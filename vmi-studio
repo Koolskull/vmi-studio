@@ -1,0 +1,22 @@
+#!/bin/bash
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [ -z "${CLIP2KRITA_SRC:-}" ]; then
+  sibling="${HOME}/Documents/work/clip2krita/src"
+  vendored="$ROOT/third_party/clip2krita/src"
+  if [ -d "$sibling/clip2krita" ]; then
+    export CLIP2KRITA_SRC="$sibling"
+  else
+    export CLIP2KRITA_SRC="$vendored"
+  fi
+fi
+if [ -z "${BGCARDBUILDER:-}" ]; then
+  fonts="${HOME}/Documents/work/Github/bgcardbuilder"
+  if [ -d "$fonts/src/data" ]; then
+    export BGCARDBUILDER="$fonts"
+  fi
+fi
+case ":${PYTHONPATH:-}:" in
+  *":$ROOT:"*) ;;
+  *) export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" ;;
+esac
+exec "$ROOT/.venv/bin/python" -m vmi_studio "$@"

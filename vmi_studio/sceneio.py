@@ -1,0 +1,195 @@
+"""Write the scene folder. The drawing stays the source."""
+
+import json
+import os
+
+from vmi_studio.composite import composite_image
+from vmi_studio.desk import plan_scene
+
+
+def standard_text(scene=""):
+    name = "This folder is the scene %s." % scene if scene else "This folder is one scene."
+    return """%s
+
+The drawing stays the source. This folder is the delivery. One scene file goes in. One folder comes out. Everyone on the picture uses the same folders, so a large drawing can be split across people and still stack.
+
+An object is one thing in the work: a door, a beetle, a shop, a word. The layers that build that thing (line, color, shadow) share one position and become one picture. Another drawing of that same thing is another position: hover, pressed, or the next frame.
+
+An animation folder is a timeline. Each thing directly inside it is one frame, and that frame can be a whole folder of layers and subfolders. The timeline order is the frame order. It can differ from the layer stack. Each frame is one full-canvas picture at the size of the drawing. It is not cut down to a small sprite.
+
+The picture name is six hex digits, SSSXXX.
+
+SSS is the state. 000 rest, 001 hover, 002 pressed, 003 after. XXX is the frame. 000, then 001, then 002.
+
+door at rest is objects/door/000000.PNG. door when the pointer is over it is objects/door/001000.PNG. The second drawing of a wave is objects/ocean/000001.PNG.
+
+Every picture is the whole canvas. Empty pixels stay empty, so the door still sits on the shop when the pictures stack. The back layer is the back of the picture.
+
+Exterior and Interior are views. They are written on the object. They are not separate games.
+
+A hidden layer, a hidden folder, and a name that says sketch, guide, reference, template, or paper, or that starts with _, stays in the drawing. It is listed so the leave-out is on purpose.
+
+Layer 1, Folder 1, and a bare number will not make sense next month. Name the object for the thing.
+
+The folder name is the start of the object name. Change it when that name is wrong. Delete an object from the list when it does not belong. 000 rest, 001 hover, and 002 pressed are the button positions. 003 is after. Rename a position and that name is written in the object file.
+
+The object outliner is the stack for VMI. It filters the layer tree into the things in the level before the pictures are written. The top of a group is in front. Drop an object onto another to put it inside. That parent and the z order are written with the scene. The type, the name, a warp mask or a warp map, and a sound are set on the object. The level can turn on the menu playlist or the battle playlist.
+""" % name
+
+
+def how_text(plan):
+    lines = [standard_text(plan["scene"]).rstrip("\n"), "", "This scene", ""]
+    lines.append("Canvas %d x %d. Source %s (%s)." % (
+        plan["canvas"]["w"], plan["canvas"]["h"], plan["source"]["file"], plan["source"]["kind"],
+    ))
+    playlist = plan.get("playlist") or ""
+    if playlist:
+        lines.append("Webamp playlist %s." % playlist)
+    else:
+        lines.append("Webamp playlist is off.")
+    lines.append("")
+    if not plan["objects"]:
+        lines.append("No objects yet.")
+        return "\n".join(lines) + "\n"
+    missing = 0
+    for obj in plan["objects"]:
+        view = " view %s" % obj["view"] if obj["view"] else ""
+        parent = "  in %s" % obj["parent"] if obj.get("parent") else ""
+        warp = "  %s" % obj["warpLayer"] if obj.get("warpLayer") else ""
+        sound = "  sound %s" % obj["sound"] if obj.get("sound") else ""
+        lines.append("%s  %s  z %s%s%s%s%s" % (
+            obj["folder"], obj["type"], obj["zIndex"], parent, view, warp, sound,
+        ))
+        for slot in obj["slots"]:
+            png = slot.get("png", True)
+            file_name = "%s.PNG" % slot["key"] if png else "%s (no picture in this open)" % slot["key"]
+            if not png:
+                missing += 1
+            lines.append("  %s  %s  %s" % (file_name, slot["label"], ", ".join(slot["layers"])))
+    if missing:
+        lines.append("")
+        lines.append("A position with no picture still has its name in object.json. The drawing is still the source.")
+    return "\n".join(lines) + "\n"
+
+
+def layers_tsx(plan):
+    rows = []
+    for obj in plan["objects"]:
+        rows.append(
+            '  { id: %s, folder: %s, type: %s, zIndex: %s, parent: %s, warpLayer: %s, sound: %s, ext: "PNG" },' % (
+                json.dumps(obj["folder"]),
+                json.dumps("objects/%s" % obj["folder"]),
+                json.dumps(obj["type"]),
+                obj["zIndex"],
+                json.dumps(obj.get("parent") or ""),
+                json.dumps(obj.get("warpLayer") or ""),
+                json.dumps(obj.get("sound") or ""),
+            )
+        )
+    body = "\n".join(rows)
+    playlist = json.dumps(plan.get("playlist") or "")
+    text = (
+        "// Generated by VMI STUDIO\n"
+        "// Picture path: <folder>/<SSSXXX>.PNG\n"
+        "export const PLAYLIST = %s;\n"
+        "export const LAYER_STACK = [\n%s\n];\n"
+    )
+    return text % (playlist, body)
+
+
+def _safe_folder(name):
+    clean = (name or "").strip().replace("\\", " ").replace("/", " ")
+    if clean in ("", ".", ".."):
+        return "scene"
+    return clean
+
+
+def write_scene(parent, art, objects, playlist=""):
+    """Write <parent>/<scene>/ with HOW.txt, scene.json, layers.tsx, and objects/."""
+    plan = plan_scene(art, objects, playlist)
+    scene = _safe_folder(plan["scene"])
+    plan["scene"] = scene
+    parent_abs = os.path.abspath(parent)
+    root = os.path.join(parent_abs, scene)
+    if os.path.commonpath([parent_abs, root]) != parent_abs:
+        raise RuntimeError("The scene folder would leave the chosen directory.")
+    os.makedirs(root, exist_ok=True)
+    pictures = 0
+    missing = 0
+    scene_objects = []
+    for obj in plan["objects"]:
+        obj["folder"] = _safe_folder(obj["folder"])
+        base = os.path.join(root, "objects", obj["folder"])
+        os.makedirs(base, exist_ok=True)
+        slot_json = []
+        slot_map = {}
+        for slot in obj["slots"]:
+            image = composite_image(art.width, art.height, slot["nodes"])
+            png = image is not None
+            slot["png"] = png
+            if png:
+                image.save(os.path.join(base, "%s.PNG" % slot["key"]), "PNG")
+                pictures += 1
+            else:
+                missing += 1
+            slot_json.append({
+                "file": "%s.PNG" % slot["key"],
+                "state": slot["key"][:3],
+                "frame": slot["key"][3:],
+                "label": slot["label"],
+                "layers": slot["layers"],
+                "png": png,
+            })
+            slot_map[slot["key"]] = {
+                "file": "%s.PNG" % slot["key"],
+                "label": slot["label"],
+                "layers": slot["layers"],
+                "png": png,
+            }
+        with open(os.path.join(base, "object.json"), "w", encoding="utf-8") as handle:
+            json.dump({
+                "name": obj["folder"],
+                "type": obj["type"],
+                "zIndex": obj["zIndex"],
+                "parent": obj.get("parent") or "",
+                "view": obj["view"],
+                "animation": bool(obj.get("animation")),
+                "warpLayer": obj.get("warpLayer") or "",
+                "sound": obj.get("sound") or "",
+                "labels": obj.get("labels") or {},
+                "slots": slot_json,
+            }, handle, indent=2)
+            handle.write("\n")
+        entry = {
+            "id": obj["folder"],
+            "folder": "objects/%s" % obj["folder"],
+            "type": obj["type"],
+            "zIndex": obj["zIndex"],
+            "parent": obj.get("parent") or "",
+            "warpLayer": obj.get("warpLayer") or "",
+            "sound": obj.get("sound") or "",
+            "slots": slot_map,
+        }
+        if obj["view"]:
+            entry["view"] = obj["view"]
+        if obj.get("animation"):
+            entry["animation"] = True
+        if obj.get("labels"):
+            entry["labels"] = obj["labels"]
+        scene_objects.append(entry)
+    with open(os.path.join(root, "HOW.txt"), "w", encoding="utf-8") as handle:
+        handle.write(how_text(plan))
+    with open(os.path.join(root, "layers.tsx"), "w", encoding="utf-8") as handle:
+        handle.write(layers_tsx(plan))
+    with open(os.path.join(root, "scene.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "vmi": 1,
+            "naming": "SSSXXX",
+            "scene": plan["scene"],
+            "canvas": plan["canvas"],
+            "source": plan["source"],
+            "playlist": plan.get("playlist") or "",
+            "objects": scene_objects,
+        }, handle, indent=2)
+        handle.write("\n")
+    return {"root": root, "pictures": pictures, "missing": missing, "scene": plan["scene"]}

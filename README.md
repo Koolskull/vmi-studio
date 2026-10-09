@@ -32,6 +32,8 @@ Check the build with:
 
 It prints `VMI STUDIO 0.01`. The program is a window. It needs a normal desktop session.
 
+The Windows download is `vmi-studio-0.01-windows-x86_64.zip` on that same release. It is a 64-bit build. Unzip it and run `vmi-studio\vmi-studio.exe`. `vmi-clip-vector.exe` sits beside it. A console window stays open with the studio. Check it with `vmi-studio.exe --version`.
+
 ## The window
 
 The title is `VMI STUDIO — <file>`. The menu bar is File, Edit, View, and Layer. Settings, the font list, and the theme list sit at the right of that bar. Themes are Studio, Paper, Charcoal, Peach, Mint, and Lilac. Three panes sit side by side. Drag the gutters to resize them.
@@ -186,6 +188,8 @@ cargo build --manifest-path tools/vmi-clip-vector/Cargo.toml --release
 ```
 
 The program is `dist/vmi-studio/vmi-studio`. The spec copies `vmi-clip-vector` into that folder. The `.so` speeds up Krita files. Without it, those files still open through the Python decoder.
+
+The Windows build runs on a Windows machine. The workflow is `.github/workflows/windows.yml`. It compiles `lzf_d.dll`, builds `vmi-clip-vector.exe`, and packs `dist\vmi-studio\vmi-studio.exe`.
 
 An optional font catalog can live in `~/Documents/work/Github/bgcardbuilder`, or in the directory named by `BGCARDBUILDER`. Without it, the header font list is the system monospace. That is the default face either way.
 

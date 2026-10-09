@@ -1,0 +1,52 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build the vector reader
+        run: cargo build --release --manifest-path tools/vmi-clip-vector/Cargo.toml
+
+      - name: Build the Krita tile decoder
+        run: cl /nologo /O2 /LD /Fe:vmi_studio\lzf_d.dll vmi_studio\lzf_d.c
+
+      - name: Package the studio
+        run: pyinstaller --noconfirm --clean vmi-studio.spec
+
+      - name: Put the vector reader beside the program
+        shell: cmd
+        run: copy /Y tools\vmi-clip-vector\target\release\vmi-clip-vector.exe dist\vmi-studio\vmi-clip-vector.exe
+
+      - name: Check both programs
+        shell: pwsh
+        run: |
+          & .\dist\vmi-studio\vmi-studio.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\dist\vmi-studio\vmi-clip-vector.exe images
+          if ($LASTEXITCODE -ne 2) { exit 1 }
+
+      - name: Zip the folder
+        run: tar -a -cf vmi-studio-0.01-windows-x86_64.zip -C dist vmi-studio
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vmi-studio-0.01-windows-x86_64
+          path: vmi-studio-0.01-windows-x86_64.zip

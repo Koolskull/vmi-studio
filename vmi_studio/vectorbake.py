@@ -44,27 +44,38 @@ ERASE_COMPOSITE = 27
 _LOGGED_ALIAS = set()
 
 
+def _sidecar_names():
+    names = ["vmi-clip-vector"]
+    if sys.platform == "win32":
+        names.insert(0, "vmi-clip-vector.exe")
+    return names
+
+
 def sidecar_path():
     """Built reader, or VMI_CLIP_VECTOR when that file exists.
 
     A frozen build looks beside the program and inside the PyInstaller
     folder. A source checkout looks in tools/vmi-clip-vector/target.
+    Windows uses the .exe name.
     """
     env = os.environ.get("VMI_CLIP_VECTOR")
     if env and os.path.isfile(env):
         return env
+    names = _sidecar_names()
     candidates = []
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-        candidates.append(os.path.join(exe_dir, "vmi-clip-vector"))
         meipass = getattr(sys, "_MEIPASS", "")
-        if meipass:
-            candidates.append(os.path.join(meipass, "vmi-clip-vector"))
-        candidates.append(os.path.join(exe_dir, "_internal", "vmi-clip-vector"))
+        for name in names:
+            candidates.append(os.path.join(exe_dir, name))
+            if meipass:
+                candidates.append(os.path.join(meipass, name))
+            candidates.append(os.path.join(exe_dir, "_internal", name))
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.normpath(os.path.join(here, "..", "tools", "vmi-clip-vector", "target"))
-    for name in ("release", "debug"):
-        candidates.append(os.path.join(root, name, "vmi-clip-vector"))
+    for folder in ("release", "debug"):
+        for name in names:
+            candidates.append(os.path.join(root, folder, name))
     for path in candidates:
         if os.path.isfile(path):
             return path

@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -202,6 +203,20 @@ def _lzf_decode(src, size):
     return _lzf_decode_py(src, size)
 
 
+def _lzf_paths():
+    """The compiled decoder. Windows ships a dll. Linux ships a .so."""
+    filename = "lzf_d.dll" if sys.platform == "win32" else "lzf_d.so"
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [os.path.join(here, filename)]
+    if getattr(sys, "frozen", False):
+        root = getattr(sys, "_MEIPASS", "")
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        if root:
+            paths.append(os.path.join(root, "vmi_studio", filename))
+        paths.append(os.path.join(exe_dir, "_internal", "vmi_studio", filename))
+    return paths
+
+
 def _library():
     global _LIB, _LIB_TRIED
     if _LIB_TRIED:
@@ -209,19 +224,20 @@ def _library():
     _LIB_TRIED = True
     import ctypes
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    source = os.path.join(here, "lzf_d.c")
-    library = os.path.join(here, "lzf_d.so")
+    paths = _lzf_paths()
+    library = next((path for path in paths if os.path.isfile(path)), paths[0])
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lzf_d.c")
     try:
-        stale = os.path.isfile(source) and (
-            not os.path.isfile(library) or os.path.getmtime(source) > os.path.getmtime(library)
-        )
-        if stale:
-            subprocess.run(
-                ["gcc", "-O3", "-shared", "-fPIC", "-o", library, source],
-                check=True,
-                capture_output=True,
+        if sys.platform != "win32" and not getattr(sys, "frozen", False):
+            stale = os.path.isfile(source) and (
+                not os.path.isfile(library) or os.path.getmtime(source) > os.path.getmtime(library)
             )
+            if stale:
+                subprocess.run(
+                    ["gcc", "-O3", "-shared", "-fPIC", "-o", library, source],
+                    check=True,
+                    capture_output=True,
+                )
         if not os.path.isfile(library):
             return None
         lib = ctypes.CDLL(library)

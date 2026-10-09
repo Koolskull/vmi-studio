@@ -1,13 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""Linux build for the VMI STUDIO executable. Run from the repository root."""
+"""VMI STUDIO executable. Run from the repository root on the target system."""
 
 import os
+import sys
 
 root = os.path.abspath(SPECPATH)
 clip_pkg = os.path.join(root, "third_party", "clip2krita", "src", "clip2krita")
 clip_vendor = os.path.join(root, "third_party", "clip2krita", "third_party")
-lzf = os.path.join(root, "vmi_studio", "lzf_d.so")
-vector = os.path.join(root, "tools", "vmi-clip-vector", "target", "release", "vmi-clip-vector")
+windows = sys.platform == "win32"
+lzf = os.path.join(root, "vmi_studio", "lzf_d.dll" if windows else "lzf_d.so")
+vector_name = "vmi-clip-vector.exe" if windows else "vmi-clip-vector"
+vector = os.path.join(root, "tools", "vmi-clip-vector", "target", "release", vector_name)
 
 datas = [
     (clip_pkg, "third_party/clip2krita/src/clip2krita"),

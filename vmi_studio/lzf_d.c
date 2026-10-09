@@ -1,5 +1,8 @@
 /* liblzf-shaped tile decode. No Python headers, so it builds without python3-dev. */
 
+#if defined(_WIN32)
+__declspec(dllexport)
+#endif
 int lzf_decode(const unsigned char *src, int src_len, unsigned char *out, int max_out) {
     int ip = 0;
     int op = 0;

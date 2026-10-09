@@ -15,16 +15,34 @@ use clipfile::{
 };
 use serde_json::{Map, Value, json};
 
+mod images;
+
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
-    let Some(path) = args.next() else {
-        eprintln!("usage: vmi-clip-vector <file.clip>");
+    let Some(first) = args.next() else {
+        usage();
         return ExitCode::from(2);
     };
+    if first == "images" {
+        let Some(path) = args.next() else {
+            usage();
+            return ExitCode::from(2);
+        };
+        let Some(directory) = args.next() else {
+            usage();
+            return ExitCode::from(2);
+        };
+        if args.next().is_some() {
+            usage();
+            return ExitCode::from(2);
+        }
+        return images::write_images(&path, &directory);
+    }
     if args.next().is_some() {
-        eprintln!("usage: vmi-clip-vector <file.clip>");
+        usage();
         return ExitCode::from(2);
     }
+    let path = first;
     match dump(&path) {
         Ok(value) => {
             let mut out = io::stdout().lock();
@@ -41,6 +59,11 @@ fn main() -> ExitCode {
     }
 }
 
+fn usage() {
+    eprintln!("usage: vmi-clip-vector <file.clip>");
+    eprintln!("       vmi-clip-vector images <file.clip> <directory>");
+}
+
 fn dump(path: &std::ffi::OsStr) -> Result<Value, Box<dyn std::error::Error>> {
     let mut clip = ClipFile::open(File::open(path)?)?;
     let limits = clip.limits();
@@ -53,10 +76,11 @@ fn dump(path: &std::ffi::OsStr) -> Result<Value, Box<dyn std::error::Error>> {
         .or_else(|| document.canvases().first())
         .ok_or("clip has no canvas")?;
     let color_columns = color_columns(database.connection())?;
-    let mut brush_cache: HashMap<u32, Option<(i64, f64)>> = HashMap::new();
+    let mut brush_cache: HashMap<u32, Option<(i64, f64, Option<i64>)>> = HashMap::new();
     let mut fill_cache: HashMap<u32, Option<i64>> = HashMap::new();
     let mut brush_warned = false;
     let mut seen_alias: HashMap<i64, u32> = HashMap::new();
+    let mut seen_composite: HashMap<i64, u32> = HashMap::new();
     let root = canvas.root_layer_id();
     let layers = children(&document, root)
         .into_iter()
@@ -72,6 +96,7 @@ fn dump(path: &std::ffi::OsStr) -> Result<Value, Box<dyn std::error::Error>> {
                 &mut fill_cache,
                 &mut brush_warned,
                 &mut seen_alias,
+                &mut seen_composite,
             )
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
@@ -82,6 +107,13 @@ fn dump(path: &std::ffi::OsStr) -> Result<Value, Box<dyn std::error::Error>> {
         pairs.sort_by_key(|(value, _)| *value);
         for (value, count) in pairs {
             eprintln!("vector alias raw={value} count={count}");
+        }
+    }
+    if !seen_composite.is_empty() {
+        let mut pairs: Vec<_> = seen_composite.into_iter().collect();
+        pairs.sort_by_key(|(value, _)| *value);
+        for (value, count) in pairs {
+            eprintln!("vector composite raw={value} count={count}");
         }
     }
     Ok(json!({
@@ -115,10 +147,11 @@ fn layer_json(
     id: i64,
     limits: Limits,
     color_columns: &[String],
-    brush_cache: &mut HashMap<u32, Option<(i64, f64)>>,
+    brush_cache: &mut HashMap<u32, Option<(i64, f64, Option<i64>)>>,
     fill_cache: &mut HashMap<u32, Option<i64>>,
     brush_warned: &mut bool,
     seen_alias: &mut HashMap<i64, u32>,
+    seen_composite: &mut HashMap<i64, u32>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let Some(layer) = document.layer(id) else {
         return Ok(json!({
@@ -150,6 +183,7 @@ fn layer_json(
             fill_cache,
             brush_warned,
             seen_alias,
+            seen_composite,
         )?
     };
     let children = children(document, id)
@@ -166,6 +200,7 @@ fn layer_json(
                 fill_cache,
                 brush_warned,
                 seen_alias,
+                seen_composite,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -185,10 +220,11 @@ fn vector_json(
     database: &Database,
     layer_id: i64,
     limits: Limits,
-    brush_cache: &mut HashMap<u32, Option<(i64, f64)>>,
+    brush_cache: &mut HashMap<u32, Option<(i64, f64, Option<i64>)>>,
     fill_cache: &mut HashMap<u32, Option<i64>>,
     brush_warned: &mut bool,
     seen_alias: &mut HashMap<i64, u32>,
+    seen_composite: &mut HashMap<i64, u32>,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let sources = database.vector_data_sources(layer_id, limits)?;
     if sources.is_empty() {
@@ -219,6 +255,7 @@ fn vector_json(
             fill_cache,
             brush_warned,
             seen_alias,
+            seen_composite,
             layer_id,
             &mut strokes,
         )?;
@@ -233,13 +270,16 @@ fn push_strokes(
     data: &VectorData,
     database: &Database,
     limits: Limits,
-    brush_cache: &mut HashMap<u32, Option<(i64, f64)>>,
+    brush_cache: &mut HashMap<u32, Option<(i64, f64, Option<i64>)>>,
     fill_cache: &mut HashMap<u32, Option<i64>>,
     brush_warned: &mut bool,
     seen_alias: &mut HashMap<i64, u32>,
+    seen_composite: &mut HashMap<i64, u32>,
     layer_id: i64,
     strokes: &mut Vec<Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut varied_scale = 0u32;
+    let mut counted_scale = 0u32;
     for (index, stroke) in data.strokes().enumerate() {
         let Some(style) = stroke.style() else {
             eprintln!("vector: layer {layer_id} stroke {index} has no supported style");
@@ -271,16 +311,25 @@ fn push_strokes(
             None => None,
         };
         let (anti_alias, alias_source, hardness) = match (fill_alias, brush) {
-            (Some(alias), Some((_, hardness))) => (Some(alias), "fill", Some(hardness)),
+            (Some(alias), Some((_, hardness, _))) => (Some(alias), "fill", Some(hardness)),
             (Some(alias), None) => (Some(alias), "fill", None),
-            (None, Some((alias, hardness))) => (Some(alias), "brush", Some(hardness)),
+            (None, Some((alias, hardness, _))) => (Some(alias), "brush", Some(hardness)),
             (None, None) => (None, "missing", None),
         };
+        let composite = brush.and_then(|(_, _, mode)| mode);
+        if let Some(mode) = composite {
+            if mode != 0 {
+                *seen_composite.entry(mode).or_insert(0) += 1;
+            }
+        }
         if let Some(alias) = anti_alias {
             *seen_alias.entry(alias).or_insert(0) += 1;
         }
         let mut points = Vec::new();
         let mut point_error = false;
+        let mut scale_min = f32::MAX;
+        let mut scale_max = 0f32;
+        let mut scale_count = 0u32;
         for point in stroke.points() {
             let (Some(position), Some(width), Some(opacity)) =
                 (point.position(), point.width_factor(), point.opacity_factor())
@@ -288,6 +337,12 @@ fn push_strokes(
                 point_error = true;
                 break;
             };
+            let scale = width_scale(point.raw());
+            if let Some(scale) = scale {
+                scale_min = scale_min.min(scale);
+                scale_max = scale_max.max(scale);
+                scale_count += 1;
+            }
             let controls: Vec<Value> = point
                 .control_points()
                 .map(|control| json!([control.x(), control.y()]))
@@ -296,6 +351,7 @@ fn push_strokes(
                 "x": position.x(),
                 "y": position.y(),
                 "width_factor": width,
+                "width_scale": scale,
                 "opacity_factor": opacity,
                 "controls": controls,
             }));
@@ -321,13 +377,33 @@ fn push_strokes(
             "fill_style_id": fill_id,
             "color": [color.red_8bit(), color.green_8bit(), color.blue_8bit()],
             "opacity": style.opacity(),
+            "composite": composite,
             "anti_alias": anti_alias,
             "hardness": hardness,
             "alias_source": alias_source,
             "points": points,
         }));
+        if scale_count > 0 {
+            counted_scale += 1;
+            if scale_max - scale_min > 0.001 {
+                varied_scale += 1;
+            }
+        }
+    }
+    if counted_scale > 0 {
+        eprintln!("vector width scale layer={layer_id} varied={varied_scale} of {counted_scale}");
     }
     Ok(())
+}
+
+/// Stored per-point width envelope at byte 36.
+///
+/// Untapered strokes keep this at 1. Pen strokes drop toward 0 at the ends.
+/// It multiplies `width_factor`; it is not a pixel width.
+fn width_scale(raw: &[u8]) -> Option<f32> {
+    let bytes = raw.get(36..40)?;
+    let value = f32::from_bits(u32::from_be_bytes(bytes.try_into().ok()?));
+    (value.is_finite() && value >= 0.0).then_some(value)
 }
 
 fn kind_name(kind: VectorStrokeKind) -> &'static str {
@@ -353,14 +429,18 @@ fn brush_alias(
     database: &Database,
     id: u32,
     limits: Limits,
-    cache: &mut HashMap<u32, Option<(i64, f64)>>,
+    cache: &mut HashMap<u32, Option<(i64, f64, Option<i64>)>>,
     warned: &mut bool,
-) -> Result<Option<(i64, f64)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(i64, f64, Option<i64>)>, Box<dyn std::error::Error>> {
     if let Some(hit) = cache.get(&id) {
         return Ok(*hit);
     }
     let typed = match database.brush_style(id, limits) {
-        Ok(Some(style)) => Some((style.anti_alias(), style.hardness())),
+        Ok(Some(style)) => Some((
+            style.anti_alias(),
+            style.hardness(),
+            Some(style.composite_mode()),
+        )),
         Ok(None) => None,
         Err(err) => {
             if !*warned {
@@ -370,8 +450,9 @@ fn brush_alias(
             None
         }
     };
-    // Older files omit columns the typed reader requires. AntiAlias and
-    // Hardness are still on the row.
+    // Older files omit columns the typed reader requires. AntiAlias,
+    // Hardness, and CompositeMode are still on the row. CompositeMode 27
+    // is the ink Erase mode: a transparent vector stroke, not white paint.
     let found = if typed.is_some() {
         typed
     } else {
@@ -384,9 +465,9 @@ fn brush_alias(
 fn sql_brush(
     connection: &rusqlite::Connection,
     id: u32,
-) -> Result<Option<(i64, f64)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(i64, f64, Option<i64>)>, Box<dyn std::error::Error>> {
     let mut statement = match connection.prepare(
-        "SELECT AntiAlias, Hardness FROM BrushStyle WHERE MainId = ?1",
+        "SELECT AntiAlias, Hardness, CompositeMode FROM BrushStyle WHERE MainId = ?1",
     ) {
         Ok(statement) => statement,
         Err(err) => {
@@ -400,7 +481,8 @@ fn sql_brush(
     };
     let alias: Option<i64> = row.get(0)?;
     let hardness: Option<f64> = row.get(1)?;
-    Ok(alias.map(|alias| (alias, hardness.unwrap_or(1.0))))
+    let composite: Option<i64> = row.get(2)?;
+    Ok(alias.map(|alias| (alias, hardness.unwrap_or(1.0), composite)))
 }
 
 fn fill_alias(

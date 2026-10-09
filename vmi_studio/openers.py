@@ -98,6 +98,19 @@ def _open_clip(path, progress):
     art.kind = "clip"
     art.note = "Clip Studio paint is loaded."
     try:
+        from vmi_studio.csptime import apply_clip_time, read_clip_time
+
+        info = read_clip_time(path)
+        if info:
+            apply_clip_time(art, info)
+            count = sum(1 for folder in info.get("folders") or [] if folder.get("cels") or folder.get("keys"))
+            if count:
+                art.note = "%s %d animation folder%s." % (
+                    art.note, count, "" if count == 1 else "s",
+                )
+    except Exception:
+        pass
+    try:
         from vmi_studio.vectorbake import apply_vector_previews
 
         if progress:
@@ -109,6 +122,18 @@ def _open_clip(path, progress):
             )
     except Exception as exc:
         sys.stderr.write("vector: %s\n" % exc)
+    try:
+        from vmi_studio.imagebake import apply_image_previews
+
+        if progress:
+            progress("Reading image materials")
+        count = apply_image_previews(art, path)
+        if count:
+            art.note = "%s %d image material%s." % (
+                art.note, count, "" if count == 1 else "s",
+            )
+    except Exception as exc:
+        sys.stderr.write("image: %s\n" % exc)
     return art
 
 

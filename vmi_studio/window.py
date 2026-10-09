@@ -5,16 +5,18 @@ import math
 import os
 import shutil
 import sys
+import tempfile
 import time
 import traceback
 
-from PySide6.QtCore import QEvent, QPointF, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
-    QActionGroup,
+
     QColor,
     QEventPoint,
     QFont,
+    QFontMetrics,
     QImage,
     QKeySequence,
     QPainter,
@@ -46,7 +48,10 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QStyle,
+    QTabBar,
+    QToolButton,
     QStyledItemDelegate,
     QToolTip,
     QTreeWidget,
@@ -64,6 +69,7 @@ from vmi_studio.composite import (
     BLEND_CHOICES,
     assign_blend,
     blend_label,
+    composite_image,
     composite_scene,
     ink_count,
     loaded_paint,
@@ -85,8 +91,10 @@ from vmi_studio.desk import (
     SOUND_EFFECTS,
     DeskObject,
     apply_frames,
-    arrange_objects,
     assigned_type,
+    scene_objects,
+    scene_plate,
+    set_scene_order,
     clean_kind,
     clean_playlist,
     clean_sound,
@@ -103,6 +111,7 @@ from vmi_studio.desk import (
     static_layers,
 )
 from vmi_studio.document import (
+    _next_id,
     animation_folders,
     apply_animations,
     apply_blends,
@@ -112,16 +121,23 @@ from vmi_studio.document import (
     arrange,
     can_arrange,
     capture_flags,
+    cel_at,
     cel_of,
     clamp_opacity,
     find_node,
+    frame_map,
     move_cel,
     move_into,
     new_folder,
+    Node,
+    Raster,
+    place_cel,
+    refresh,
     owning_animation,
     paint_layers,
     panel_order,
     preview_paint,
+    remove_nodes,
     rename_node,
     apply_clips,
     set_animation,
@@ -134,14 +150,33 @@ from vmi_studio.document import (
     visibility_map,
     walk,
 )
-from vmi_studio.naming import parse_sf, slot_key, state_label
+from vmi_studio.naming import parse_sf, sanitize, slot_key, state_label
 from vmi_studio.openers import open_drawing
+from vmi_studio import theme
+from vmi_studio.launchui import ImagePick, Launcher
+from vmi_studio.settingsui import SettingsBar
+from vmi_studio.loadgate import EditorShade, LoadGate
 from vmi_studio.sceneio import _safe_folder, plan_scene, write_scene
+from vmi_studio.tabs import default_export_parent, same_export
+from vmi_studio.tasks import TaskBoard
+from vmi_studio import cloud as cloudstore
 from vmi_studio.vmib import prepare_blueprint, write_parts
+from vmi_studio.drawbar import DrawBar
+from vmi_studio.exportdialog import PngDialog, favorite_places
+from vmi_studio.filmstrip import Filmstrip, TimelineGutter, Transport
+from vmi_studio.paint import (
+    MaskCanvas,
+    fill_polygon,
+    fresh_name,
+    recolor_raster,
+    stroke_steps,
+)
+from vmi_studio.pngout import scale_image
 from vmi_studio.warp import (
     WARP_PINK,
     WARP_PURPLE,
     mark_warps,
+    marker_ink,
     object_role,
     warp_counts,
     warp_layer_kind,
@@ -166,12 +201,14 @@ MARK = 11
 KNOB = 18
 TREE_WIDTH = 280
 MIN_TREE = 160
-MIN_TRACK = 200
 GUTTER = 7
-# Highlight is white. Everything else stays dark.
+# Highlight is white. Everything else stays dark. A theme replaces these.
 INK = "#ffffff"
 QUIET = "#3a3a3a"
 RULE = "#2a2a2a"
+FIELD = "#000000"
+ROW = "#111111"
+BROWSER_TAB = 0
 PICTURE_WAIT = "Loading the picture."
 REST_WAIT = "Loading the rest of the picture."
 STATIC_EXPORT = "create new object"
@@ -192,12 +229,18 @@ WARP_BUTTON = (
     " padding: 6px 10px; border-radius: 0; text-align: left; }"
     "QPushButton#warpPrepare:hover { background: #7a3450; color: #ffffff; border-color: #e0a0b8; }"
 )
-# 4K client: narrow side panes, picture takes the rest. A saved layout from
-# before this ratio is ignored (split_version).
+# 4K client: the picture takes most of the window. The layers pane is wide
+# enough for the names, mute, solo, clip, the dial, and a blend chip.
+# A saved layout from before this ratio is ignored (split_version).
 WIDE_SCREEN = 3200
-WIDE_SPLIT = (0.09, 0.82, 0.09)
-SPLIT_VERSION = 3
+WIDE_SPLIT = (0.24, 0.67, 0.09)
+WIDE_FACTORS = (24, 67, 9)
+SPLIT_VERSION = 4
+BLEND_GAP = 8
+BLEND_TAIL = 4
 PANE_MIN = 140
+PANE_COLLAPSED = 32
+MAX_PANE = 16777215
 
 
 def screen_pixels(screen):
@@ -238,16 +281,27 @@ def saved_split_fits(saved, width, handle=GUTTER, slack=0.20):
     return abs(total - inner) <= inner * slack
 
 
+def layers_need():
+    """Width where the names keep MIN_TREE and the blend chip still fits."""
+    chip = 120
+    if QApplication.instance() is not None:
+        chip = blend_chip_width()
+    return MIN_TREE + GUTTER + _button_span() + BLEND_GAP + chip + BLEND_TAIL
+
+
 def choose_split(width, saved, screen_width, custom=False):
     """Sizes to apply, or None to leave the gutters alone.
 
-    A layout saved at this width is kept. On a 4K screen, anything saved
-    from a much narrower window is replaced by the wide default.
+    A layout saved at this width is kept. On a 4K screen, a layers pane
+    too narrow for the names and the blend chip is replaced by the wide
+    default, and so is anything saved from a much narrower window.
     """
     if custom:
         return None
     if saved_split_fits(saved, width):
-        return [int(value) for value in saved]
+        sizes = [int(value) for value in saved]
+        if int(screen_width) < WIDE_SCREEN or sizes[0] >= layers_need():
+            return sizes
     if int(screen_width) < WIDE_SCREEN:
         return None
     return split_sizes(width)
@@ -320,25 +374,60 @@ def _item_chain(item):
     return chain
 
 
-def row_tracks(rect, tree_width):
-    """The drag zone, mute, solo, clipping mask, opacity knob, and blend menu.
+def blend_chip_width():
+    """The blend control is as wide as its longest name, and no wider."""
+    font = QFont()
+    app = QApplication.instance()
+    if app is not None:
+        font = app.font()
+    else:
+        font.setPixelSize(12)
+    metrics = QFontMetrics(font)
+    widest = 0
+    for _key, label in BLEND_CHOICES:
+        widest = max(widest, metrics.horizontalAdvance(label))
+    # 4px of text padding and 14px for the chevron, matching _paint_blend.
+    return widest + 18
 
-    The drag zone is not drawn. The blend menu uses the rest of the track.
+
+def _button_span():
+    """Mute, solo, clip, and the opacity dial, including the gaps between them."""
+    return 6 + MARK + 6 + MARK + 6 + MARK + 6 + KNOB
+
+
+def row_tracks(rect, tree_width):
+    """Names on the left. Mute, solo, and clip next. The blend chip last.
+
+    Extra width goes to the names. The chip stays at blend_chip_width.
+    It is the first control to disappear: when the names would fall under
+    MIN_TREE, the chip is omitted and mute, solo, clip, and the dial stay.
+    tree_width is not used. A saved gutter must not pull the chip over the names.
     """
+    del tree_width
     if not rect.isValid():
         empty = QRect()
         return 0, empty, empty, empty, empty, empty, empty, empty
-    split = rect.x() + int(tree_width)
-    split = min(max(split, rect.x() + MIN_TREE), rect.right() - MIN_TRACK)
-    gutter = QRect(split, rect.y(), GUTTER, rect.height())
-    track = QRect(gutter.right() + 1, rect.y(), max(0, rect.right() - gutter.right()), rect.height())
+    chip = blend_chip_width()
+    buttons = _button_span()
+    full = GUTTER + buttons + BLEND_GAP + chip + BLEND_TAIL
+    show_blend = rect.width() >= MIN_TREE + full
+    end = rect.x() + rect.width()
     top = rect.center().y() - MARK // 2
-    mute = QRect(track.x() + 6, top, MARK, MARK)
-    solo = QRect(mute.right() + 6, top, MARK, MARK)
-    clip = QRect(solo.right() + 6, top, MARK, MARK)
     knob_top = rect.center().y() - KNOB // 2
-    opacity = QRect(clip.right() + 6, knob_top, KNOB, KNOB)
-    blend = QRect(opacity.right() + 8, rect.y() + 2, max(0, track.right() - opacity.right() - 12), max(0, rect.height() - 4))
+    if show_blend:
+        blend = QRect(end - BLEND_TAIL - chip, rect.y() + 2, chip, max(0, rect.height() - 4))
+        after_opacity = blend.left() - BLEND_GAP
+    else:
+        blend = QRect()
+        after_opacity = end - BLEND_TAIL
+    opacity = QRect(after_opacity - KNOB, knob_top, KNOB, KNOB)
+    clip = QRect(opacity.left() - 6 - MARK, top, MARK, MARK)
+    solo = QRect(clip.left() - 6 - MARK, top, MARK, MARK)
+    mute = QRect(solo.left() - 6 - MARK, top, MARK, MARK)
+    track_x = mute.left() - 6
+    gutter = QRect(track_x - GUTTER, rect.y(), GUTTER, rect.height())
+    split = gutter.left()
+    track = QRect(track_x, rect.y(), max(0, end - track_x), rect.height())
     return split, gutter, track, mute, solo, clip, opacity, blend
 
 
@@ -349,7 +438,7 @@ def _paint_handle(painter, box, letter, active):
     painter.setPen(QPen(color))
     painter.setBrush(QColor(INK) if active else Qt.NoBrush)
     painter.drawRect(box)
-    painter.setPen(QColor("#000000") if active else color)
+    painter.setPen(QColor(FIELD) if active else color)
     font = QFont(painter.font())
     font.setPixelSize(9)
     painter.setFont(font)
@@ -363,11 +452,11 @@ def _paint_clip(painter, box, on, lit):
     if on and lit:
         frame = QColor(INK)
         fill = QColor(INK)
-        letter = QColor("#000000")
+        letter = QColor(FIELD)
     elif on:
         frame = QColor(QUIET)
         fill = QColor(QUIET)
-        letter = QColor("#000000")
+        letter = QColor(FIELD)
     else:
         frame = QColor(QUIET)
         fill = None
@@ -416,7 +505,7 @@ def _paint_blend(painter, box, node, lit, font):
         return
     painter.setFont(font)
     painter.setPen(QPen(QColor(RULE)))
-    painter.setBrush(QColor("#000000"))
+    painter.setBrush(QColor(FIELD))
     painter.drawRect(box)
     label = blend_label(node.blend, getattr(node, "shapes", True))
     painter.setPen(QColor(INK if lit else QUIET))
@@ -646,7 +735,7 @@ class LayerDelegate(QStyledItemDelegate):
         view = _outliner(option.widget)
         tree_width = view.tree_width if view is not None else TREE_WIDTH
         split, _gutter, _track, mute, solo, clip, opacity, blend = row_tracks(rect, tree_width)
-        painter.fillRect(rect, QColor("#111111" if selected else "#000000"))
+        painter.fillRect(rect, QColor(ROW if selected else FIELD))
         painter.setClipRect(rect.x(), rect.y(), max(0, split - rect.x()), rect.height())
         pen = QPen(QColor(RULE))
         pen.setWidth(1)
@@ -680,12 +769,11 @@ class LayerDelegate(QStyledItemDelegate):
                 painter.drawLine(disclosure.center().x(), disclosure.top() + 2, disclosure.center().x(), disclosure.bottom() - 2)
         painter.setBrush(mark if node.visible else Qt.NoBrush)
         painter.drawRect(eye)
+        ink = marker_ink(node)
         if selected:
             painter.setPen(QColor(INK))
-        elif getattr(node, "warp", "") == "target":
-            painter.setPen(QColor(WARP_PINK))
-        elif getattr(node, "warp", "") == "window":
-            painter.setPen(QColor(WARP_PURPLE))
+        elif ink:
+            painter.setPen(QColor(ink))
         elif node.omit:
             painter.setPen(QColor(RULE))
         else:
@@ -744,7 +832,6 @@ class Outliner(QTreeView):
         self._dragging = False
         self._drop = None
         self._refused = False
-        self._gutter_drag = False
         self._opacity_id = None
         model.modelReset.connect(self.expandAll)
 
@@ -787,9 +874,7 @@ class Outliner(QTreeView):
         node = self.model().node_of(index)
         if node is None:
             return "row"
-        _split, gutter, track, mute, solo, clip, opacity, blend = self.track_marks(index)
-        if gutter.contains(pos):
-            return "gutter"
+        _split, _gutter, track, mute, solo, clip, opacity, blend = self.track_marks(index)
         if mute.contains(pos):
             return "mute"
         if solo.contains(pos):
@@ -848,10 +933,6 @@ class Outliner(QTreeView):
         if zone == "blend":
             self.host.choose_blend(node, event.globalPosition().toPoint())
             return
-        if zone == "gutter":
-            self._gutter_drag = True
-            self.viewport().setCursor(Qt.SplitHCursor)
-            return
         if zone == "track":
             if not self._select_from_row(index, node, event.modifiers()):
                 self.host.select_only(node)
@@ -890,12 +971,6 @@ class Outliner(QTreeView):
             self.viewport().setCursor(Qt.SizeVerCursor)
             self.host.drag_opacity(pos.y())
             return
-        if self._gutter_drag and event.buttons() & Qt.LeftButton:
-            limit = self.viewport().width() - MIN_TRACK
-            self.tree_width = max(MIN_TREE, min(pos.x(), limit))
-            self.viewport().setCursor(Qt.SplitHCursor)
-            self.viewport().update()
-            return
         if self._press is not None and event.buttons() & Qt.LeftButton:
             pos = event.position().toPoint()
             delta = pos - self._press
@@ -929,16 +1004,13 @@ class Outliner(QTreeView):
                 self.viewport().setCursor(Qt.SizeVerCursor)
             elif zone == "blend" and node is not None:
                 tip = "Blend mode"
-            elif zone == "gutter":
-                tip = "Drag to give the tracks more room"
-                self.viewport().setCursor(Qt.SplitHCursor)
             elif zone == "track":
                 tip = "Track"
         if tip:
             QToolTip.showText(event.globalPosition().toPoint(), tip, self.viewport())
         else:
             QToolTip.hideText()
-        if self._opacity_id is None and not self._gutter_drag and zone not in ("opacity", "gutter"):
+        if self._opacity_id is None and zone != "opacity":
             self.viewport().unsetCursor()
         super().mouseMoveEvent(event)
 
@@ -947,12 +1019,6 @@ class Outliner(QTreeView):
             self._opacity_id = None
             self.viewport().unsetCursor()
             self.host.end_opacity()
-            return
-        if self._gutter_drag and event.button() == Qt.LeftButton:
-            self._gutter_drag = False
-            self.viewport().unsetCursor()
-            if self.host.art:
-                self.host._save_session()
             return
         if event.button() != Qt.LeftButton or self._press is None:
             super().mouseReleaseEvent(event)
@@ -1089,6 +1155,15 @@ class Outliner(QTreeView):
         if index.isValid() and event.key() == Qt.Key_F2:
             self._begin_rename(index)
             return
+        if (
+            self._editor is None
+            and event.key() in (Qt.Key_Delete, Qt.Key_Backspace)
+            and not event.isAutoRepeat()
+        ):
+            mods = event.modifiers()
+            if not (mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)):
+                self.host.delete_layers()
+                return
         super().keyPressEvent(event)
 
     def _begin_rename(self, index):
@@ -1158,12 +1233,14 @@ class Outliner(QTreeView):
         hide = menu.addAction("Show" if not node.visible else "Hide")
         grouping = len(self.model().picked) > 1
         folder = menu.addAction("Create folder and insert layer" if grouping else "New folder")
+        image = menu.addAction("Insert image")
         anim = None
         if node.kind == "group":
             anim = menu.addAction("Not an animation" if node.animation else "Animation")
         move = menu.addAction("Move picked here")
         move.setEnabled(node.kind == "group" and bool(self.model().picked))
-        return warp_prepare, static_export, subfolders, rename, hide, folder, anim, move
+        delete = menu.addAction("Delete")
+        return warp_prepare, static_export, subfolders, rename, hide, folder, image, anim, move, delete
 
     def _menu(self, pos):
         index = self.indexAt(pos)
@@ -1172,7 +1249,7 @@ class Outliner(QTreeView):
         self.setCurrentIndex(index)
         node = self.model().node_of(index)
         menu = QMenu(self)
-        warp_prepare, static_export, subfolders, rename, hide, folder, anim, move = self._fill_menu(menu, node)
+        warp_prepare, static_export, subfolders, rename, hide, folder, image, anim, move, delete = self._fill_menu(menu, node)
         grouping = len(self.model().picked) > 1
         picked = menu.exec(self.viewport().mapToGlobal(pos))
         chosen = menu._chosen if menu._chosen is not None else picked
@@ -1191,10 +1268,67 @@ class Outliner(QTreeView):
                 self.host.group_selection()
             else:
                 self.host.make_folder(node)
+        elif chosen == image:
+            self.host.pick_image()
         elif anim is not None and chosen == anim:
             self.host.mark_animation(node)
         elif chosen == move:
             self.host.move_picked(node)
+        elif chosen == delete:
+            self.host.delete_layers()
+
+
+class TabClose(QToolButton):
+    """Close mark inset from the tab border. Same grey as mute and solo."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 6px before the mark, the mark, 6px after it so the stroke stays off the border.
+        self.setFixedSize(18, 12)
+        self.setCursor(Qt.ArrowCursor)
+        self.setAutoRaise(True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setToolTip("Close this tab")
+        self.setStyleSheet(
+            "QToolButton { background: transparent; border: none; border-radius: 0; padding: 0; }"
+        )
+        self._hover = False
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        color = QColor(INK if self._hover or self.isDown() else QUIET)
+        painter.setPen(QPen(color))
+        painter.drawLine(6, 3, 11, 8)
+        painter.drawLine(11, 3, 6, 8)
+
+
+class ProjectTabs(QTabBar):
+    """Short tabs. A long name ends in an ellipsis before the close mark."""
+
+    MAX_WIDTH = 240
+
+    def tabSizeHint(self, index):
+        hint = super().tabSizeHint(index)
+        hint.setHeight(20)
+        if hint.width() > self.MAX_WIDTH:
+            hint.setWidth(self.MAX_WIDTH)
+        return hint
+
+    def minimumTabSizeHint(self, index):
+        hint = super().minimumTabSizeHint(index)
+        hint.setHeight(20)
+        return hint
 
 
 class ArrangeLock(QPushButton):
@@ -1205,7 +1339,7 @@ class ArrangeLock(QPushButton):
         self.setCheckable(True)
         self.setFixedSize(22, 22)
         self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet("QPushButton { padding: 0; border: none; background: #000000; }")
+        self.setStyleSheet(theme.lock_sheet())
         self._tip()
 
     def setChecked(self, checked):
@@ -1224,7 +1358,7 @@ class ArrangeLock(QPushButton):
         unlocked = self.isChecked()
         color = QColor(INK if unlocked else QUIET)
         edge = QColor(INK if unlocked else RULE)
-        painter.fillRect(self.rect(), QColor("#000000"))
+        painter.fillRect(self.rect(), QColor(FIELD))
         painter.setPen(QPen(edge))
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
@@ -1237,6 +1371,77 @@ class ArrangeLock(QPushButton):
             painter.drawLine(13, 6, 13, 8)
         else:
             painter.drawLine(13, 6, 13, 11)
+        painter.end()
+
+
+class PaneHeader(QWidget):
+    """The pane title. A tap collapses that pane. The lock is not this button."""
+
+    clicked = Signal()
+
+    def __init__(self, title, corner=None):
+        super().__init__()
+        self.title = title
+        self.corner = corner
+        self.collapsed = False
+        self._hover = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("paneHeader")
+        self.setFixedHeight(28)
+        if corner is not None:
+            corner.setParent(self)
+
+    def enterEvent(self, _event):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, _event):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            corner = self.corner
+            if corner is not None and corner.isVisible() and corner.geometry().contains(event.position().toPoint()):
+                event.ignore()
+                return
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_corner()
+
+    def _place_corner(self):
+        if self.corner is None:
+            return
+        if self.collapsed:
+            self.corner.hide()
+            return
+        self.corner.show()
+        self.corner.move(self.width() - self.corner.width() - 2, (self.height() - self.corner.height()) // 2)
+        self.corner.raise_()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(FIELD))
+        painter.setPen(QColor(INK if self._hover else RULE))
+        if not self.collapsed:
+            reserve = self.corner.width() + 8 if self.corner is not None else 0
+            painter.drawText(QRect(0, 0, max(0, self.width() - reserve), self.height()), Qt.AlignVCenter | Qt.AlignLeft, self.title)
+        else:
+            painter.save()
+            painter.translate(self.width() / 2.0, self.height() / 2.0)
+            painter.rotate(-90)
+            painter.drawText(
+                QRect(int(-self.height() / 2), int(-self.width() / 2), self.height(), self.width()),
+                Qt.AlignCenter,
+                self.title,
+            )
+            painter.restore()
         painter.end()
 
 
@@ -1270,6 +1475,13 @@ class PictureView(QWidget):
         self.selection = []
         self._draft = []
         self._hover = None
+        self.draw_mode = ""
+        self.draw_color = "#FF3EB8"
+        self.on_draw = None
+        self._poly = []
+        self._dabs = []
+        self._brush_radius = 12.0
+        self._tablet_at = 0.0
         self._space = False
         self._drag = None
         self._last = None
@@ -1296,10 +1508,7 @@ class PictureView(QWidget):
         button = QPushButton(text, self)
         button.setFixedSize(28, 24)
         button.setToolTip(tip)
-        button.setStyleSheet(
-            "QPushButton { padding: 0; border: 1px solid #2a2a2a; background: #000000; color: #3a3a3a; }"
-            "QPushButton:hover { border-color: #ffffff; color: #ffffff; }"
-        )
+        button.setStyleSheet(theme.zoom_sheet())
         return button
 
     def viewport(self):
@@ -1361,10 +1570,20 @@ class PictureView(QWidget):
         self.update()
 
     def zoom_by(self, factor):
+        old = self._shown_scale()
         base = self._base_scale()
-        shown = clamp_zoom(base * self.zoom * float(factor))
+        shown = clamp_zoom(old * float(factor))
         self.zoom = shown / base if base > 0 else 1.0
+        self._hold_window_center(old, self._shown_scale())
         self.apply()
+
+    def _hold_window_center(self, old_scale, new_scale):
+        """Keep the image point under the canvas center when the scale changes."""
+        if old_scale <= 0 or new_scale <= 0 or old_scale == new_scale:
+            return
+        ratio = new_scale / old_scale
+        self.pan_x *= ratio
+        self.pan_y *= ratio
 
     def _base_scale(self):
         image = self._image
@@ -1406,6 +1625,33 @@ class PictureView(QWidget):
             dw, dh = iw, ih
         return ix / iw * dw, iy / ih * dh
 
+    def document_point(self, pos):
+        """Document pixel, including a point outside the canvas."""
+        image = self._image
+        dw, dh = self._doc
+        if dw <= 0 or dh <= 0:
+            dw, dh = 1, 1
+        if image is not None and not image.isNull() and image.width() > 0 and image.height() > 0:
+            iw, ih = image.width(), image.height()
+            scale = self._shown_scale()
+        else:
+            iw, ih = dw, dh
+            scale = 1.0
+        if scale <= 0:
+            scale = 1.0
+        x = pos.x() if hasattr(pos, "x") else pos[0]
+        y = pos.y() if hasattr(pos, "y") else pos[1]
+        dx = float(x) - (self.width() / 2.0 + self.pan_x)
+        dy = float(y) - (self.height() / 2.0 + self.pan_y)
+        rad = math.radians(self.rotation)
+        cos = math.cos(rad)
+        sin = math.sin(rad)
+        ux = dx * cos + dy * sin
+        uy = -dx * sin + dy * cos
+        ix = ux / scale + iw / 2.0
+        iy = uy / scale + ih / 2.0
+        return ix / iw * dw, iy / ih * dh
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._place_zoom()
@@ -1425,7 +1671,7 @@ class PictureView(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#000000"))
+        painter.fillRect(self.rect(), QColor(FIELD))
         painter.setRenderHint(QPainter.Antialiasing, False)
         image = self._image
         if image is None or image.isNull():
@@ -1439,9 +1685,14 @@ class PictureView(QWidget):
             painter.translate(-image.width() / 2.0, -image.height() / 2.0)
             painter.drawPixmap(0, 0, image)
             self._paint_selection(painter)
+            self._paint_draw(painter)
             painter.resetTransform()
         if self.height() >= 36:
-            if self.cut_active:
+            if self.draw_mode == "warp-target":
+                text = "CLICK CORNERS  ·  ENTER CLOSES  ·  ESC CANCELS"
+            elif self.draw_mode == "warp-mask":
+                text = "DRAW THE WARP MASK  ·  ESC LEAVES THE BRUSH"
+            elif self.cut_active:
                 text = "SHIFT+X DONE   ·   DRAG A SELECTION   ·   CUT TO FOLDER OR DELETE"
             else:
                 text = "SCROLL ZOOM   ·   SPACE PAN   ·   SHIFT ROTATE   ·   CLICK A LAYER"
@@ -1462,7 +1713,51 @@ class PictureView(QWidget):
         self.cut_active = bool(active)
         if not active:
             self.clear_selection()
+        self._cursor()
         self.update()
+
+    def set_draw_mode(self, mode, color=None):
+        self.draw_mode = mode or ""
+        if color:
+            self.draw_color = color
+        self._poly = []
+        self._dabs = []
+        self._hover = None
+        if self.draw_mode and self.cut_active:
+            self.cut_active = False
+            self.clear_selection()
+        self._cursor()
+        self.update()
+
+    def close_warp_polygon(self):
+        if self.draw_mode != "warp-target" or len(self._poly) < 3:
+            return False
+        points = list(self._poly)
+        self._poly = []
+        self._hover = None
+        if self.on_draw:
+            self.on_draw("close", points)
+        self.update()
+        return True
+
+    def _point_pressure(self, event):
+        try:
+            points = event.points()
+            if points:
+                return max(0.0, min(1.0, float(points[0].pressure())))
+        except Exception:
+            pass
+        return 1.0
+
+    def _tablet_mouse(self, event):
+        source = event.source() if hasattr(event, "source") else None
+        for name in ("MouseEventSynthesizedBySystem", "MouseEventSynthesizedByQt"):
+            value = getattr(Qt, name, None)
+            if value is not None and source == value:
+                return True
+        if self._tablet_at and (time.monotonic() - self._tablet_at) < 0.03:
+            return True
+        return False
 
     def clear_selection(self):
         self.selection = []
@@ -1522,6 +1817,64 @@ class PictureView(QWidget):
         else:
             painter.drawPolyline(polygon)
 
+    def _paint_draw(self, painter):
+        if self.draw_mode == "warp-target" and (self._poly or self._hover):
+            points = list(self._poly)
+            if self._hover is not None and points:
+                points = points + [self._hover]
+            if len(points) >= 2:
+                mapped = [self._doc_to_preview(x, y) for x, y in points]
+                pen = QPen(QColor(self.draw_color or "#FF3EB8"))
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in mapped]))
+        if self.draw_mode != "warp-mask":
+            return
+        color = QColor(self.draw_color or "#FF3EB8")
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        dw, dh = self._doc
+        image = self._image
+        scale = 1.0
+        if image is not None and not image.isNull() and dw > 0:
+            scale = float(image.width()) / float(dw)
+        for x, y, radius in self._dabs:
+            px, py = self._doc_to_preview(x, y)
+            reach = max(0.5, float(radius) * scale)
+            painter.drawEllipse(QPointF(px, py), reach, reach)
+        if self._hover is not None and self._drag != "mask":
+            px, py = self._doc_to_preview(self._hover[0], self._hover[1])
+            reach = max(0.5, float(self._brush_radius) * scale)
+            painter.setBrush(Qt.NoBrush)
+            pen = QPen(color)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawEllipse(QPointF(px, py), reach, reach)
+
+    def _draw_press(self, event):
+        if not self.draw_mode or event.button() != Qt.LeftButton or self._space:
+            return False
+        if self._gesture(event) != "pick":
+            return False
+        doc = self.document_point(event.position())
+        if doc is None:
+            event.accept()
+            return True
+        pressure = self._point_pressure(event)
+        if self.draw_mode == "warp-target":
+            self._poly.append(doc)
+            self.update()
+            event.accept()
+            return True
+        if self.draw_mode == "warp-mask":
+            self._drag = "mask"
+            if self.on_draw:
+                self.on_draw("press", (doc[0], doc[1], pressure))
+            event.accept()
+            return True
+        return False
+
     def _cut_press(self, event):
         if not self.cut_active or event.button() != Qt.LeftButton or self._space:
             return False
@@ -1566,6 +1919,15 @@ class PictureView(QWidget):
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
+        if self.draw_mode == "warp-target" and event.button() == Qt.LeftButton:
+            if len(self._poly) >= 2:
+                last = self._poly[-1]
+                prev = self._poly[-2]
+                if abs(last[0] - prev[0]) < 2 and abs(last[1] - prev[1]) < 2:
+                    self._poly.pop()
+            self.close_warp_polygon()
+            event.accept()
+            return
         if self.cut_active and self.cut_tool == "poly" and event.button() == Qt.LeftButton:
             if len(self._draft) >= 2:
                 last = self._draft[-1]
@@ -1578,6 +1940,11 @@ class PictureView(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
+        if self.draw_mode and self._tablet_mouse(event):
+            event.accept()
+            return
+        if self._draw_press(event):
+            return
         if self._cut_press(event):
             return
         mode = self._gesture(event)
@@ -1596,6 +1963,21 @@ class PictureView(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self.draw_mode and self._tablet_mouse(event) and self._drag != "mask":
+            event.accept()
+            return
+        if self.draw_mode == "warp-target" and self._drag not in ("pan", "rotate", "cut"):
+            self._hover = self.document_point(event.position())
+            self.update()
+        elif self.draw_mode == "warp-mask" and self._drag != "mask":
+            self._hover = self.document_point(event.position())
+            self.update()
+        if self._drag == "mask":
+            doc = self.document_point(event.position())
+            if doc is not None and self.on_draw:
+                self.on_draw("move", (doc[0], doc[1], self._point_pressure(event)))
+            event.accept()
+            return
         if self.cut_active and self.cut_tool == "poly" and self._drag != "cut":
             self._hover = self.document_at(event.position())
             self.update()
@@ -1636,6 +2018,12 @@ class PictureView(QWidget):
         if self.mouseGrabber() is self:
             self.releaseMouse()
         self._cursor()
+        if drag == "mask":
+            if self.on_draw:
+                self.on_draw("release", None)
+            self.update()
+            event.accept()
+            return
         if drag == "cut":
             if self.cut_tool == "rect" and len(self._draft) == 2:
                 x0, y0 = self._draft[0]
@@ -1656,6 +2044,47 @@ class PictureView(QWidget):
             return
         super().mouseReleaseEvent(event)
 
+    def tabletEvent(self, event):
+        kind = event.type()
+        self._tablet_at = time.monotonic()
+        pos = event.position()
+        try:
+            pressure = max(0.0, min(1.0, float(event.pressure())))
+        except Exception:
+            pressure = 1.0
+        if kind == QEvent.Type.TabletPress and self.draw_mode:
+            class _Press(object):
+                pass
+            fake = _Press()
+            fake.button = lambda: Qt.LeftButton
+            fake.position = lambda: pos
+            fake.modifiers = event.modifiers
+            fake.points = lambda: []
+            if self._gesture(fake) == "pick" and not self._space:
+                doc = self.document_point(pos)
+                if doc is not None and self.draw_mode == "warp-mask":
+                    self._drag = "mask"
+                    if self.on_draw:
+                        self.on_draw("press", (doc[0], doc[1], pressure))
+                elif doc is not None and self.draw_mode == "warp-target":
+                    self._poly.append(doc)
+                    self.update()
+            event.accept()
+            return
+        if kind == QEvent.Type.TabletMove and self._drag == "mask":
+            doc = self.document_point(pos)
+            if doc is not None and self.on_draw:
+                self.on_draw("move", (doc[0], doc[1], pressure))
+            event.accept()
+            return
+        if kind == QEvent.Type.TabletRelease and self._drag == "mask":
+            self._drag = None
+            if self.on_draw:
+                self.on_draw("release", None)
+            event.accept()
+            return
+        event.ignore()
+
     def event(self, event):
         if event.type() == QEvent.Type.Gesture:
             return self._pinch(event)
@@ -1672,9 +2101,11 @@ class PictureView(QWidget):
             self._pinch_center = pinch.centerPoint()
             self._drag = None
         if state in (Qt.GestureState.GestureStarted, Qt.GestureState.GestureUpdated):
+            old = self._shown_scale()
             base = self._base_scale()
             shown = clamp_zoom(self._pinch_scale * pinch.totalScaleFactor())
             self.zoom = shown / base if base > 0 else 1.0
+            self._hold_window_center(old, self._shown_scale())
             self.rotation = self._pinch_rotation + pinch.totalRotationAngle()
             center = pinch.centerPoint()
             if self._pinch_center is not None:
@@ -1732,6 +2163,8 @@ class PictureView(QWidget):
             self.setCursor(Qt.OpenHandCursor)
         elif self._drag == "rotate":
             self.setCursor(Qt.SizeHorCursor)
+        elif self.draw_mode and not self._space:
+            self.setCursor(Qt.CrossCursor)
         else:
             self.unsetCursor()
 
@@ -1769,32 +2202,44 @@ class LabelDelegate(QStyledItemDelegate):
 
 
 class ObjectDelegate(QStyledItemDelegate):
-    """The same guides as the layer tree. Names stay quiet, the selection white."""
+    """Names use the ink color. A warp role stays pink or purple until that row is selected."""
 
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), 22)
 
     def paint(self, painter, option, index):
-        tree = option.widget
-        if tree is not None and not isinstance(tree, ObjectOutliner):
-            tree = tree.parent()
-        item = tree.itemFromIndex(index) if isinstance(tree, ObjectOutliner) else None
-        if item is None:
-            return
+        widget = option.widget
+        tree = None
+        for _step in range(6):
+            if isinstance(widget, ObjectOutliner):
+                tree = widget
+                break
+            widget = widget.parent() if widget is not None else None
+        item = tree.itemFromIndex(index) if tree is not None else None
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, False)
         rect = option.rect
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         role = index.data(Qt.UserRole + 1) or ""
-        if selected:
-            color = INK
-        elif role == "target":
+        if role == "target" and not selected:
             color = WARP_PINK
-        elif role == "window":
+        elif role == "window" and not selected:
             color = WARP_PURPLE
         else:
-            color = QUIET
-        painter.fillRect(rect, QColor("#111111" if selected else "#000000"))
+            color = INK
+        font = QFont(option.font)
+        font.setStyleStrategy(
+            QFont.StyleStrategy.NoAntialias | QFont.StyleStrategy.NoSubpixelAntialias
+        )
+        font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        if item is None:
+            painter.fillRect(rect, QColor(ROW if selected else FIELD))
+            painter.setPen(QColor(color))
+            painter.setFont(font)
+            painter.drawText(rect.adjusted(8, 0, -4, 0), Qt.AlignVCenter, index.data(Qt.DisplayRole) or "")
+            painter.restore()
+            return
+        painter.fillRect(rect, QColor(ROW if selected else FIELD))
         depth = _item_depth(item)
         folder = item.childCount() > 0
         chain = _item_chain(item)
@@ -1832,7 +2277,7 @@ class ObjectDelegate(QStyledItemDelegate):
                     disclosure.center().x(), disclosure.bottom() - 2,
                 )
         painter.setPen(QColor(color))
-        painter.setFont(option.font)
+        painter.setFont(font)
         text = index.data(Qt.DisplayRole) or ""
         available = max(0, rect.right() - name_x - 4)
         shown = painter.fontMetrics().elidedText(text, Qt.ElideRight, available)
@@ -1845,8 +2290,46 @@ class ObjectDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class ObjectsPane(QWidget):
+    """The objects pane. Preview is a row at the bottom right."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("objectsPane")
+
+
+class ScenePreview(QDialog):
+    """A still of the objects about to export. Closed until Preview is clicked."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Scene preview")
+        self.setModal(False)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setStyleSheet(theme.dialog_sheet())
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        title = QLabel("SCENE")
+        title.setObjectName("title")
+        layout.addWidget(title)
+        self.picture = QLabel()
+        self.picture.setAlignment(Qt.AlignCenter)
+        self.picture.setMinimumSize(160, 90)
+        layout.addWidget(self.picture)
+        self.names = QLabel("No objects yet.")
+        self.names.setWordWrap(True)
+        self.names.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.names)
+        self.resize(360, 280)
+
+
 class ObjectOutliner(QTreeWidget):
-    """The level, filtered from the layer tree. The top of a group is in front."""
+    """Every object, in scene order. Drag a row up or down. The top row is behind."""
 
     def __init__(self, host):
         super().__init__()
@@ -1875,6 +2358,14 @@ class ObjectOutliner(QTreeWidget):
         width = self.viewport().width()
         if width > 0 and self.columnWidth(0) != width:
             self.setColumnWidth(0, width)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not event.isAutoRepeat():
+            mods = event.modifiers()
+            if not (mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)):
+                self.host.delete_objects()
+                return
+        super().keyPressEvent(event)
 
     def _disclosure_rect(self, index):
         item = self.itemFromIndex(index)
@@ -1908,24 +2399,57 @@ class ObjectOutliner(QTreeWidget):
             QToolTip.showText(event.globalPosition().toPoint(), tip, self)
         super().mouseMoveEvent(event)
 
-    def dropEvent(self, event):
-        moving = {item.data(0, Qt.UserRole) for item in self.selectedItems()}
-        target = self.itemAt(event.position().toPoint())
-        onto = self.dropIndicatorPosition() == QAbstractItemView.DropIndicatorPosition.OnItem
-        if onto and target is not None and self._would_cycle(moving, target):
-            event.ignore()
-            self.host.status.showMessage("An object stays out of its own contents.")
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
             return
-        super().dropEvent(event)
-        QTimer.singleShot(0, self.host._apply_object_tree)
+        event.ignore()
 
-    def _would_cycle(self, moving, target):
-        item = target
-        while item is not None:
-            if item.data(0, Qt.UserRole) in moving:
-                return True
-            item = item.parent()
-        return False
+    def dragMoveEvent(self, event):
+        super().dragMoveEvent(event)
+        if event.source() is self:
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """Move whole rows up or down. A drop never nests one object inside another."""
+        moving = []
+        for index in range(self.topLevelItemCount()):
+            item = self.topLevelItem(index)
+            if item.isSelected():
+                ident = item.data(0, Qt.UserRole)
+                if ident:
+                    moving.append(ident)
+        if not moving:
+            event.ignore()
+            return
+        pos = event.position().toPoint()
+        target = self.itemAt(pos)
+        target_id = target.data(0, Qt.UserRole) if target is not None else None
+        if target_id in moving:
+            event.ignore()
+            return
+        ids = []
+        for index in range(self.topLevelItemCount()):
+            ident = self.topLevelItem(index).data(0, Qt.UserRole)
+            if ident not in moving:
+                ids.append(ident)
+        if target is None or target_id not in ids:
+            at = len(ids)
+        else:
+            at = ids.index(target_id)
+            indicator = self.dropIndicatorPosition()
+            above = QAbstractItemView.DropIndicatorPosition.AboveItem
+            below = QAbstractItemView.DropIndicatorPosition.BelowItem
+            if indicator == below:
+                at += 1
+            elif indicator != above:
+                rect = self.visualRect(self.indexFromItem(target))
+                if not rect.isValid() or pos.y() >= rect.center().y():
+                    at += 1
+        for offset, ident in enumerate(moving):
+            ids.insert(at + offset, ident)
+        event.accept()
+        self.host._apply_scene_order(ids)
 
     def rows(self):
         def group(parent):
@@ -2008,7 +2532,7 @@ class CutFolderDialog(QDialog):
         self.as_object.setObjectName("cutObject")
         self.as_object.setStyleSheet(
             "QCheckBox { color: #ffffff; spacing: 8px; }"
-            "QCheckBox::indicator { width: 14px; height: 14px;"
+            "QCheckBox::indicator { width: 14px; height: 14px; border-radius: 0;"
             " border: 1px solid #ffffff; background: #000000; }"
             "QCheckBox::indicator:checked { background: #ffffff; }"
         )
@@ -2239,6 +2763,64 @@ class _PictureJob(QThread):
         self.ready.emit(self.generation, image, error)
 
 
+def raster_from_image(path):
+    """One RGBA plate from a picture file. The name is the file stem."""
+    from PIL import Image
+
+    from vmi_studio.catalog import is_image
+
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError("That image is missing.")
+    if not is_image(path):
+        raise ValueError("Choose a picture.")
+    with Image.open(path) as image:
+        plate = image.convert("RGBA")
+        width, height = plate.size
+        if width < 1 or height < 1:
+            raise ValueError("That image is empty.")
+        rgba = plate.tobytes("raw", "RGBA")
+    stem = os.path.splitext(os.path.basename(path))[0] or "Image"
+    return stem, Raster(0, 0, width, height, rgba)
+
+
+class OpenTab:
+    """One drawing in the editor. Its export folder is not shared."""
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.export_dir = default_export_parent(self.path)
+        self.loaded = False
+        self.art = None
+        self.objects = []
+        self.picked = set()
+        self.history = History()
+        self.playlist = ""
+        self.arrange_locked = True
+        self.tasks = []
+        self.task_colors = {"background": "#000000", "text": "#FFFFFF"}
+        self.low_res = False
+
+
+class PictureSplit(QSplitter):
+    """Picture over the timeline. The handle is the Timeline button and its line."""
+
+    def __init__(self):
+        super().__init__(Qt.Vertical)
+        self.setObjectName("pictureSplit")
+        self.setHandleWidth(TimelineGutter.BAND)
+        self.setChildrenCollapsible(False)
+        self._on_resize = None
+
+    def createHandle(self):
+        return TimelineGutter(self.orientation(), self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        callback = self._on_resize
+        if callback is not None:
+            callback()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, dev=False):
         super().__init__()
@@ -2254,6 +2836,17 @@ class MainWindow(QMainWindow):
         self._save_timer.setInterval(200)
         self._save_timer.timeout.connect(self._save_session)
         self.dev = dev
+        self._home = None
+        self._quitting = False
+        self._note_open = None
+        self._projects = []
+        self._shown_index = -1
+        self._loading_index = -1
+        self._tab_guard = False
+        self._on_browser = True
+        self._gate = None
+        self._shade = None
+        self._image_pick = None
         self.art = None
         self.objects = []
         self.picked = set()
@@ -2261,7 +2854,11 @@ class MainWindow(QMainWindow):
         self._flat = None
         self._loader = None
         self._loading = False
+        self._hold_gate = False
         self._saver = None
+        self._uploader = None
+        self._upload_name = ""
+        self._cloud_dialog = None
         self.history = History()
         self._fingers = FingerChords()
         self._watch_base = None
@@ -2274,7 +2871,25 @@ class MainWindow(QMainWindow):
         self.picture = PictureView()
         self.picture.on_resize = self._picture_resized
         self.picture.on_pick = self.choose_picture
+        self.picture.on_draw = self._on_draw
         self._preview_edge = None
+        self._mask = None
+        self._mask_id = None
+        self._mask_last = None
+        self._filling_objects = False
+        self._export_side = "layers"
+        self._png_percent = 100
+        self._png_resample = "nearest"
+        self._png_recent = []
+        self._png_favorites = []
+        self._pane_open = {}
+        self._pane_width = {}
+        self._pane_headers = {}
+        self._pane_bodies = {}
+        self._timeline_open = True
+        self._timeline_dragged = False
+        self._timeline_span = 0
+        self._timeline_seed_guard = False
         self.caption = QLabel("")
         self.caption.setObjectName("title")
         self.timeline_title = QLabel("TIMELINE", self)
@@ -2296,8 +2911,13 @@ class MainWindow(QMainWindow):
         delete_key.setShortcutContext(Qt.WidgetShortcut)
         delete_key.triggered.connect(self.delete_objects)
         self.objects_list.addAction(delete_key)
+        backspace_key = QAction(self.objects_list)
+        backspace_key.setShortcut(QKeySequence(Qt.Key_Backspace))
+        backspace_key.setShortcutContext(Qt.WidgetShortcut)
+        backspace_key.triggered.connect(self.delete_objects)
+        self.objects_list.addAction(backspace_key)
         self.objects_list.itemChanged.connect(self._object_renamed)
-        self.objects_list.currentItemChanged.connect(lambda *_: self._show_slots())
+        self.objects_list.currentItemChanged.connect(self._object_focused)
         self.objects_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.objects_list.customContextMenuRequested.connect(self._object_menu)
         self.slots = QTreeWidget()
@@ -2316,21 +2936,60 @@ class MainWindow(QMainWindow):
         self.arrange_lock = ArrangeLock()
         self.arrange_lock.toggled.connect(self._arrange_toggled)
         self.split = QSplitter(Qt.Horizontal)
-        self.split.addWidget(self._pane("LAYERS", self.tree, self.arrange_lock))
+        self.split.addWidget(self._pane("LAYERS", self.tree, self.arrange_lock, "layers"))
         picture_body = QWidget()
         picture_layout = QVBoxLayout(picture_body)
         picture_layout.setContentsMargins(0, 0, 0, 0)
         picture_layout.setSpacing(4)
-        picture_layout.addWidget(self.picture, 1)
+        self.picture_split = PictureSplit()
+        self.picture_split._on_resize = self._seed_timeline_split
+        picture_top = QWidget()
+        top_layout = QVBoxLayout(picture_top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(4)
+        top_layout.addWidget(self.picture, 1)
+        self.draw_bar = DrawBar()
+        self.draw_bar.mode_requested.connect(self.set_draw_mode)
+        self.draw_bar.color_changed.connect(self._warp_recolor)
+        self.draw_bar.setEnabled(False)
         self._cut_target = None
         self.cut_bar = self._cut_bar()
-        picture_layout.addWidget(self.cut_bar)
+        top_layout.addWidget(self.draw_bar)
+        top_layout.addWidget(self.cut_bar)
+        picture_top.setMinimumHeight(80)
+        self.film = Filmstrip()
+        self.film.cel_chosen.connect(self._film_chosen)
+        self.film.moved.connect(self._film_moved)
+        self.film.scrubbed.connect(self._film_scrubbed)
+        self._playing = False
+        self._loop = False
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+        self.transport = Transport()
+        self.transport.back_frame.connect(lambda: self._step_frame(-1))
+        self.transport.forward_frame.connect(lambda: self._step_frame(1))
+        self.transport.play.connect(self._toggle_play)
+        self.transport.loop.connect(self._toggle_loop)
+        picture_bottom = QWidget()
+        bottom_layout = QVBoxLayout(picture_bottom)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(4)
+        bottom_layout.addWidget(self.transport)
+        bottom_layout.addWidget(self.film, 1)
+        self.picture_split.addWidget(picture_top)
+        self.picture_split.addWidget(picture_bottom)
+        self.picture_split.setStretchFactor(0, 1)
+        self.picture_split.setStretchFactor(1, 0)
+        self.timeline_gutter = self.picture_split.handle(1)
+        self.timeline_gutter.clicked.connect(self._toggle_timeline)
+        self.timeline_gutter.dragged.connect(self._timeline_user_dragged)
+        picture_layout.addWidget(self.picture_split, 1)
         picture_layout.addWidget(self.caption)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
         self.split.addWidget(self._pane("PICTURE", picture_body))
-        self.split.addWidget(self._pane("OBJECTS", self._objects_body()))
+        self.split.addWidget(self._pane("OBJECTS", self._objects_body(), key="objects"))
         self.split.setHandleWidth(GUTTER)
         self.split.setChildrenCollapsible(False)
         self.split.splitterMoved.connect(self._split_dragged)
@@ -2338,14 +2997,27 @@ class MainWindow(QMainWindow):
             self.split.widget(index).setMinimumWidth(PANE_MIN)
         screen = QApplication.primaryScreen()
         if screen_pixels(screen) >= WIDE_SCREEN:
-            for index, factor in enumerate((9, 82, 9)):
+            for index, factor in enumerate(WIDE_FACTORS):
                 self.split.setStretchFactor(index, factor)
-        self.setCentralWidget(self.split)
+        self._install_browser()
+        self._tab_bar = self._tab_bar_row()
+        self._pages = QStackedWidget()
+        self._pages.addWidget(self.browser_page)
+        self._pages.addWidget(self.split)
+        self._pages.setCurrentWidget(self.browser_page)
+        shell = QWidget()
+        column = QVBoxLayout(shell)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(self._tab_bar)
+        column.addWidget(self._pages, 1)
+        self.setCentralWidget(shell)
         self.status = self.statusBar()
-        self.status.showMessage("Open a .clip, .psd, .kra, .xcf, or .vmib file.")
+        self.browser_page.status._forward = self.status.showMessage
+        self.browser_page._status_label.hide()
+        self.status.showMessage(self.browser_page.status.currentMessage())
         self._font_id = fonts.current_id()
-        self._font_actions = {}
-        self._font_previewed = False
+        self._theme_id = theme.current().id
         self._menu_bar()
         selection = self.tree.selectionModel()
         if selection is not None:
@@ -2358,22 +3030,23 @@ class MainWindow(QMainWindow):
             timer.start()
             self._timer = timer
 
-    def _pane(self, title, body, corner=None):
+    def _pane(self, title, body, corner=None, key=None):
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        label = QLabel(title)
-        label.setObjectName("title")
-        if corner is None:
-            layout.addWidget(label)
+        if key:
+            header = PaneHeader(title, corner)
+            header.clicked.connect(lambda name=key: self._toggle_pane(name))
+            self._pane_headers[key] = header
+            self._pane_bodies[key] = body
+            self._pane_open[key] = True
+            self._pane_width[key] = None
+            layout.addWidget(header, 0)
         else:
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(6)
-            row.addWidget(label, 1)
-            row.addWidget(corner, 0, Qt.AlignRight | Qt.AlignVCenter)
-            layout.addLayout(row)
+            label = QLabel(title)
+            label.setObjectName("title")
+            layout.addWidget(label)
         layout.addWidget(body, 1)
         # The long notes and tables must not force a pane wider than the gutter allows.
         wrap.setMinimumWidth(PANE_MIN)
@@ -2456,14 +3129,33 @@ class MainWindow(QMainWindow):
 
     def _objects_body(self):
         """The level outliner fills the top of this pane. Fields sit under it."""
-        body = QWidget()
+        body = ObjectsPane()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
-        self.object_note = QLabel("The top of a group is in front. Drop an object onto another to put it inside.")
+        self.object_note = QLabel("Scene order. The top row is behind. Drag a row up or down.")
         self.object_note.setWordWrap(True)
         layout.addWidget(self.object_note)
         layout.addWidget(self.objects_list, 1)
+        self.preview_button = QPushButton("Preview")
+        self.preview_button.setObjectName("scenePreview")
+        self.preview_button.setCursor(Qt.PointingHandCursor)
+        self.preview_button.setFixedSize(76, 22)
+        self.preview_button.setToolTip("A still of the scene this export will write.")
+        self._scene_preview = ScenePreview(self)
+        self.preview_button.clicked.connect(self.toggle_scene_preview)
+
+        slot = QVBoxLayout()
+        slot.setContentsMargins(0, 0, 0, 0)
+        slot.setSpacing(0)
+        holder = QWidget()
+        holder.setLayout(slot)
+        holder.setMinimumWidth(0)
+        holder.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.task_board = TaskBoard()
+        self.task_board.changed.connect(self._tasks_changed)
+        self.task_board.place(slot)
+        layout.addWidget(holder, 0)
 
         detail = QWidget()
         form = QVBoxLayout(detail)
@@ -2499,6 +3191,11 @@ class MainWindow(QMainWindow):
         scroll.setMaximumHeight(220)
         scroll.setWidget(detail)
         layout.addWidget(scroll, 0)
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 4, 4)
+        bar.addStretch(1)
+        bar.addWidget(self.preview_button)
+        layout.addLayout(bar)
         body.setMinimumWidth(0)
         body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         return body
@@ -2512,17 +3209,26 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self.save_blueprint)
         save_as_action = QAction("Save blueprint as", self)
         save_as_action.triggered.connect(self.save_blueprint_as)
+        cloud_action = QAction("Cloud storage", self)
+        cloud_action.triggered.connect(self.cloud_storage)
         export_action = QAction("Export scene", self)
         export_action.setShortcut(QKeySequence("Ctrl+E"))
         export_action.triggered.connect(self.export_scene)
+        png_action = QAction("Export PNG\tShift+E", self)
+        png_action.triggered.connect(self.export_png)
+        home_action = QAction("Launcher", self)
+        home_action.triggered.connect(self.show_browser)
         quit_action = QAction("Quit", self)
         quit_action.setShortcut(QKeySequence.Quit)
-        quit_action.triggered.connect(self.close)
+        quit_action.triggered.connect(self._quit)
         file_menu.addAction(open_action)
         file_menu.addAction(save_action)
         file_menu.addAction(save_as_action)
+        file_menu.addAction(cloud_action)
         file_menu.addAction(export_action)
+        file_menu.addAction(png_action)
         file_menu.addSeparator()
+        file_menu.addAction(home_action)
         file_menu.addAction(quit_action)
         edit_menu = self.menuBar().addMenu("Edit")
         undo_action = QAction("Undo\tCtrl+Z", self)
@@ -2555,64 +3261,34 @@ class MainWindow(QMainWindow):
         rotate_hint.setEnabled(False)
         view_menu.addAction(pan_hint)
         view_menu.addAction(rotate_hint)
-        self._font_menu()
         layer_menu = self.menuBar().addMenu("Layer")
+        image_action = QAction("Insert image", self)
+        image_action.triggered.connect(self.pick_image)
         group_action = QAction("Create folder and insert layer", self)
         group_action.setShortcut(QKeySequence("Ctrl+G"))
         group_action.setShortcutContext(Qt.WindowShortcut)
         group_action.triggered.connect(self.group_selection)
         anim_action = QAction("Animation folder", self)
         anim_action.triggered.connect(self.mark_current_animation)
+        target_action = QAction("Create warp target", self)
+        target_action.triggered.connect(lambda: self.set_draw_mode("warp-target"))
+        mask_action = QAction("Draw warp mask", self)
+        mask_action.triggered.connect(lambda: self.set_draw_mode("warp-mask"))
+        layer_menu.addAction(image_action)
         layer_menu.addAction(group_action)
         layer_menu.addAction(anim_action)
+        layer_menu.addAction(target_action)
+        layer_menu.addAction(mask_action)
+        self._settings_header()
 
-    def _font_menu(self):
-        menu = self.menuBar().addMenu("Font")
-        self._font_group = QActionGroup(self)
-        self._font_group.setExclusive(True)
-        buckets = {}
-        system = None
-        for face in fonts.catalog():
-            if face.id == fonts.DEFAULT_ID:
-                system = face
-                continue
-            buckets.setdefault(face.category, []).append(face)
-        if system is not None:
-            self._add_font_action(menu, system)
-            menu.addSeparator()
-        for category in fonts.CATEGORY_ORDER:
-            rows = buckets.pop(category, [])
-            if rows:
-                self._fill_font_menu(menu.addMenu(fonts.CATEGORY_LABELS.get(category, category)), rows)
-        for category, rows in buckets.items():
-            self._fill_font_menu(menu.addMenu(category), rows)
-        menu.aboutToShow.connect(self._preview_font_menu)
-
-    def _fill_font_menu(self, menu, rows):
-        for face in sorted(rows, key=lambda item: item.name.lower()):
-            self._add_font_action(menu, face)
-        menu.aboutToShow.connect(self._preview_font_menu)
-
-    def _add_font_action(self, menu, face):
-        action = QAction(face.name, self)
-        action.setCheckable(True)
-        action.setActionGroup(self._font_group)
-        action.triggered.connect(lambda _checked=False, ident=face.id: self.set_ui_font(ident))
-        action.setChecked(face.id == self._font_id)
-        menu.addAction(action)
-        self._font_actions[face.id] = action
-
-    def _preview_font_menu(self):
-        if self._font_previewed:
-            return
-        self._font_previewed = True
-        for ident, action in self._font_actions.items():
-            family = fonts.preview_family(ident)
-            if not family:
-                continue
-            font = QFont(family)
-            font.setPixelSize(12)
-            action.setFont(font)
+    def _settings_header(self):
+        """Settings replaces the Font menu. Font and theme are the dropdowns beside it."""
+        self.settings_bar = SettingsBar()
+        self.settings_bar.font_chosen.connect(self.set_ui_font)
+        self.settings_bar.theme_chosen.connect(self.set_ui_theme)
+        self.settings_bar.mark_font(self._font_id)
+        self.settings_bar.mark_theme(self._theme_id)
+        self.menuBar().setCornerWidget(self.settings_bar, Qt.TopRightCorner)
 
     def set_ui_font(self, ident):
         if ident == self._font_id:
@@ -2631,18 +3307,72 @@ class MainWindow(QMainWindow):
         _paint_font(QApplication.instance(), loaded, family)
         self._font_id = loaded.id
         self._check_font()
-        action = self._font_actions.get(loaded.id)
-        if action is not None:
-            preview = QFont(family)
-            preview.setPixelSize(12)
-            action.setFont(preview)
+        bar = getattr(self, "settings_bar", None)
+        if bar is not None:
+            bar.mark_font(loaded.id)
         self._persist_font()
         self.status.showMessage("UI font: %s" % loaded.name)
 
+    def set_ui_theme(self, ident):
+        """Choose a theme. The colors are the theme's. They are not edited."""
+        chosen = theme.choose(ident)
+        if chosen.id == self._theme_id and ident == chosen.id:
+            return
+        self._theme_id = chosen.id
+        theme.bind_modules(chosen)
+        face = fonts.get(self._font_id) or fonts.get(fonts.DEFAULT_ID)
+        try:
+            loaded, family = fonts.activate(face.id)
+        except Exception:
+            loaded, family = fonts.activate(fonts.DEFAULT_ID)
+        app = QApplication.instance()
+        if app is not None:
+            _paint_font(app, loaded, family)
+        self._refresh_theme_chrome()
+        self._persist_theme()
+        self.status.showMessage("Theme: %s" % chosen.name)
+
+    def _refresh_theme_chrome(self):
+        ui = theme.current()
+        if getattr(self, "tabs", None) is not None:
+            self.tabs.setStyleSheet(theme.tab_sheet(ui))
+        if getattr(self, "export_label", None) is not None:
+            self.export_label.setStyleSheet("color: %s;" % ui.ink)
+        if getattr(self, "transport", None) is not None:
+            self.transport.setStyleSheet(theme.transport_sheet(ui))
+        picture = getattr(self, "picture", None)
+        if picture is not None:
+            for button in (picture._zoom_out, picture._zoom_label, picture._zoom_in):
+                button.setStyleSheet(theme.zoom_sheet(ui))
+        if getattr(self, "cut_bar", None) is not None:
+            self.cut_bar.setStyleSheet(theme.cut_sheet(ui))
+        if getattr(self, "arrange_lock", None) is not None:
+            self.arrange_lock.setStyleSheet(theme.lock_sheet(ui))
+        page = getattr(self, "browser_page", None)
+        if page is not None and hasattr(page, "apply_theme"):
+            page.apply_theme()
+        pick = getattr(self, "_image_pick", None)
+        if pick is not None:
+            pick.setStyleSheet(theme.dialog_sheet(ui))
+        settings = getattr(self, "settings_bar", None)
+        if settings is not None:
+            settings.mark_theme(ui.id)
+        self.update()
+
+    def _persist_theme(self):
+        if self.art:
+            self._save_session()
+            return
+        data = load() or {}
+        if not isinstance(data, dict):
+            data = {}
+        data["theme"] = self._theme_id
+        save(data)
+
     def _check_font(self):
-        action = self._font_actions.get(self._font_id)
-        if action is not None:
-            action.setChecked(True)
+        bar = getattr(self, "settings_bar", None)
+        if bar is not None:
+            bar.mark_font(self._font_id)
 
     def _persist_font(self):
         if self.art:
@@ -2655,17 +3385,8 @@ class MainWindow(QMainWindow):
         save(data)
 
     def choose_file(self):
-        start = ""
-        if self.art and self.art.path:
-            start = os.path.dirname(self.art.path)
-        path, _selected = QFileDialog.getOpenFileName(
-            self,
-            "Open drawing",
-            start,
-            "Projects (*.vmib *.clip *.psd *.psb *.kra *.xcf);;All files (*)",
-        )
-        if path:
-            self.open_path(path)
+        """File → Open. Project files are chosen from the browser tab."""
+        self.show_browser()
 
     def save_blueprint(self):
         """Ctrl+S. An open blueprint is overwritten. A drawing is saved beside it."""
@@ -2707,8 +3428,10 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Still saving the blueprint.")
             return
         try:
+            rows, colors = self._task_snapshot()
             document, blobs = prepare_blueprint(
-                self.art, self.objects, self.playlist, self.arrange_locked
+                self.art, self.objects, self.playlist, self.arrange_locked,
+                tasks=rows, task_colors=colors,
             )
         except Exception as exc:
             self.status.showMessage(str(exc))
@@ -2723,8 +3446,10 @@ class MainWindow(QMainWindow):
         if not self.art:
             return
         source = {}
+        document = {}
         if self._saver is not None:
-            source = self._saver.document.get("source") or {}
+            document = self._saver.document or {}
+            source = document.get("source") or {}
         self.art.path = os.path.abspath(path)
         self.art.file_name = os.path.basename(path)
         self.art.kind = "vmib"
@@ -2734,35 +3459,534 @@ class MainWindow(QMainWindow):
             "arrange_locked": self.arrange_locked,
             "source_file": source.get("file") or "",
             "source_kind": source.get("kind") or "",
+            "tasks": list(document.get("tasks") or []),
+            "task_colors": dict(document.get("task_colors") or {"background": "#000000", "text": "#FFFFFF"}),
         }
         self.setWindowTitle("VMI STUDIO — %s" % self.art.file_name)
         self._save_session()
         self.status.showMessage("Saved %s." % self.art.file_name)
+        self._offer_upload(self.art.path)
 
     def _blueprint_failed(self, message):
         self.status.showMessage(message)
 
-    def open_path(self, path):
+    def cloud_storage(self):
+        """File → Cloud storage. The dialog is shown, not run as a nested loop."""
+        self._cloud_dialog = cloudstore.CloudDialog(self, cloudstore.load())
+        self._cloud_dialog.accepted.connect(
+            lambda: self.status.showMessage("Cloud storage saved.")
+        )
+        self._cloud_dialog.show()
+
+    def _offer_upload(self, path):
+        """After the zip is on disk. A failure here leaves that file alone."""
+        settings = cloudstore.load()
+        name = os.path.basename(path)
+        if not cloudstore.usable(settings):
+            return
+        if self._uploader is not None and self._uploader.isRunning():
+            self.status.showMessage("Saved %s. An upload is already running." % name)
+            return
+        self._upload_name = name
+        self._uploader = cloudstore.CloudThread(path, settings)
+        self._uploader.ok.connect(self._upload_ok)
+        self._uploader.bad.connect(self._upload_bad)
+        self._uploader.start()
+        self.status.showMessage("Saved %s. Uploading." % name)
+
+    def _upload_ok(self, label):
+        self.status.showMessage("Saved %s. Uploaded %s." % (self._upload_name or "blueprint", label))
+
+    def _upload_bad(self, message):
+        self.status.showMessage(
+            "Saved %s. Upload did not finish: %s." % (self._upload_name or "blueprint", message)
+        )
+
+    def _install_browser(self):
+        """The launcher lives in the window. It is not a second top-level window."""
+        seed = ""
+        book_path = None
+        if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+            book_path = os.path.join(tempfile.gettempdir(), "vmi-studio-offscreen-launcher.json")
+        else:
+            session = load() or {}
+            if isinstance(session, dict):
+                seed = session.get("path") or ""
+        self.browser_page = Launcher(book_path=book_path, seed_path=seed, dev=False)
+        self.browser_page.open_requested.connect(self.open_path)
+        self.browser_page.leave_app.connect(self._quit)
+
+    def _project_tab(self, project_index):
+        return project_index + 1
+
+    def _project_of_tab(self, tab_index):
+        return tab_index - 1
+
+    def _tab_bar_row(self):
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(8, 2, 8, 0)
+        row.setSpacing(8)
+        self.tabs = ProjectTabs()
+        self.tabs.setObjectName("projects")
+        self.tabs.setDrawBase(False)
+        self.tabs.setExpanding(False)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(False)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        self.tabs.setStyleSheet(theme.tab_sheet())
+        self.tabs.currentChanged.connect(self._tab_changed)
+        self.tabs.tabCloseRequested.connect(self._close_tab)
+        self._tab_guard = True
+        self.tabs.addTab("browser")
+        self.tabs.setTabToolTip(BROWSER_TAB, "Projects, tasks, and drawings")
+        self._tab_guard = False
+        row.addWidget(self.tabs, 1)
+        self.export_label = QLabel("")
+        self.export_label.setStyleSheet("color: #ffffff;")
+        row.addWidget(self.export_label)
+        return bar
+
+    def _tab_close_button(self):
+        button = TabClose(self.tabs)
+
+        def close_this():
+            index = self.tabs.tabAt(button.mapTo(self.tabs, button.rect().center()))
+            if index >= 0:
+                self._close_tab(index)
+
+        button.clicked.connect(close_this)
+        return button
+
+    def _begin_tab(self, path, low_res=False):
+        """Add a project tab to the right of the browser. Returns the project index."""
+        path = os.path.abspath(path)
+        project = OpenTab(path)
+        project.low_res = bool(low_res)
+        self._projects.append(project)
+        project_index = len(self._projects) - 1
+        self._tab_guard = True
+        tab_index = self.tabs.addTab(os.path.basename(path))
+        self.tabs.setTabButton(
+            tab_index, QTabBar.ButtonPosition.RightSide, self._tab_close_button()
+        )
+        self.tabs.setTabToolTip(tab_index, project.export_dir)
+        self.tabs.setCurrentIndex(tab_index)
+        self._tab_guard = False
+        self._on_browser = False
+        self._shown_index = project_index
+        self._show_editor_page()
+        self._tab_bar.setVisible(True)
+        self._show_export_label()
+        return project_index
+
+    def _finish_tab(self, index):
+        project = self._projects[index]
+        project.art = self.art
+        project.objects = self.objects
+        project.picked = self.picked
+        project.history = self.history
+        project.playlist = self.playlist or ""
+        project.arrange_locked = bool(self.arrange_locked)
+        project.tasks, project.task_colors = self._task_snapshot()
+        project.loaded = True
+        self.model.picked = self.picked
+        self._shown_index = index
+        name = self.art.file_name if self.art else os.path.basename(project.path)
+        tab_index = self._project_tab(index)
+        self.tabs.setTabText(tab_index, name)
+        self.tabs.setTabToolTip(tab_index, project.export_dir)
+        self._show_export_label()
+
+    def _stash(self, index):
+        if index < 0 or index >= len(self._projects) or self.art is None:
+            return
+        project = self._projects[index]
+        if not project.loaded:
+            return
+        if self.art.path and os.path.abspath(self.art.path) != project.path:
+            return
+        project.art = self.art
+        project.objects = self.objects
+        project.picked = self.picked
+        project.history = self.history
+        project.playlist = self.playlist or ""
+        project.arrange_locked = bool(self.arrange_locked)
+        project.tasks, project.task_colors = self._task_snapshot()
+
+    def _show_tab(self, project):
+        if not project.loaded or project.art is None:
+            return
+        self._catch_up_gate(project)
+        self._stop_play()
+        reset_plate_cache()
+        self._clear_draw()
+        self.art = project.art
+        self.objects = project.objects
+        self.picked = project.picked
+        self.model.picked = self.picked
+        self.history = project.history
+        self.playlist = project.playlist or ""
+        self._set_arrange_locked(project.arrange_locked)
+        self.picture.set_document(self.art.width, self.art.height)
+        self._place_picture(bool(getattr(project, "low_res", False)))
+        if getattr(self, "draw_bar", None) is not None:
+            self.draw_bar.setEnabled(True)
+        self.model.set_layers(self.art.layers)
+        self._show_playlist()
+        self._fill_objects()
+        self._apply_tasks(getattr(project, "tasks", []), getattr(project, "task_colors", None))
+        self._arm_playhead()
+        self.recomposite()
+        self._refresh_timeline()
+        self.setWindowTitle("VMI STUDIO — %s" % self.art.file_name)
+        self._show_export_label()
+        self._save_session()
+
+    def _show_export_label(self):
+        if getattr(self, "_on_browser", False):
+            self.export_label.setText("")
+            self.export_label.setToolTip("")
+            return
+        index = self._shown_index
+        if index < 0 or index >= len(self._projects):
+            tab = self.tabs.currentIndex() if getattr(self, "tabs", None) is not None else -1
+            index = self._project_of_tab(tab)
+        if index < 0 or index >= len(self._projects):
+            self.export_label.setText("")
+            self.export_label.setToolTip("")
+            return
+        path = self._projects[index].export_dir
+        self.export_label.setText(path)
+        self.export_label.setToolTip(path)
+
+    def _tab_export_dir(self):
+        index = self._shown_index
+        if index < 0 or index >= len(self._projects):
+            tab = self.tabs.currentIndex() if getattr(self, "tabs", None) is not None else -1
+            index = self._project_of_tab(tab)
+        if 0 <= index < len(self._projects):
+            return self._projects[index].export_dir
+        if self.art and self.art.path:
+            return default_export_parent(self.art.path)
+        return os.path.expanduser("~")
+
+    def _claim_export_dir(self, parent):
+        """Remember this tab's export parent. Refuse another tab's output folder."""
+        if not self.art:
+            return False
+        index = self._shown_index
+        if index < 0 or index >= len(self._projects):
+            tab = self.tabs.currentIndex() if getattr(self, "tabs", None) is not None else -1
+            index = self._project_of_tab(tab)
+        if index < 0 or index >= len(self._projects):
+            return True
+        name = self.art.file_name or os.path.basename(self._projects[index].path)
+        for other_index, project in enumerate(self._projects):
+            if other_index == index:
+                continue
+            other_name = project.art.file_name if project.art is not None else os.path.basename(project.path)
+            if same_export(parent, name, project.export_dir, other_name):
+                who = other_name
+                if who == name:
+                    who = project.path
+                self.status.showMessage(
+                    "That folder is the export for %s. This tab needs its own path." % who
+                )
+                return False
+        self._projects[index].export_dir = os.path.abspath(parent)
+        self.tabs.setTabToolTip(self._project_tab(index), self._projects[index].export_dir)
+        self._show_export_label()
+        return True
+
+    def _show_editor_page(self):
+        pages = getattr(self, "_pages", None)
+        if pages is not None:
+            pages.setCurrentWidget(self.split)
+        QTimer.singleShot(0, lambda: self._apply_split(self._split_saved))
+
+    def _show_browser_page(self):
+        self._on_browser = True
+        pages = getattr(self, "_pages", None)
+        if pages is not None and getattr(self, "browser_page", None) is not None:
+            pages.setCurrentWidget(self.browser_page)
+        self.export_label.setText("")
+        self.export_label.setToolTip("")
+        self.setWindowTitle("VMI STUDIO")
+        message = ""
+        page = getattr(self, "browser_page", None)
+        if page is not None:
+            message = page.status.currentMessage()
+        if message:
+            self.status.showMessage(message)
+
+    def show_browser(self):
+        """The leftmost tab. It stays, and File → Open selects it."""
         if self._loading:
             self.status.showMessage("Still reading.")
             return
+        if getattr(self, "tabs", None) is None or self.tabs.count() < 1:
+            return
+        if self.tabs.currentIndex() != BROWSER_TAB:
+            self.tabs.setCurrentIndex(BROWSER_TAB)
+            return
+        self._show_browser_page()
+
+    def _tab_changed(self, index):
+        if self._tab_guard or index < 0:
+            return
+        if index == BROWSER_TAB:
+            self._stash(self._shown_index)
+            self._show_browser_page()
+            return
+        project_index = self._project_of_tab(index)
+        self._on_browser = False
+        self._show_editor_page()
+        previous = self._shown_index
+        if previous != project_index:
+            self._stash(previous)
+        self._shown_index = project_index
+        if self._loading:
+            self._show_export_label()
+            return
+        if 0 <= project_index < len(self._projects) and self._projects[project_index].loaded:
+            self._show_tab(self._projects[project_index])
+        else:
+            self._show_export_label()
+
+    def _close_tab(self, index):
+        if index <= BROWSER_TAB:
+            return
+        if self._loading:
+            self.status.showMessage("Still reading.")
+            return
+        project_index = self._project_of_tab(index)
+        if project_index < 0 or project_index >= len(self._projects):
+            return
+        self._tab_guard = True
+        del self._projects[project_index]
+        self.tabs.removeTab(index)
+        self._tab_guard = False
+        if not self._projects:
+            self._shown_index = -1
+            self._clear_editor()
+            self._tab_guard = True
+            self.tabs.setCurrentIndex(0)
+            self._tab_guard = False
+            self._show_browser_page()
+            return
+        nxt = min(project_index, len(self._projects) - 1)
+        self._shown_index = -1
+        tab = self._project_tab(nxt)
+        if self.tabs.currentIndex() != tab:
+            self.tabs.setCurrentIndex(tab)
+        else:
+            self._shown_index = nxt
+            self._on_browser = False
+            self._show_editor_page()
+            self._show_tab(self._projects[nxt])
+
+    def _clear_editor(self):
+        self._stop_play()
+        self.art = None
+        self.objects = []
+        self.picked = set()
+        self.model.picked = self.picked
+        self.history = History()
+        self.playlist = ""
+        self.model.set_layers([])
+        self._fill_objects()
+        self._apply_tasks([], None)
+        self.picture.set_document(1, 1)
+        self.setWindowTitle("VMI STUDIO")
+        self.export_label.setText("")
+        self.status.showMessage("Open a .clip, .psd, .kra, .xcf, or .vmib file.")
+
+    def _place_shade(self):
+        shade = getattr(self, "_shade", None)
+        if shade is None:
+            return
+        frame = self.frameGeometry()
+        if frame.width() < 2 or frame.height() < 2:
+            frame = self.geometry()
+        shade.setGeometry(frame)
+
+    def _catch_up_gate(self, project):
+        """Dim the studio. The graphic and the bar stay up until this plate is ready."""
+        art = project.art
+        name = art.file_name if art is not None else os.path.basename(project.path)
+        self._hold_gate = True
         self._loading = True
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._show_gate(name, catchup=True)
+
+    def _show_gate(self, file_name, catchup=False):
+        if self._gate is None:
+            self._gate = LoadGate(file_name)
+        else:
+            self._gate.set_name(file_name)
+            self._gate.bar.reset()
+        self._gate.set_catchup(bool(catchup))
+        if self._shade is None:
+            self._shade = EditorShade(self)
+        self._place_shade()
+        self._shade.show()
+        self._shade.raise_()
+        self._gate.show()
+        self._gate.raise_()
+        self._gate.activateWindow()
+
+    def _hide_gate(self):
+        if self._gate is not None:
+            self._gate.hide()
+        pick = getattr(self, "_image_pick", None)
+        if pick is not None and pick.isVisible():
+            return
+        if self._shade is not None:
+            self._shade.hide()
+
+    def _release_gate(self):
+        """The picture is on screen. The loading window can leave."""
+        if self._gate is not None:
+            self._gate.bar.complete()
+        self._hold_gate = False
+        self._loading = False
+        self._hide_gate()
+
+    def _load_note(self, text):
+        self.status.showMessage(text)
+        if self._gate is not None:
+            self._gate.hear(text)
+
+    def _reveal_behind_gate(self):
+        """Draw the filled panes under the loading window before it leaves."""
+        if not self._hold_gate:
+            return
+        for name in ("tree", "objects_list", "film", "picture"):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            view = widget.viewport() if hasattr(widget, "viewport") else widget
+            view.repaint()
+        self.repaint()
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def _take_low_res(self, low_res):
+        """The launcher sets a flag beside the path signal. One open consumes it."""
+        page = getattr(self, "browser_page", None)
+        if page is not None and getattr(page, "_open_low_res", False):
+            low_res = True
+        if page is not None and hasattr(page, "_open_low_res"):
+            page._open_low_res = False
+        return bool(low_res)
+
+    def open_path(self, path, low_res=False):
+        path = os.path.abspath(path)
+        low_res = self._take_low_res(low_res)
+        if self._loading:
+            self.status.showMessage("Still reading.")
+            return
+        for index, project in enumerate(self._projects):
+            if project.path == path and project.loaded:
+                if low_res:
+                    project.low_res = True
+                self._stash(self._shown_index)
+                tab = self._project_tab(index)
+                if self.tabs.currentIndex() != tab:
+                    self.tabs.setCurrentIndex(tab)
+                else:
+                    self._on_browser = False
+                    self._show_editor_page()
+                    self._show_tab(project)
+                self.status.showMessage("%s is already open." % os.path.basename(path))
+                return
+        self._stash(self._shown_index)
+        index = self._begin_tab(path, low_res=low_res)
+        self._loading_index = index
+        self._loading = True
+        self._show_gate(os.path.basename(path))
         self.status.showMessage("Reading %s" % os.path.basename(path))
         self._loader = LoadThread(path)
         self._loader.ok.connect(self._opened)
         self._loader.bad.connect(self._open_failed)
-        self._loader.note.connect(self.status.showMessage)
+        self._loader.note.connect(self._load_note)
         self._loader.start()
 
     def _opened(self, art):
-        self._loading = False
-        QApplication.restoreOverrideCursor()
-        self.show_file(art)
+        index = self._loading_index
+        self._hold_gate = True
+        try:
+            if 0 <= index < len(self._projects):
+                project = self._projects[index]
+                # show_file clears the live selection and history in place.
+                # Point those at this tab first so the other tabs keep theirs.
+                self.history = project.history
+                self.picked = project.picked
+                self.model.picked = self.picked
+                self.objects = project.objects
+            self.show_file(art)
+            if 0 <= index < len(self._projects):
+                self._finish_tab(index)
+            note = getattr(self, "_note_open", None)
+            if note is not None and getattr(art, "path", ""):
+                try:
+                    note(art.path)
+                except Exception:
+                    self.status.showMessage(
+                        "Opened %s. The recent list could not be updated." % art.file_name
+                    )
+            self._reveal_behind_gate()
+        finally:
+            self._loading_index = -1
+            if not self._hold_gate:
+                self._loading = False
+            elif self._picture_sync() or not self._job_alive():
+                self._release_gate()
+
+    def _go_home(self):
+        if getattr(self, "_home", None) is None:
+            self.status.showMessage("Close this window to leave the drawing.")
+            return
+        self.close()
+
+    def _quit(self):
+        self._quitting = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _open_failed(self, message):
+        self._hold_gate = False
         self._loading = False
-        QApplication.restoreOverrideCursor()
+        self._hide_gate()
+        index = self._loading_index
+        self._loading_index = -1
+        if 0 <= index < len(self._projects) and not self._projects[index].loaded:
+            self._tab_guard = True
+            del self._projects[index]
+            self.tabs.removeTab(self._project_tab(index))
+            self._tab_guard = False
+            self._shown_index = -1
+            if self._projects:
+                nxt = min(index, len(self._projects) - 1)
+                tab = self._project_tab(nxt)
+                if self.tabs.currentIndex() != tab:
+                    self.tabs.setCurrentIndex(tab)
+                elif self._projects[nxt].loaded:
+                    self._shown_index = nxt
+                    self._on_browser = False
+                    self._show_editor_page()
+                    self._show_tab(self._projects[nxt])
+                else:
+                    self._shown_index = nxt
+            else:
+                self._tab_guard = True
+                self.tabs.setCurrentIndex(0)
+                self._tab_guard = False
+                self._clear_editor()
+                self._show_browser_page()
         self.status.showMessage(message)
         QMessageBox.warning(self, "VMI STUDIO", message)
 
@@ -2778,29 +4002,191 @@ class MainWindow(QMainWindow):
         self._split_custom = True
         for index, size in enumerate(self.split.sizes()):
             self.split.setStretchFactor(index, max(1, int(size)))
+        self._clamp_collapsed()
 
     def _apply_split(self, saved=None):
-        if self._split_custom:
+        if not self._split_custom:
+            width = self.split.width()
+            sizes = choose_split(width, saved, self._screen_width())
+            if sizes:
+                fitting = saved_split_fits(saved, width)
+                target = [int(value) for value in sizes]
+                if [int(value) for value in self.split.sizes()] != target:
+                    # splitterMoved can arrive after setSizes returns. Keep the guard
+                    # until the next turn so that move is not saved as a user drag.
+                    self._split_guard = True
+                    self.split.setSizes(target)
+                    QTimer.singleShot(0, self._clear_split_guard)
+                if fitting:
+                    self._split_custom = True
+                    for index, size in enumerate(target):
+                        self.split.setStretchFactor(index, max(1, int(size)))
+                else:
+                    for index, factor in enumerate(WIDE_FACTORS):
+                        self.split.setStretchFactor(index, factor)
+        self._clamp_collapsed()
+
+    def _toggle_timeline(self):
+        self._set_timeline_open(not self._timeline_open)
+        if self.art:
+            self._save_session()
+
+    def _set_timeline_open(self, open_):
+        self._timeline_open = bool(open_)
+        film = getattr(self, "film", None)
+        if film is not None:
+            film.setVisible(self._timeline_open)
+        self._apply_timeline_span()
+
+    def _timeline_bottom_hint(self):
+        """Transport, the gap under the bar, and the strip's eight-row height."""
+        transport_h = 22
+        if getattr(self, "transport", None) is not None:
+            transport_h = max(transport_h, self.transport.sizeHint().height())
+        film_h = 72
+        film = getattr(self, "film", None)
+        if film is not None:
+            film_h = film._preferred_height()
+        return transport_h + film_h + 4
+
+    def _timeline_user_dragged(self):
+        self._timeline_dragged = True
+        split = getattr(self, "picture_split", None)
+        if split is None or not self._timeline_open:
             return
-        width = self.split.width()
-        sizes = choose_split(width, saved, self._screen_width())
-        if not sizes:
+        sizes = split.sizes()
+        if len(sizes) == 2:
+            self._timeline_span = int(sizes[1])
+
+    def _seed_timeline_split(self):
+        if self._timeline_seed_guard:
             return
-        fitting = saved_split_fits(saved, width)
-        target = [int(value) for value in sizes]
-        if [int(value) for value in self.split.sizes()] != target:
-            # splitterMoved can arrive after setSizes returns. Keep the guard
-            # until the next turn so that move is not saved as a user drag.
-            self._split_guard = True
-            self.split.setSizes(target)
-            QTimer.singleShot(0, self._clear_split_guard)
-        if fitting:
-            self._split_custom = True
-            for index, size in enumerate(target):
-                self.split.setStretchFactor(index, max(1, int(size)))
+        split = getattr(self, "picture_split", None)
+        if split is None or split.count() < 2:
+            return
+        self._timeline_seed_guard = True
+        try:
+            if self._timeline_dragged:
+                return
+            total = split.height() - split.handleWidth()
+            if total < 160:
+                return
+            if self._timeline_open:
+                want = self._timeline_bottom_hint()
+            else:
+                want = max(22, self.transport.sizeHint().height())
+            want = max(1, min(int(want), total - 80))
+            target = [total - want, want]
+            current = [int(item) for item in split.sizes()]
+            if current != target:
+                split.setSizes(target)
+            if self._timeline_open:
+                self._timeline_span = want
+        finally:
+            self._timeline_seed_guard = False
+
+    def _apply_timeline_span(self):
+        split = getattr(self, "picture_split", None)
+        if split is None or split.count() < 2 or self._timeline_seed_guard:
+            return
+        film = getattr(self, "film", None)
+        if film is not None:
+            film.updateGeometry()
+        split.widget(1).updateGeometry()
+        sizes = [int(item) for item in split.sizes()]
+        total = sum(sizes)
+        if total <= 0:
+            return
+        transport_h = max(22, self.transport.sizeHint().height())
+        if self._timeline_open:
+            if self._timeline_dragged and self._timeline_span:
+                want = int(self._timeline_span)
+            else:
+                want = self._timeline_bottom_hint()
         else:
-            for index, factor in enumerate((9, 82, 9)):
-                self.split.setStretchFactor(index, factor)
+            if sizes[1] > transport_h + 8:
+                self._timeline_span = sizes[1]
+            want = transport_h
+        want = max(1, min(int(want), total - 80))
+        target = [total - want, want]
+        self._timeline_seed_guard = True
+        try:
+            if sizes != target:
+                split.setSizes(target)
+        finally:
+            self._timeline_seed_guard = False
+
+    def _toggle_pane(self, key):
+        self._set_pane_open(key, not self._pane_open.get(key, True))
+        if self.art:
+            self._save_session()
+
+    def _set_pane_open(self, key, open_, give=True):
+        if key not in self._pane_headers:
+            return
+        index = 0 if key == "layers" else 2
+        wrap = self.split.widget(index)
+        header = self._pane_headers[key]
+        body = self._pane_bodies[key]
+        header.collapsed = not open_
+        if open_:
+            body.show()
+            header.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            header.setFixedHeight(28)
+            wrap.setMinimumWidth(PANE_MIN)
+            wrap.setMaximumWidth(MAX_PANE)
+            width = max(PANE_MIN, int(self._pane_width.get(key) or PANE_MIN))
+        else:
+            sizes = self.split.sizes()
+            if sizes and len(sizes) == 3 and sizes[index] > PANE_COLLAPSED + 8:
+                self._pane_width[key] = sizes[index]
+            body.hide()
+            header.setMinimumHeight(0)
+            header.setMaximumHeight(MAX_PANE)
+            header.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+            wrap.setMinimumWidth(PANE_COLLAPSED)
+            wrap.setMaximumWidth(PANE_COLLAPSED)
+            width = PANE_COLLAPSED
+        header._place_corner()
+        header.update()
+        self._pane_open[key] = bool(open_)
+        if not give:
+            return
+        sizes = list(self.split.sizes())
+        if len(sizes) != 3:
+            return
+        delta = sizes[index] - width
+        sizes[index] = width
+        sizes[1] = max(PANE_MIN, sizes[1] + delta)
+        self._split_guard = True
+        self.split.setSizes([int(value) for value in sizes])
+        QTimer.singleShot(0, self._clear_split_guard)
+
+    def _clamp_collapsed(self):
+        if not self._pane_open:
+            return
+        sizes = list(self.split.sizes())
+        if len(sizes) != 3:
+            return
+        changed = False
+        for index, key in ((0, "layers"), (2, "objects")):
+            if key not in self._pane_open:
+                continue
+            wrap = self.split.widget(index)
+            if not self._pane_open[key]:
+                wrap.setMinimumWidth(PANE_COLLAPSED)
+                wrap.setMaximumWidth(PANE_COLLAPSED)
+                if sizes[index] != PANE_COLLAPSED:
+                    sizes[1] += sizes[index] - PANE_COLLAPSED
+                    sizes[index] = PANE_COLLAPSED
+                    changed = True
+            else:
+                wrap.setMinimumWidth(PANE_MIN)
+                wrap.setMaximumWidth(MAX_PANE)
+        if changed:
+            self._split_guard = True
+            self.split.setSizes([max(0, int(value)) for value in sizes])
+            QTimer.singleShot(0, self._clear_split_guard)
 
     def _open_wide(self):
         offscreen = os.environ.get("QT_QPA_PLATFORM") == "offscreen"
@@ -2831,19 +4217,31 @@ class MainWindow(QMainWindow):
         self._split_ready = True
         QTimer.singleShot(0, self._open_wide)
 
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._place_shade()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if getattr(self, "split", None) is None or self._split_guard or self._split_custom:
+        self._place_shade()
+        if getattr(self, "split", None) is None or self._split_guard:
+            return
+        if self._split_custom:
+            self._clamp_collapsed()
             return
         self._apply_split(self._split_saved)
 
     def show_file(self, art, restore=True):
+        self._stop_play()
         self.history.clear()
         reset_plate_cache()
+        self._clear_draw()
         self.art = art
         self.picked.clear()
         self.picture.set_document(art.width, art.height)
-        self.picture.reset_view()
+        self._place_picture(self._opening_low_res())
+        if getattr(self, "draw_bar", None) is not None:
+            self.draw_bar.setEnabled(True)
         session = load() if restore else None
         same = bool(
             session
@@ -2852,8 +4250,11 @@ class MainWindow(QMainWindow):
         )
         if same and session.get("visible"):
             apply_visibility(art.layers, session["visible"])
+        # A .clip already carries its cel specification. An older session stored
+        # the misread 0, 1, 2… fallback in "animations" and would paint over it.
         if same and session.get("animations"):
-            apply_animations(art.layers, session["animations"])
+            if not (art.kind == "clip" and not session.get("time_version")):
+                apply_animations(art.layers, session["animations"])
         if same:
             apply_blends(art.layers, session.get("blends"))
             apply_track_flags(art.layers, session.get("mute"), session.get("solo"))
@@ -2896,13 +4297,20 @@ class MainWindow(QMainWindow):
                 self._split_saved = None
             self._apply_split(self._split_saved)
         self._fill_objects()
+        self._apply_tasks(*self._tasks_from(art, session, project))
+        self._restore_png(session)
+        self._restore_panes(session, same)
+        self._arm_playhead()
         self.recomposite()
+        self._refresh_timeline()
         self.setWindowTitle("VMI STUDIO — %s" % art.file_name)
         opened = "%s  %d×%d  %s" % (art.file_name, art.width, art.height, art.note or "Opened.")
         targets, windows = warp_counts(art.layers)
         if targets or windows:
             opened += "  Warp targets: %d. Windows: %d." % (targets, windows)
         self.status.showMessage(opened)
+        self._on_browser = False
+        self._show_editor_page()
         if same and session.get("selected"):
             self._select_layer(session["selected"])
         self._save_session()
@@ -2946,6 +4354,25 @@ class MainWindow(QMainWindow):
                 highest = max(highest, int(obj.id[1:]))
         reset_object_ids(highest + 1)
 
+    def _opening_low_res(self):
+        """The tab being read. A direct show, with no tab, stays at full size."""
+        index = getattr(self, "_loading_index", -1)
+        if 0 <= index < len(self._projects):
+            return bool(getattr(self._projects[index], "low_res", False))
+        return False
+
+    def _place_picture(self, low_res):
+        """High res keeps every document pixel. Low res fits a smaller plate."""
+        self.picture.fit = bool(low_res)
+        self.picture.reset_navigation()
+        self.picture.apply()
+
+    def _remember_clarity(self):
+        index = self._shown_index
+        if index < 0 or index >= len(self._projects):
+            return
+        self._projects[index].low_res = bool(self.picture.fit)
+
     def _picture_edge(self):
         """Fit view composites to the screen. Actual size keeps the document."""
         if not self.picture.fit:
@@ -2961,6 +4388,7 @@ class MainWindow(QMainWindow):
     def _picture_resized(self):
         if not self.art or getattr(self, "_loading", False):
             return
+        self._remember_clarity()
         edge = self._picture_edge()
         old = self._preview_edge
         if edge == old:
@@ -3031,7 +4459,11 @@ class MainWindow(QMainWindow):
         )
 
     def _start_picture_job(self):
+        if getattr(self, "_hold_gate", False) and self._gate is not None:
+            self._gate.hear("Painting the picture")
         if not self.art:
+            if getattr(self, "_hold_gate", False):
+                self._release_gate()
             return
         self._picture_pending = False
         generation = self._picture_generation
@@ -3079,6 +4511,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._start_picture_job)
         else:
             self.picture.set_busy(False)
+            if getattr(self, "_hold_gate", False) and current:
+                self.picture.repaint()
+                self._release_gate()
 
     def _caption(self):
         if not self.art:
@@ -3090,6 +4525,14 @@ class MainWindow(QMainWindow):
             self.caption.setText("%s is hidden." % node.name)
             return
         folder = owning_animation(self.art.layers, node.id) if node else None
+        if folder is not None and getattr(folder, "frames", None):
+            play = self.film.playhead if getattr(self, "film", None) is not None else getattr(folder, "show_frame", 0)
+            held = cel_at(folder, play)
+            if held is None:
+                self.caption.setText("%s  frame %s  no cel" % (folder.name, play))
+            else:
+                self.caption.setText("%s  frame %s  %s" % (folder.name, play, held.name))
+            return
         if folder is not None:
             cel = cel_of(folder, node.id) if node and node.id != folder.id else None
             visible = [item for item in timeline_cels(folder) if item.visible]
@@ -3110,6 +4553,8 @@ class MainWindow(QMainWindow):
     def _layer_current(self, *_args):
         if self._timeline_lock:
             return
+        self._export_side = "layers"
+        self._sync_playhead_to_selection()
         self._caption()
         self._refresh_timeline()
         if self.art and animation_folders(self.art.layers):
@@ -3119,41 +4564,43 @@ class MainWindow(QMainWindow):
         if self._timeline_lock:
             return
         self._timeline_lock = True
-        self.timeline.clear()
-        folder = None
-        node = None
-        if self.art:
-            index = self.tree.currentIndex()
-            node = self.model.node_of(index) if index.isValid() else None
-            if node is not None:
-                folder = owning_animation(self.art.layers, node.id)
-        self.earlier_button.setEnabled(folder is not None)
-        self.later_button.setEnabled(folder is not None)
-        if folder is None:
-            self.timeline_title.setText("TIMELINE")
-            hint = QListWidgetItem("Mark a folder as an animation.")
-            hint.setFlags(Qt.NoItemFlags)
-            self.timeline.addItem(hint)
+        try:
+            self.timeline.clear()
+            folder = None
+            node = None
+            if self.art:
+                index = self.tree.currentIndex()
+                node = self.model.node_of(index) if index.isValid() else None
+                if node is not None:
+                    folder = owning_animation(self.art.layers, node.id)
+            self.earlier_button.setEnabled(folder is not None)
+            self.later_button.setEnabled(folder is not None)
+            if folder is None:
+                self.timeline_title.setText("TIMELINE")
+                hint = QListWidgetItem("Mark a folder as an animation.")
+                hint.setFlags(Qt.NoItemFlags)
+                self.timeline.addItem(hint)
+                return
+            self.timeline_title.setText(folder.name)
+            state, _frame = parse_sf(folder.name)
+            number = 0
+            current_row = 0
+            for row, cel in enumerate(timeline_cels(folder)):
+                if cel.visible:
+                    label = "%s  %s" % (slot_key(state, number), cel.name)
+                    number += 1
+                else:
+                    label = "hidden  %s" % cel.name
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, cel.id)
+                self.timeline.addItem(item)
+                if node is not None and (node.id == cel.id or cel_of(folder, node.id) is cel):
+                    current_row = row
+            if self.timeline.count():
+                self.timeline.setCurrentRow(current_row)
+        finally:
             self._timeline_lock = False
-            return
-        self.timeline_title.setText(folder.name)
-        state, _frame = parse_sf(folder.name)
-        number = 0
-        current_row = 0
-        for row, cel in enumerate(timeline_cels(folder)):
-            if cel.visible:
-                label = "%s  %s" % (slot_key(state, number), cel.name)
-                number += 1
-            else:
-                label = "hidden  %s" % cel.name
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, cel.id)
-            self.timeline.addItem(item)
-            if node is not None and (node.id == cel.id or cel_of(folder, node.id) is cel):
-                current_row = row
-        if self.timeline.count():
-            self.timeline.setCurrentRow(current_row)
-        self._timeline_lock = False
+            self._sync_film()
 
     def _timeline_chosen(self, row):
         if self._timeline_lock or row < 0 or not self.art:
@@ -3227,6 +4674,612 @@ class MainWindow(QMainWindow):
         if changed:
             current = self._current_object()
             self._fill_objects(select=current.id if current else None)
+
+    def _current_node(self):
+        if not self.art:
+            return None
+        index = self.tree.currentIndex()
+        if not index.isValid():
+            return None
+        return self.model.node_of(index)
+
+    def pick_image(self):
+        """A browser for one picture. The rest of the studio dims, as it does while loading."""
+        if self._loading:
+            self.status.showMessage("Still reading.")
+            return
+        if not self.art or not (0 <= self._shown_index < len(self._projects)):
+            self.status.showMessage("Open a drawing first.")
+            return
+        if self._on_browser:
+            self.tabs.setCurrentIndex(self._project_tab(self._shown_index))
+        if self._image_pick is None:
+            self._image_pick = ImagePick()
+            self._image_pick.chosen.connect(self._image_chosen)
+            self._image_pick.dismissed.connect(self._hide_image_pick)
+        start = os.path.dirname(self.art.path) if self.art.path else os.path.expanduser("~")
+        self._image_pick.browse_at(start)
+        if self._shade is None:
+            self._shade = EditorShade(self)
+        self._place_shade()
+        self._shade.show()
+        self._shade.raise_()
+        self._image_pick.show()
+        self._image_pick.raise_()
+        self._image_pick.activateWindow()
+
+    def _hide_image_pick(self):
+        pick = getattr(self, "_image_pick", None)
+        if pick is not None:
+            pick.hide()
+        gate = getattr(self, "_gate", None)
+        if gate is not None and gate.isVisible():
+            return
+        if self._shade is not None:
+            self._shade.hide()
+
+    def _image_chosen(self, path):
+        self._hide_image_pick()
+        self.insert_image(path)
+
+    def insert_image(self, path):
+        """Read one picture and put it in front of the current layer."""
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return
+        try:
+            stem, raster = raster_from_image(path)
+        except Exception as exc:
+            self.status.showMessage(str(exc))
+            return
+        name = fresh_name(list(walk(self.art.layers)), stem)
+        node = Node(_next_id(self.art.layers), name, "layer", raster=raster)
+        with self._edit("the image"):
+            self._place_in_front(node)
+            refresh(self.art.layers)
+            self.model.set_layers(self.art.layers)
+        reset_plate_cache()
+        self.recomposite()
+        self.select_only(node)
+        self.status.showMessage("Inserted %s." % name)
+
+    def _place_in_front(self, node):
+        """A new layer sits in front of the current row. A folder receives it inside."""
+        current = self._current_node()
+        if current is None or not self.art:
+            self.art.layers.append(node)
+            return
+        if current.kind == "group":
+            current.children.append(node)
+            return
+        parent = parent_of(self.art.layers, current.id)
+        home = self.art.layers if parent is None else parent.children
+        index = next((i for i, item in enumerate(home) if item is current), None)
+        if index is None:
+            home.append(node)
+            return
+        home.insert(index + 1, node)
+
+    def _place_below_selection(self, node):
+        """Put a warp target in the selected layer's folder, directly under that layer.
+
+        The list shows the front layer at the top, and children are stored back
+        to front, so the slot of the selected layer is the row just beneath it.
+        A selected folder receives the target inside that folder, in front.
+        """
+        current = self._current_node()
+        if current is None or not self.art:
+            self.art.layers.append(node)
+            return
+        if current.kind == "group":
+            current.children.append(node)
+            return
+        parent = parent_of(self.art.layers, current.id)
+        home = self.art.layers if parent is None else parent.children
+        index = next((i for i, item in enumerate(home) if item is current), None)
+        if index is None:
+            home.append(node)
+            return
+        home.insert(index, node)
+
+    def _draw_home(self):
+        """The child list a new warp mask is appended to. The end is in front."""
+        current = self._current_node()
+        if current is None or not self.art:
+            return self.art.layers if self.art else []
+        if current.kind == "group":
+            return current.children
+        parent = parent_of(self.art.layers, current.id)
+        if parent is None:
+            return self.art.layers
+        return parent.children
+
+    def _clear_draw(self):
+        self._mask = None
+        self._mask_id = None
+        self._mask_last = None
+        picture = getattr(self, "picture", None)
+        if picture is not None:
+            picture.set_draw_mode("")
+        bar = getattr(self, "draw_bar", None)
+        if bar is not None:
+            bar.set_mode("")
+
+    def set_draw_mode(self, mode):
+        """Turn a warp tool on, or off when the same tool is asked for again."""
+        mode = mode or ""
+        picture = getattr(self, "picture", None)
+        if picture is None:
+            return
+        current = picture.draw_mode or ""
+        if mode == "" or mode == current:
+            was = current
+            self._clear_draw()
+            if was:
+                self.status.showMessage("Warp tool off.")
+            return
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return
+        picture.set_cut(False)
+        if getattr(self, "cut_bar", None) is not None:
+            self.cut_bar.hide()
+        self._cut_target = None
+        self._mask = None
+        self._mask_last = None
+        if mode == "warp-mask":
+            self._ensure_mask_layer()
+        color = self.draw_bar.color() if getattr(self, "draw_bar", None) is not None else "#FF3EB8"
+        picture.set_draw_mode(mode, color)
+        if mode == "warp-mask":
+            picture._brush_radius = self.draw_bar.brush.diameter_for(1.0) / 2.0
+        if getattr(self, "draw_bar", None) is not None:
+            self.draw_bar.set_mode(mode)
+        if mode == "warp-target":
+            self.status.showMessage("Click the corners of the warp target. Enter closes the polygon.")
+        elif mode == "warp-mask":
+            self.status.showMessage("Draw the warp mask.")
+
+    def _ensure_mask_layer(self):
+        """Reuse a warp mask in this folder, or make one. The empty layer is one undo step."""
+        current = self._current_node()
+        if current is not None and getattr(current, "marker", "") == "mask":
+            self._mask_id = current.id
+            return current
+        home = self._draw_home()
+        for node in home:
+            if getattr(node, "marker", "") == "mask":
+                self._mask_id = node.id
+                return node
+        if not self.art:
+            return None
+        name = fresh_name(list(walk(self.art.layers)), "Warp Mask")
+        node = Node(_next_id(self.art.layers), name, "layer")
+        node.marker = "mask"
+        node.color = self.draw_bar.color()
+        with self._edit("the warp mask"):
+            home.append(node)
+            refresh(self.art.layers)
+            mark_warps(self.art.layers)
+        self._mask_id = node.id
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.select_only(node)
+        self._save_session()
+        return node
+
+    def _on_draw(self, phase, payload):
+        if phase == "close":
+            self._close_warp_target(payload or [])
+        elif phase == "press":
+            self._mask_press(*payload)
+        elif phase == "move":
+            self._mask_move(*payload)
+        elif phase == "release":
+            self._mask_release()
+
+    def _close_warp_target(self, points):
+        """The polygon becomes a layer only when it closes. Escape leaves nothing."""
+        if not self.art or len(points) < 3:
+            return
+        name = fresh_name(list(walk(self.art.layers)), "WT")
+        color = self.draw_bar.color()
+        node = Node(_next_id(self.art.layers), name, "layer")
+        node.marker = "target"
+        node.color = color
+        node.vectors = [[(float(x), float(y)) for x, y in points]]
+        node.raster = fill_polygon(points, color, self.art.width, self.art.height)
+        with self._edit("the warp target"):
+            self._place_below_selection(node)
+            refresh(self.art.layers)
+            mark_warps(self.art.layers)
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.select_only(node)
+        self.recomposite()
+        self._save_session()
+        self.status.showMessage("Warp target %s is a %d-point polygon." % (node.name, len(points)))
+
+    def _mask_node(self):
+        node = find_node(self.art.layers, self._mask_id) if self.art and self._mask_id else None
+        if node is None or getattr(node, "marker", "") != "mask":
+            node = self._current_node()
+        if node is None or getattr(node, "marker", "") != "mask":
+            return None
+        return node
+
+    def _mask_press(self, x, y, pressure):
+        if not self.art:
+            return
+        node = self._mask_node()
+        if node is None:
+            return
+        self._mask = MaskCanvas(self.art.width, self.art.height, node.raster)
+        self._mask_id = node.id
+        self._mask_last = (float(x), float(y), float(pressure))
+        brush = self.draw_bar.brush
+        color = node.color or self.draw_bar.color()
+        self._mask.stamp(x, y, brush, pressure, color)
+        radius = brush.diameter_for(pressure) / 2.0
+        self.picture._brush_radius = radius
+        self.picture._dabs = [(float(x), float(y), radius)]
+        self.picture.update()
+
+    def _mask_move(self, x, y, pressure):
+        if self._mask is None or self._mask_last is None or not self.art:
+            return
+        brush = self.draw_bar.brush
+        node = self._mask_node()
+        color = node.color if node is not None and node.color else self.draw_bar.color()
+        x0, y0, p0 = self._mask_last
+        spacing = 0.35 * brush.diameter_for(max(p0, pressure))
+        steps = list(stroke_steps(x0, y0, p0, x, y, pressure, spacing))
+        if not steps or abs(steps[-1][0] - float(x)) > 0.01 or abs(steps[-1][1] - float(y)) > 0.01:
+            steps.append((float(x), float(y), float(pressure)))
+        dabs = list(self.picture._dabs)
+        for sx, sy, sp in steps:
+            self._mask.stamp(sx, sy, brush, sp, color)
+            dabs.append((float(sx), float(sy), brush.diameter_for(sp) / 2.0))
+        self.picture._dabs = dabs
+        self.picture._brush_radius = brush.diameter_for(pressure) / 2.0
+        self._mask_last = (float(x), float(y), float(pressure))
+        self.picture.update()
+
+    def _mask_release(self):
+        canvas = self._mask
+        self._mask = None
+        self._mask_last = None
+        if getattr(self, "picture", None) is not None:
+            self.picture._dabs = []
+            self.picture.update()
+        if canvas is None or not canvas.changed or not self.art:
+            return
+        node = find_node(self.art.layers, self._mask_id)
+        if node is None:
+            return
+        with self._edit("the warp mask"):
+            node.raster = canvas.raster()
+            if not node.color:
+                node.color = self.draw_bar.color()
+            mark_warps(self.art.layers)
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.recomposite()
+        self._save_session()
+
+    def _warp_recolor(self, color):
+        parsed = color or ""
+        picture = getattr(self, "picture", None)
+        if picture is not None and parsed:
+            picture.draw_color = parsed
+            picture.update()
+        if self._mask is not None or not self.art or not parsed:
+            return
+        node = self._current_node()
+        if node is None or getattr(node, "marker", "") not in ("target", "mask"):
+            return
+        with self._edit("the warp color"):
+            node.color = parsed
+            if node.marker == "target" and getattr(node, "vectors", None):
+                node.raster = fill_polygon(node.vectors[0], parsed, self.art.width, self.art.height)
+            else:
+                node.raster = recolor_raster(node.raster, parsed)
+            mark_warps(self.art.layers)
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.tree.viewport().update()
+        self.recomposite()
+        self._save_session()
+
+    def _draw_key(self, event):
+        if QApplication.activeModalWidget() is not None or self._text_focus() or event.isAutoRepeat():
+            return False
+        picture = getattr(self, "picture", None)
+        if picture is None or not picture.draw_mode:
+            return False
+        key = event.key()
+        if key in (Qt.Key_Return, Qt.Key_Enter) and picture.draw_mode == "warp-target":
+            if not picture.close_warp_polygon():
+                self.status.showMessage("A warp target needs at least three corners.")
+            return True
+        if key == Qt.Key_Escape:
+            if picture.draw_mode == "warp-target" and picture._poly:
+                picture._poly = []
+                picture._hover = None
+                picture.update()
+                self.status.showMessage("Warp target cancelled.")
+                return True
+            self._clear_draw()
+            self.status.showMessage("Warp tool off.")
+            return True
+        if key == Qt.Key_Backspace and picture.draw_mode == "warp-target" and picture._poly:
+            picture._poly.pop()
+            picture.update()
+            return True
+        return False
+
+    def _png_key(self, event):
+        if QApplication.activeModalWidget() is not None or event.isAutoRepeat() or self._text_focus():
+            return False
+        mods = event.modifiers()
+        if event.key() != Qt.Key_E or not (mods & Qt.ShiftModifier):
+            return False
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+        self.export_png()
+        return True
+
+    def _png_dialog(self, title, directory, note):
+        return PngDialog(
+            self,
+            title=title,
+            directory=directory or "",
+            percent=self._png_percent,
+            resample=self._png_resample,
+            recents=list(self._png_recent),
+            favorites=list(self._png_favorites),
+            places=favorite_places(self.art.path if self.art else ""),
+            note=note,
+        )
+
+    def _remember_png(self, values):
+        if not isinstance(values, dict):
+            return
+        try:
+            self._png_percent = max(1, min(800, int(values.get("percent") or 100)))
+        except (TypeError, ValueError):
+            self._png_percent = 100
+        self._png_resample = "bicubic" if str(values.get("resample") or "").lower() == "bicubic" else "nearest"
+        favs = []
+        for path in values.get("favorites") or []:
+            if path and path not in favs:
+                favs.append(path)
+        self._png_favorites = favs
+        folder = values.get("path") or ""
+        if folder:
+            self._png_recent = [folder] + [item for item in self._png_recent if item != folder]
+            self._png_recent = self._png_recent[:8]
+
+    def _restore_png(self, session):
+        if not isinstance(session, dict):
+            return
+        if "png_percent" in session:
+            try:
+                self._png_percent = max(1, min(800, int(session.get("png_percent") or 100)))
+            except (TypeError, ValueError):
+                self._png_percent = 100
+        if "png_resample" in session:
+            self._png_resample = "bicubic" if str(session.get("png_resample") or "").lower() == "bicubic" else "nearest"
+        if isinstance(session.get("png_recent"), list):
+            self._png_recent = [path for path in session["png_recent"] if isinstance(path, str)][:8]
+        if isinstance(session.get("png_favorites"), list):
+            self._png_favorites = [path for path in session["png_favorites"] if isinstance(path, str)]
+
+    def _restore_panes(self, session, same):
+        if not same or not isinstance(session, dict):
+            for key in ("layers", "objects"):
+                if not self._pane_open.get(key, True):
+                    self._set_pane_open(key, True)
+            self._set_timeline_open(True)
+            return
+        for key, field in (("layers", "layers_open"), ("objects", "objects_open")):
+            if field in session and session.get(field) is False:
+                self._set_pane_open(key, False)
+            elif not self._pane_open.get(key, True):
+                self._set_pane_open(key, True)
+        self._set_timeline_open(not (session.get("timeline_open") is False))
+
+    def _arm_playhead(self):
+        if not self.art:
+            return
+        info = getattr(self.art, "clip_time", None)
+        current = int(info.get("current") or 0) if isinstance(info, dict) else 0
+        for folder in animation_folders(self.art.layers):
+            if getattr(folder, "frames", None) and not hasattr(folder, "show_frame"):
+                folder.show_frame = current
+        film = getattr(self, "film", None)
+        if film is not None and film.art is not self.art:
+            film.set_playhead(current)
+
+    def _sync_film(self):
+        film = getattr(self, "film", None)
+        if film is None:
+            return
+        node = self._current_node()
+        film.set_project(self.art, selected=node.id if node is not None else "")
+        if not self._timeline_dragged and self._timeline_open:
+            self._seed_timeline_split()
+
+    def _stamp_playhead(self, frame):
+        """One playhead for every folder that already has a frame specification.
+
+        A hand-marked folder keeps empty frames and the older focus rule.
+        Scrubbing does not invent keys.
+        """
+        if not self.art:
+            return
+        for folder in animation_folders(self.art.layers):
+            if getattr(folder, "frames", None):
+                folder.show_frame = int(frame)
+
+    def _film_scrubbed(self, frame):
+        """The ruler or the line moved. The picture follows. This is not an edit."""
+        self._stamp_playhead(frame)
+        self._caption()
+        self.recomposite()
+
+    def _sync_playhead_to_selection(self):
+        """A picked cel jumps to its key, unless the playhead already holds that cel."""
+        if not self.art:
+            return
+        node = self._current_node()
+        if node is None:
+            return
+        folder = owning_animation(self.art.layers, node.id)
+        if folder is None or not getattr(folder, "frames", None):
+            return
+        cel = cel_of(folder, node.id)
+        if cel is None:
+            return
+        show = getattr(folder, "show_frame", None)
+        if show is not None and cel_at(folder, show) is cel:
+            film = getattr(self, "film", None)
+            if film is not None:
+                film.set_playhead(int(show))
+            self._stamp_playhead(int(show))
+            return
+        key = None
+        for frame, item in frame_map(folder):
+            if item.id == cel.id:
+                key = int(frame)
+                break
+        if key is None:
+            return
+        self._stamp_playhead(key)
+        film = getattr(self, "film", None)
+        if film is not None:
+            film.set_playhead(key)
+
+    def _film_chosen(self, ident):
+        if not self.art or not ident:
+            return
+        self._stamp_playhead(self.film.playhead)
+        if self._focus_id() == ident:
+            self._caption()
+            self._sync_film()
+            self.recomposite()
+            return
+        self._select_layer(ident)
+
+    def _film_moved(self, folder_id, cel_id, frame):
+        if not self.art:
+            return
+        folder = find_node(self.art.layers, folder_id)
+        if folder is None:
+            return
+        moved = False
+        with self._edit("the timeline"):
+            moved = place_cel(folder, cel_id, int(frame))
+            if moved:
+                self._sync_animations()
+        if not moved:
+            self._sync_film()
+            return
+        if getattr(folder, "frames", None):
+            self._stamp_playhead(self.film.playhead)
+        self._refresh_timeline()
+        self.recomposite()
+        self._save_session()
+        cel = find_node(self.art.layers, cel_id)
+        self.status.showMessage("Moved %s on the timeline." % (cel.name if cel is not None else "the cel"))
+
+    def _object_focused(self, *_args):
+        if not getattr(self, "_filling_objects", False):
+            self._export_side = "objects"
+        self._show_slots()
+
+    def _png_subject(self):
+        """(name, image or None, reason) for the folder or object Shift+E writes."""
+        if not self.art:
+            return "", None, "Open a drawing first."
+        if self._export_side == "objects":
+            obj = self._current_object()
+            if obj is None:
+                return "", None, "Select an object."
+            slots = slots_of(self.art, obj)
+            chosen = None
+            for slot in slots:
+                if slot["key"] == "000000":
+                    chosen = slot
+                    break
+            if chosen is None and slots:
+                chosen = slots[0]
+            if chosen is None:
+                return obj.name, None, "%s has nothing to export." % obj.name
+            image = composite_image(self.art.width, self.art.height, chosen["layers"])
+            if image is None:
+                return obj.name, None, "%s has nothing to export." % obj.name
+            return obj.name, image, ""
+        node = self._current_node()
+        if node is None:
+            return "", None, "Select a folder or an object."
+        if node.kind == "group":
+            folder = node
+        else:
+            folder = parent_of(self.art.layers, node.id)
+        if folder is None:
+            if node.kind != "layer" or not node.visible or node.omit:
+                return node.name, None, "Nothing visible to export."
+            image = composite_image(self.art.width, self.art.height, [node])
+            if image is None:
+                return node.name, None, "Nothing visible to export."
+            return node.name, image, ""
+        flags = {item.id: (bool(item.visible), False, False) for item in walk([folder])}
+        image = composite_scene(self.art.width, self.art.height, [folder], flags=flags)
+        if image is None:
+            return folder.name, None, "Nothing visible to export."
+        return folder.name, image, ""
+
+    def export_png(self):
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return
+        start = self._export_dialog_start()
+        dialog = self._png_dialog("Export PNG", start, "Writes one PNG of the selected folder or object.")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.push_png(dialog.values())
+
+    def push_png(self, values, target=None, ask=True):
+        """Write one PNG. Tests pass ask=False so this never opens a question box."""
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return None
+        self._remember_png(values or {})
+        if target is None:
+            name, image, reason = self._png_subject()
+        else:
+            name, image, reason = target
+        if image is None:
+            self.status.showMessage(reason or "Nothing to export.")
+            return None
+        if self._png_percent != 100:
+            image = scale_image(image, self._png_percent, self._png_resample)
+        folder = (values or {}).get("path") or ""
+        if not folder or not os.path.isdir(folder):
+            self.status.showMessage("Choose a folder.")
+            return None
+        dest = os.path.join(folder, sanitize(name) + ".png")
+        if os.path.isfile(dest) and ask:
+            answer = QMessageBox.question(self, "VMI STUDIO", "Replace %s?" % dest)
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        image.save(dest, "PNG")
+        self._png_recent = [folder] + [item for item in self._png_recent if item != folder]
+        self._png_recent = self._png_recent[:8]
+        self._save_session()
+        self.status.showMessage("Wrote %s" % dest)
+        return dest
 
     def toggle_visible(self, node):
         if not self.art or node is None:
@@ -3371,9 +5424,141 @@ class MainWindow(QMainWindow):
                 return True
             if not self._text_focus() and self._history_key(event):
                 return True
+            if not self._text_focus() and self._png_key(event):
+                return True
+            if self._outliner_delete_key(event, watched):
+                return True
+            if not self._text_focus() and self._draw_key(event):
+                return True
             if not self._text_focus() and self._cut_key(event):
                 return True
+            if self._transport_key(event, watched):
+                return True
         return super().eventFilter(watched, event)
+
+    def _under(self, watched, target):
+        widget = watched
+        while widget is not None:
+            if widget is target:
+                return True
+            widget = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+        return False
+
+    def _outliner_delete_key(self, event, watched):
+        """Backspace and Delete remove the row under the pointer's outliner.
+
+        A text field keeps the key. The picture keeps Delete for a cut.
+        """
+        if event.isAutoRepeat() or QApplication.activeModalWidget() is not None or self._text_focus():
+            return False
+        if isinstance(watched, (QLineEdit, QSpinBox, QPlainTextEdit)):
+            return False
+        editor = getattr(getattr(self, "tree", None), "_editor", None)
+        if editor is not None:
+            return False
+        mods = event.modifiers()
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier):
+            return False
+        if event.key() not in (Qt.Key_Delete, Qt.Key_Backspace):
+            return False
+        if self._under(watched, getattr(self, "tree", None)):
+            self.delete_layers()
+            return True
+        if self._under(watched, getattr(self, "objects_list", None)):
+            self.delete_objects()
+            return True
+        return False
+
+    def _transport_key(self, event, watched=None):
+        """Comma steps back, period steps forward, W returns to the first frame."""
+        if QApplication.activeModalWidget() is not None or self._text_focus():
+            return False
+        if isinstance(watched, (QLineEdit, QSpinBox, QPlainTextEdit)):
+            return False
+        mods = event.modifiers()
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier):
+            return False
+        key = event.key()
+        if key == Qt.Key_W:
+            if event.isAutoRepeat():
+                return False
+            self._go_first()
+            return True
+        if key == Qt.Key_Comma:
+            self._step_frame(-1)
+            return True
+        if key == Qt.Key_Period:
+            self._step_frame(1)
+            return True
+        return False
+
+    def _step_frame(self, delta):
+        film = getattr(self, "film", None)
+        if film is None:
+            return
+        film.go_frame(int(film.playhead) + int(delta))
+
+    def _go_first(self):
+        film = getattr(self, "film", None)
+        if film is None:
+            return
+        film.go_frame(film.cut_range()[0])
+
+    def _toggle_loop(self):
+        self._loop = not self._loop
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            transport.set_looping(self._loop)
+
+    def _toggle_play(self):
+        if self._playing:
+            self._stop_play()
+            return
+        film = getattr(self, "film", None)
+        if film is None or not self.art:
+            return
+        start, end = film.cut_range()
+        if int(film.playhead) >= end and start < end:
+            film.go_frame(start)
+        self._playing = True
+        rate = 24
+        info = getattr(self.art, "clip_time", None)
+        if isinstance(info, dict):
+            try:
+                rate = int(info.get("fps") or 24)
+            except (TypeError, ValueError):
+                rate = 24
+        rate = min(60, max(1, rate))
+        self._play_timer.start(max(1, int(round(1000 / rate))))
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            transport.set_playing(True)
+
+    def _stop_play(self):
+        self._playing = False
+        timer = getattr(self, "_play_timer", None)
+        if timer is not None:
+            timer.stop()
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            transport.set_playing(False)
+
+    def _play_tick(self):
+        if not self._playing:
+            return
+        film = getattr(self, "film", None)
+        if film is None:
+            self._stop_play()
+            return
+        start, end = film.cut_range()
+        frame = int(film.playhead)
+        if frame >= end:
+            if self._loop and start < end:
+                film.go_frame(start)
+            else:
+                self._stop_play()
+            return
+        film.go_frame(frame + 1)
 
     def _save_key(self, event):
         if QApplication.activeModalWidget() is not None or event.isAutoRepeat():
@@ -3494,6 +5679,12 @@ class MainWindow(QMainWindow):
         return False
 
     def keyPressEvent(self, event):
+        if not self._text_focus() and self._png_key(event):
+            event.accept()
+            return
+        if not self._text_focus() and self._draw_key(event):
+            event.accept()
+            return
         if self._cut_key(event):
             event.accept()
             return
@@ -3513,12 +5704,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout(bar)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
-        bar.setStyleSheet(
-            "QPushButton { background: #000000; color: #3a3a3a; border: 1px solid #2a2a2a;"
-            " border-radius: 0; padding: 4px 8px; }"
-            "QPushButton:hover { color: #ffffff; border-color: #ffffff; }"
-            "QPushButton#cutOn { background: #ffffff; color: #000000; border-color: #ffffff; }"
-        )
+        bar.setStyleSheet(theme.cut_sheet())
         self.cut_tools = {}
         for key, label in (("rect", "Rect"), ("lasso", "Lasso"), ("poly", "Polygon")):
             button = QPushButton(label)
@@ -3581,6 +5767,8 @@ class MainWindow(QMainWindow):
         if folder is None or folder.kind != "group":
             self.status.showMessage("Select a folder. Shift+X cuts every layer inside it.")
             return
+        if self.picture.draw_mode:
+            self._clear_draw()
         self._cut_target = folder.id
         self.picture.cut_tool = "rect"
         self.picture.set_cut(True)
@@ -3877,6 +6065,89 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Made %s from %d layers." % (name, len(obj.layer_ids)))
         return obj
 
+    def delete_layers(self):
+        """Remove the picked layers. A folder takes every layer inside it."""
+        if not self.art:
+            return
+        current = self._current_node()
+        picked = [ident for ident in self.picked if find_node(self.art.layers, ident)]
+        if not picked and current is not None:
+            picked = [current.id]
+        elif current is not None and current.id not in picked:
+            picked = [current.id]
+        if not picked:
+            self.status.showMessage("Pick a layer to delete.")
+            return
+        old = [node.id for node in self.tree.visible_nodes()]
+        anchor = current.id if current is not None else picked[0]
+        at = old.index(anchor) if anchor in old else 0
+        removed = []
+        with self._edit("the layer delete"):
+            result = remove_nodes(self.art.layers, picked)
+            if result is None:
+                return
+            layers, removed = result
+            self.art.layers = layers
+            self._drop_objects_for_missing_layers()
+        if not removed:
+            return
+        survivors = {ident for ident in self.picked if find_node(self.art.layers, ident)}
+        self.picked.clear()
+        self.picked.update(survivors)
+        if getattr(self, "_mask_id", None) and find_node(self.art.layers, self._mask_id) is None:
+            self._clear_draw()
+        self.model.set_layers(self.art.layers)
+        self._fill_objects(keep=True)
+        self._refresh_timeline()
+        self.recomposite()
+        self._select_after_delete(old, at)
+        self._save_session()
+        if len(removed) == 1 and removed[0].kind == "group":
+            self.status.showMessage("Deleted %s and the layers inside it." % removed[0].name)
+        elif len(removed) == 1:
+            self.status.showMessage("Deleted %s." % removed[0].name)
+        else:
+            self.status.showMessage("Deleted %d layers." % len(removed))
+
+    def _drop_objects_for_missing_layers(self):
+        """An object keeps only layers that are still in the tree. An empty one goes."""
+        alive = {node.id for node in walk(self.art.layers)}
+        gone = set()
+        for obj in self.objects:
+            kept = [ident for ident in obj.layer_ids if ident in alive]
+            if obj.layer_ids and not kept:
+                gone.add(obj.id)
+            obj.layer_ids = kept
+            obj.assign = {ident: pos for ident, pos in (obj.assign or {}).items() if ident in alive}
+        if not gone:
+            return
+        by_id = {obj.id: obj for obj in self.objects}
+        for obj in self.objects:
+            parent = obj.parent
+            while parent in gone:
+                parent = by_id[parent].parent if parent in by_id else ""
+            obj.parent = "" if parent in gone else parent
+        self.objects = [obj for obj in self.objects if obj.id not in gone]
+
+    def _select_after_delete(self, old, at):
+        chosen = None
+        for ident in list(old)[at + 1:]:
+            node = find_node(self.art.layers, ident)
+            if node is not None:
+                chosen = node
+                break
+        if chosen is None:
+            for ident in reversed(list(old)[:at]):
+                node = find_node(self.art.layers, ident)
+                if node is not None:
+                    chosen = node
+                    break
+        if chosen is not None:
+            self.select_only(chosen)
+            return
+        self.picked.clear()
+        self.tree.setCurrentIndex(QModelIndex())
+
     def delete_objects(self):
         if not self.art:
             return
@@ -4044,9 +6315,11 @@ class MainWindow(QMainWindow):
         if any(obj.name.lower() == name.lower() for obj in self.objects):
             self.status.showMessage("There is already an object named %s." % name)
             return
-        start = os.path.dirname(self.art.path) or os.path.expanduser("~")
+        start = self._export_dialog_start()
         parent = QFileDialog.getExistingDirectory(self, "Export static folder", start)
         if not parent:
+            return
+        if not self._claim_export_dir(parent):
             return
         obj = DeskObject(
             _next_object_id(), name, [layer.id for layer in layers],
@@ -4120,10 +6393,29 @@ class MainWindow(QMainWindow):
         if not self.art:
             self.status.showMessage("Open a drawing first.")
             return
-        start = os.path.dirname(self.art.path) or os.path.expanduser("~")
-        parent = QFileDialog.getExistingDirectory(self, "Export scene folder", start)
-        if not parent:
+        start = self._tab_export_dir()
+        dialog = self._png_dialog(
+            "Export scene",
+            start,
+            "This tab writes its own scene folder. Another open file keeps a different path. "
+            "100% keeps every picture at the canvas size.",
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        values = dialog.values()
+        parent = values["path"]
+        if not parent:
+            self.status.showMessage("Choose a folder.")
+            return
+        if not self._claim_export_dir(parent):
+            return
+        if not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as exc:
+                self.status.showMessage(str(exc))
+                return
+        self._remember_png(values)
         scene = _safe_folder(plan_scene(self.art, self.objects)["scene"])
         dest = os.path.join(parent, scene)
         if os.path.isdir(dest) and os.listdir(dest):
@@ -4132,30 +6424,43 @@ class MainWindow(QMainWindow):
                 return
             shutil.rmtree(dest)
         try:
-            result = write_scene(parent, self.art, self.objects, self.playlist)
+            result = write_scene(
+                parent, self.art, self.objects, self.playlist,
+                percent=values["percent"], resample=values["resample"],
+            )
         except Exception as exc:
             QMessageBox.warning(self, "VMI STUDIO", str(exc))
             return
         self.status.showMessage("Wrote %d pictures to %s" % (result["pictures"], result["root"]))
 
+    def _export_dialog_start(self):
+        path = self._tab_export_dir()
+        if os.path.isdir(path):
+            return path
+        parent = os.path.dirname(path)
+        if parent and os.path.isdir(parent):
+            return parent
+        if self.art and self.art.path:
+            return os.path.dirname(self.art.path) or os.path.expanduser("~")
+        return os.path.expanduser("~")
+
     def _fill_objects(self, select=None, keep=False):
         current = self._current_object()
         if keep and select is None and current is not None:
             select = current.id
+        self._filling_objects = True
         self.objects_list.blockSignals(True)
-        self.objects_list.clear()
-        ids = {obj.id for obj in self.objects}
-        children = {}
-        roots = []
-        for obj in self.objects:
-            parent = obj.parent if obj.parent in ids and obj.parent != obj.id else ""
-            if parent:
-                children.setdefault(parent, []).append(obj)
-            else:
-                roots.append(obj)
-        chosen = []
+        try:
+            self._fill_object_rows(select)
+        finally:
+            self.objects_list.blockSignals(False)
+            self._filling_objects = False
+        self._show_slots()
 
-        def add(obj, parent_item):
+    def _fill_object_rows(self, select):
+        self.objects_list.clear()
+        chosen = []
+        for obj in scene_objects(self.objects):
             item = QTreeWidgetItem([obj.name])
             item.setData(0, Qt.UserRole, obj.id)
             item.setData(0, Qt.UserRole + 1, object_role(self.art, obj))
@@ -4167,32 +6472,72 @@ class MainWindow(QMainWindow):
                 | Qt.ItemIsDragEnabled
                 | Qt.ItemIsDropEnabled
             )
-            if parent_item is None:
-                self.objects_list.addTopLevelItem(item)
-            else:
-                parent_item.addChild(item)
+            self.objects_list.addTopLevelItem(item)
             if select and obj.id == select:
                 chosen.append(item)
-            kids = sorted(children.get(obj.id, []), key=lambda row: (-int(row.stack or 0), row.id))
-            for kid in kids:
-                add(kid, item)
-
-        for obj in sorted(roots, key=lambda row: (-int(row.stack or 0), row.id)):
-            add(obj, None)
-        self.objects_list.expandAll()
-        self.objects_list.blockSignals(False)
         if chosen:
             self.objects_list.setCurrentItem(chosen[0])
+            self.objects_list.scrollToItem(chosen[0])
         elif self.objects_list.topLevelItemCount():
             self.objects_list.setCurrentItem(self.objects_list.topLevelItem(0))
-        self._show_slots()
+        self._refresh_scene_preview()
 
-    def _apply_object_tree(self):
-        with self._edit("the object stack"):
-            arrange_objects(self.objects, self.objects_list.rows())
+    def _apply_scene_order(self, ordered_ids):
+        with self._edit("the object order"):
+            set_scene_order(self.objects, ordered_ids)
         self._fill_objects(keep=True)
         self._save_session()
-        self.status.showMessage("Object stack saved. The top of each group is in front.")
+        self.status.showMessage("Scene order saved. The top row is behind.")
+
+    def toggle_scene_preview(self):
+        preview = self._scene_preview
+        if preview.isVisible():
+            preview.hide()
+            self.status.showMessage("Scene preview closed.")
+            return
+        self._paint_scene_preview()
+        self._place_scene_preview()
+        preview.show()
+        preview.raise_()
+        self.status.showMessage("Scene preview. The top of the list is behind.")
+
+    def _place_scene_preview(self):
+        preview = self._scene_preview
+        button = self.preview_button
+        preview.adjustSize()
+        origin = button.mapToGlobal(button.rect().topRight())
+        x = origin.x() - preview.width()
+        y = origin.y() - preview.height() - 8
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = min(max(area.left(), x), max(area.left(), area.right() - preview.width()))
+            y = min(max(area.top(), y), max(area.top(), area.bottom() - preview.height()))
+        preview.move(int(x), int(y))
+
+    def _refresh_scene_preview(self):
+        preview = getattr(self, "_scene_preview", None)
+        if preview is None or not preview.isVisible():
+            return
+        self._paint_scene_preview()
+
+    def _paint_scene_preview(self):
+        preview = self._scene_preview
+        preview.setStyleSheet(theme.dialog_sheet())
+        if not self.art or not self.objects:
+            preview.picture.clear()
+            preview.names.setText("No objects yet." if self.art else "Open a drawing.")
+            return
+        plate, rows = scene_plate(self.art, self.objects)
+        if plate is None:
+            preview.picture.clear()
+        else:
+            preview.picture.setPixmap(_pixmap(plate))
+        lines = []
+        for index, row in enumerate(rows):
+            extra = "" if row["painted"] else "  (no picture)"
+            lines.append("%d  %s%s" % (index, row["name"], extra))
+        preview.names.setText("\n".join(lines) if lines else "No objects yet.")
 
     def _current_object(self):
         item = self.objects_list.currentItem()
@@ -4440,6 +6785,7 @@ class MainWindow(QMainWindow):
             timer.stop()
         if not self.art:
             return
+        task_rows, task_colors = self._task_snapshot()
         save({
             "path": self.art.path,
             "signature": signature(self.art.layers),
@@ -4466,11 +6812,16 @@ class MainWindow(QMainWindow):
                 for obj in self.objects
             ],
             "animations": [
-                {"id": node.id, "timeline": list(node.timeline)}
+                {
+                    "id": node.id,
+                    "timeline": list(node.timeline),
+                    "frames": [int(frame) for frame in (getattr(node, "frames", None) or [])],
+                }
                 for node in walk(self.art.layers)
                 if node.animation
             ],
             "font": self._font_id,
+            "theme": self._theme_id,
             "arrange_locked": bool(self.arrange_locked),
             "mute": track_ids(self.art.layers, "mute"),
             "solo": track_ids(self.art.layers, "solo"),
@@ -4479,9 +6830,51 @@ class MainWindow(QMainWindow):
             "split_version": SPLIT_VERSION,
             "tree_width": int(self.tree.tree_width),
             "playlist": self.playlist or "",
+            "tasks": task_rows,
+            "task_colors": task_colors,
+            "time_version": 1,
+            "layers_open": bool(self._pane_open.get("layers", True)),
+            "objects_open": bool(self._pane_open.get("objects", True)),
+            "timeline_open": bool(getattr(self, "_timeline_open", True)),
+            "png_percent": int(getattr(self, "_png_percent", 100) or 100),
+            "png_resample": getattr(self, "_png_resample", "nearest") or "nearest",
+            "png_recent": list(getattr(self, "_png_recent", []) or [])[:8],
+            "png_favorites": list(getattr(self, "_png_favorites", []) or []),
         })
 
+    def _task_snapshot(self):
+        board = getattr(self, "task_board", None)
+        if board is None:
+            return [], {"background": "#000000", "text": "#FFFFFF"}
+        return board.rows(), board.colors()
+
+    def _apply_tasks(self, rows, colors):
+        board = getattr(self, "task_board", None)
+        if board is None:
+            return
+        board.set_state(rows, colors)
+
+    def _tasks_from(self, art, session, project):
+        """Session tasks follow the path. A blueprint supplies them when the session has none."""
+        if isinstance(session, dict) and session.get("path") == art.path and "tasks" in session:
+            return session.get("tasks") or [], session.get("task_colors")
+        if isinstance(project, dict) and "tasks" in project:
+            return project.get("tasks") or [], project.get("task_colors")
+        return [], None
+
+    def _tasks_changed(self, message):
+        index = getattr(self, "_shown_index", -1)
+        projects = getattr(self, "_projects", [])
+        if 0 <= index < len(projects):
+            projects[index].tasks, projects[index].task_colors = self._task_snapshot()
+        if message:
+            self.status.showMessage(message)
+        self._save_session()
+
     def closeEvent(self, event):
+        board = getattr(self, "task_board", None)
+        if board is not None:
+            board.shutdown()
         self._picture_pending = False
         self._picture_generation += 1
         job = self._picture_job
@@ -4490,6 +6883,17 @@ class MainWindow(QMainWindow):
         self._save_session()
         if self._loader is not None and self._loader.isRunning():
             self._loader.wait(1500)
+        home = getattr(self, "_home", None)
+        if home is None or getattr(self, "_quitting", False):
+            app = QApplication.instance()
+            page = getattr(self, "browser_page", None)
+            if app is not None and page is not None:
+                app.removeEventFilter(page)
+        if home is not None and not getattr(self, "_quitting", False):
+            event.ignore()
+            self.hide()
+            home()
+            return
         super().closeEvent(event)
 
     def _snapshot(self):
@@ -4534,16 +6938,18 @@ def _pixmap(image):
     return QPixmap.fromImage(qimg)
 
 
-def _saved_font_id():
+def _saved_choice(key, default):
     data = load() or {}
-    if isinstance(data, dict):
-        return data.get("font") or fonts.DEFAULT_ID
-    return fonts.DEFAULT_ID
+    if isinstance(data, dict) and data.get(key):
+        return data.get(key)
+    return default
 
 
-def apply_style(app, font_id=None):
+def apply_style(app, font_id=None, theme_id=None):
     app.setStyle("Fusion")
-    requested = _saved_font_id() if font_id is None else font_id
+    requested = _saved_choice("font", fonts.DEFAULT_ID) if font_id is None else font_id
+    chosen = theme.choose(_saved_choice("theme", theme.DEFAULT_ID) if theme_id is None else theme_id)
+    theme.bind_modules(chosen)
     try:
         face, family = fonts.activate(requested)
     except Exception:
@@ -4563,47 +6969,11 @@ def _paint_font(app, face, family):
             font.setStyleHint(QFont.StyleHint.Monospace)
         font.setHintingPreference(QFont.HintingPreference.PreferDefaultHinting)
     app.setFont(font)
-    safe = family.replace("\\", "").replace('"', "")
-    app.setStyleSheet(STYLESHEET % safe)
+    app.setStyleSheet(theme.stylesheet(theme.current(), family))
 
 
-STYLESHEET = """
-QWidget { background: #000000; color: #3a3a3a; font-size: 12px; }
-QMenuBar, QTreeView, QTreeWidget, QListWidget, QPlainTextEdit, QPushButton, QLineEdit, QSpinBox, QComboBox, QScrollArea, QLabel, QStatusBar, QDialog, QMessageBox, QHeaderView::section { font-family: "%s"; }
-QLabel#title { color: #2a2a2a; }
-QMenuBar { background: #000000; color: #3a3a3a; border-bottom: 1px solid #2a2a2a; }
-QMenuBar::item:selected { background: #111111; color: #ffffff; }
-QMenu { background: #000000; color: #3a3a3a; border: 1px solid #2a2a2a; }
-QMenu::item:selected { background: #111111; color: #ffffff; }
-QTreeView, QTreeWidget, QListWidget, QPlainTextEdit { background: #000000; color: #3a3a3a; border: none; outline: none; }
-QTreeView::item:selected, QTreeWidget::item:selected, QListWidget::item:selected { background: #111111; color: #ffffff; }
-QHeaderView::section { background: #000000; color: #2a2a2a; border: none; border-bottom: 1px solid #2a2a2a; padding: 2px 4px; }
-QSplitter::handle { background: #141414; }
-QSplitter::handle:hover { background: #3a3a3a; }
-QSplitter::handle:pressed { background: #ffffff; }
-QPushButton { background: #000000; color: #3a3a3a; border: 1px solid #2a2a2a; padding: 4px 8px; border-radius: 0; }
-QPushButton:hover { color: #ffffff; border-color: #ffffff; }
-QPushButton:pressed, QPushButton[current="true"] { color: #ffffff; border-color: #ffffff; }
-QPushButton#export { background: #ffffff; color: #000000; border: 1px solid #ffffff; }
-QPushButton#export:pressed { background: #ffffff; color: #000000; }
-QLineEdit, QSpinBox { background: #000000; color: #ffffff; border: 1px solid #2a2a2a; border-radius: 0; padding: 2px 4px; selection-background-color: #ffffff; selection-color: #000000; }
-QComboBox { background: #000000; color: #3a3a3a; border: 1px solid #2a2a2a; border-radius: 0; padding: 2px 6px; }
-QComboBox:focus, QComboBox:on { color: #ffffff; border-color: #ffffff; }
-QComboBox::drop-down { border: none; width: 16px; }
-QComboBox QAbstractItemView { background: #000000; color: #3a3a3a; border: 1px solid #2a2a2a; selection-background-color: #111111; selection-color: #ffffff; outline: 0; }
-QScrollArea { background: #000000; border: none; }
-QTreeWidget::item { padding: 0px; border: none; }
-QStatusBar { background: #000000; color: #3a3a3a; border-top: 1px solid #2a2a2a; }
-QScrollBar:vertical { background: #000000; width: 10px; margin: 0; }
-QScrollBar::handle:vertical { background: #2a2a2a; min-height: 24px; }
-QScrollBar::handle:vertical:hover { background: #3a3a3a; }
-QScrollBar:horizontal { background: #000000; height: 10px; margin: 0; }
-QScrollBar::handle:horizontal { background: #2a2a2a; min-width: 24px; }
-QScrollBar::handle:horizontal:hover { background: #3a3a3a; }
-QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
-QScrollBar::add-page, QScrollBar::sub-page { background: #000000; }
-QMessageBox { background: #000000; color: #3a3a3a; }
-"""
+STYLESHEET = theme.stylesheet(theme.STUDIO, "%s")
+
 
 
 def main(argv=None):
@@ -4619,7 +6989,10 @@ def main(argv=None):
         print(
             "VMI STUDIO %s\n"
             "Open a layered drawing and export one folder per object.\n\n"
+            "  vmi-studio [--dev]\n"
             "  vmi-studio [file.clip|psd|psb|kra|xcf|vmib] [--dev]\n\n"
+            "With no file, the browser tab lists projects, tasks, and recent drawings.\n"
+            "Nothing is loaded until you open one.\n"
             "--dev  restarts when the app code changes and reopens the same drawing.\n"
             % __version__
         )
@@ -4630,8 +7003,9 @@ def main(argv=None):
     path = args[0] if args else None
     app = QApplication.instance() or QApplication(sys.argv)
     apply_style(app)
-    window = MainWindow(dev=dev)
-    window.show()
+    studio = MainWindow(dev=dev)
+    studio._note_open = studio.browser_page.note_opened
+    studio.show()
     if path:
-        window.open_path(path)
+        studio.open_path(path)
     return app.exec()

@@ -4,9 +4,19 @@ The stroke body comes from the vmi-clip-vector sidecar (clipfile's
 read_vector). This module only stamps that geometry. It does not read SVG,
 and it does not add edit handles.
 
-Width at a point is brush_radius * width_factor. That product is the round
-stamp's diameter, so the stamp radius is half of it. Opacity at a point is
-the stroke opacity times opacity_factor.
+brush_radius is the stored radius in canvas pixels. The nominal diameter,
+before pressure, is brush_radius * 2. width_factor is the control-point
+multiplier. width_scale is the stored per-point envelope (1 on an untapered
+stroke, thinning toward the ends on a pen stroke). Both are interpolated
+between points. The visible diameter at a point is
+brush_radius * 2 * width_factor * width_scale, so the stamp half-width is
+brush_radius * width_factor * width_scale. Opacity at a point is the stroke
+opacity times opacity_factor.
+
+BrushStyle.CompositeMode 27 is Clip Studio's ink Erase. Those strokes cut
+pixels already stamped on the same layer. They do not paint their stored
+color. Any other mode, including a missing mode, paints. A white stroke with
+mode 0 stays white.
 
 Anti-alias comes from BrushStyle.AntiAlias, or FillStyle.AntiAlias on a fill
 stroke. 0 is None: a hard edge. Any other value is anti-aliased. Weak,
@@ -29,18 +39,33 @@ from vmi_studio.document import Raster
 # Unmapped non-zero values use UNMAPPED_FRINGE (the middle fringe).
 MAPPED_FRINGE = {0: 0.0}
 UNMAPPED_FRINGE = 2.0
+# Stored BrushStyle.CompositeMode for a transparent vector stroke.
+ERASE_COMPOSITE = 27
 _LOGGED_ALIAS = set()
 
 
 def sidecar_path():
-    """Built reader, or VMI_CLIP_VECTOR when that file exists."""
+    """Built reader, or VMI_CLIP_VECTOR when that file exists.
+
+    A frozen build looks beside the program and inside the PyInstaller
+    folder. A source checkout looks in tools/vmi-clip-vector/target.
+    """
     env = os.environ.get("VMI_CLIP_VECTOR")
     if env and os.path.isfile(env):
         return env
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "vmi-clip-vector"))
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.append(os.path.join(meipass, "vmi-clip-vector"))
+        candidates.append(os.path.join(exe_dir, "_internal", "vmi-clip-vector"))
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.normpath(os.path.join(here, "..", "tools", "vmi-clip-vector", "target"))
     for name in ("release", "debug"):
-        path = os.path.join(root, name, "vmi-clip-vector")
+        candidates.append(os.path.join(root, name, "vmi-clip-vector"))
+    for path in candidates:
         if os.path.isfile(path):
             return path
     return ""
@@ -226,6 +251,7 @@ def _samples(stroke, monochrome):
     if opacity <= 0:
         return
     color = _color(stroke.get("color"))
+    erase = _erases(stroke)
     fringe = fringe_px(stroke.get("anti_alias"), monochrome)
     hardness = _finite(stroke.get("hardness"))
     if hardness is None:
@@ -240,6 +266,9 @@ def _samples(stroke, monochrome):
         if x is None or y is None or width_factor is None or opacity_factor is None:
             _log("stroke point is missing position or factors")
             return
+        width_scale = _finite(point.get("width_scale"))
+        if width_scale is None:
+            width_scale = 1.0
         controls = []
         for control in point.get("controls") or []:
             if isinstance(control, (list, tuple)) and len(control) >= 2:
@@ -248,26 +277,32 @@ def _samples(stroke, monochrome):
                 if cx is None or cy is None:
                     continue
                 controls.append((cx, cy))
-        decoded.append((x, y, max(0.0, width_factor), _unit(opacity_factor), controls))
+        decoded.append((
+            x,
+            y,
+            max(0.0, width_factor) * max(0.0, width_scale),
+            _unit(opacity_factor),
+            controls,
+        ))
     if not decoded:
         return
     curve = stroke.get("curve") or "straight"
     closed = bool(stroke.get("closed"))
     if curve == "spline":
-        yield from _spline(decoded, radius, opacity, color, fringe, hardness, monochrome, closed)
+        yield from _spline(decoded, radius, opacity, color, fringe, hardness, monochrome, erase, closed)
         return
     if len(decoded) == 1:
-        yield _dab(decoded[0], radius, opacity, color, fringe, hardness, monochrome)
+        yield _dab(decoded[0], radius, opacity, color, fringe, hardness, monochrome, erase)
         return
     count = len(decoded)
     segments = count if closed else count - 1
     for index in range(segments):
         start = decoded[index]
         end = decoded[(index + 1) % count]
-        yield from _segment(curve, start, end, radius, opacity, color, fringe, hardness, monochrome)
+        yield from _segment(curve, start, end, radius, opacity, color, fringe, hardness, monochrome, erase)
 
 
-def _segment(curve, start, end, radius, opacity, color, fringe, hardness, monochrome):
+def _segment(curve, start, end, radius, opacity, color, fringe, hardness, monochrome, erase):
     controls = start[4]
     if curve == "quadratic" and len(controls) >= 1:
         position = lambda t, a=start, b=end, c=controls[0]: _quad(a, c, b, t)
@@ -281,13 +316,13 @@ def _segment(curve, start, end, radius, opacity, color, fringe, hardness, monoch
     else:
         _log("curve %s is not drawn" % curve)
         return
-    yield from _trace(position, radius, opacity, color, fringe, hardness, monochrome)
+    yield from _trace(position, radius, opacity, color, fringe, hardness, monochrome, erase)
 
 
-def _spline(points, radius, opacity, color, fringe, hardness, monochrome, closed):
+def _spline(points, radius, opacity, color, fringe, hardness, monochrome, erase, closed):
     count = len(points)
     if count == 1:
-        yield _dab(points[0], radius, opacity, color, fringe, hardness, monochrome)
+        yield _dab(points[0], radius, opacity, color, fringe, hardness, monochrome, erase)
         return
     segments = count if closed else count - 1
     for index in range(segments):
@@ -304,10 +339,10 @@ def _spline(points, radius, opacity, color, fringe, hardness, monochrome, closed
         if index + 1 >= count and not closed:
             break
         position = lambda t, a=p0, b=p1, c=p2, d=p3: _catmull(a, b, c, d, t)
-        yield from _trace(position, radius, opacity, color, fringe, hardness, monochrome)
+        yield from _trace(position, radius, opacity, color, fringe, hardness, monochrome, erase)
 
 
-def _trace(position, radius, opacity, color, fringe, hardness, monochrome):
+def _trace(position, radius, opacity, color, fringe, hardness, monochrome, erase):
     rough = 0.0
     previous = position(0.0)
     for step in range(1, 9):
@@ -326,10 +361,10 @@ def _trace(position, radius, opacity, color, fringe, hardness, monochrome):
         amount = opacity * opacity_factor
         if stamp_radius <= 0 or amount <= 0:
             continue
-        yield (x, y, stamp_radius, amount, color, fringe, hardness, monochrome)
+        yield (x, y, stamp_radius, amount, color, fringe, hardness, monochrome, erase)
 
 
-def _dab(point, radius, opacity, color, fringe, hardness, monochrome):
+def _dab(point, radius, opacity, color, fringe, hardness, monochrome, erase):
     x, y, width_factor, opacity_factor, _controls = point
     return (
         x,
@@ -340,12 +375,16 @@ def _dab(point, radius, opacity, color, fringe, hardness, monochrome):
         fringe,
         hardness,
         monochrome,
+        erase,
     )
 
 
 def _stamp_radius(brush_radius, width_factor):
-    """Diameter is brush_radius * width_factor. The stamp uses the radius."""
-    return max(0.0, brush_radius * width_factor * 0.5)
+    """Half of brush_radius * 2 * width_factor * width_scale.
+
+    The caller multiplies width_factor by the per-point width envelope first.
+    """
+    return max(0.0, brush_radius * width_factor)
 
 
 def _line(start, end, t):
@@ -405,7 +444,7 @@ def _bounds(samples, width, height):
     top = height
     right = 0
     bottom = 0
-    for x, y, radius, _opacity, _color, fringe, hardness, monochrome in samples:
+    for x, y, radius, _opacity, _color, fringe, hardness, monochrome, _erase in samples:
         reach = radius + _soft_reach(fringe, hardness, monochrome) + 1.0
         left = min(left, x - reach)
         right = max(right, x + reach)
@@ -430,7 +469,7 @@ def _soft_reach(fringe, hardness, monochrome):
 
 
 def _stamp(image, x, y, sample):
-    _sx, _sy, radius, opacity, color, fringe, hardness, monochrome = sample
+    _sx, _sy, radius, opacity, color, fringe, hardness, monochrome, erase = sample
     if radius <= 0 or opacity <= 0:
         return
     reach = radius + _soft_reach(fringe, hardness, monochrome)
@@ -448,6 +487,9 @@ def _stamp(image, x, y, sample):
         on = dist <= radius
         if not np.any(on):
             return
+        if erase:
+            _cut_alpha(tile, on, float(opacity))
+            return
         alpha = int(round(opacity * 255.0))
         tile[on, 0] = color[0]
         tile[on, 1] = color[1]
@@ -458,6 +500,9 @@ def _stamp(image, x, y, sample):
     sa = cover * float(opacity)
     if not np.any(sa > 0):
         return
+    if erase:
+        _cut_alpha(tile, sa > 0, None, sa)
+        return
     dst = tile.astype(np.float32)
     da = dst[:, :, 3] * (1.0 / 255.0)
     out_a = sa + da * (1.0 - sa)
@@ -467,6 +512,27 @@ def _stamp(image, x, y, sample):
         dst[:, :, channel] = np.where(keep, mixed / np.maximum(out_a, 1e-6), dst[:, :, channel])
     dst[:, :, 3] = out_a * 255.0
     image[y0:y1, x0:x1] = np.clip(np.rint(dst), 0, 255).astype(np.uint8)
+
+
+def _cut_alpha(tile, mask, opacity, coverage=None):
+    """Destination-out. RGB stays. Full coverage clears alpha."""
+    channel = tile[:, :, 3].astype(np.float32)
+    if coverage is None:
+        channel[mask] *= 1.0 - opacity
+    else:
+        channel[mask] *= 1.0 - coverage[mask]
+    tile[:, :, 3] = np.clip(np.rint(channel), 0, 255).astype(np.uint8)
+
+
+def _erases(stroke):
+    """Mode 27 cuts ink. A missing mode, and every other mode, paints."""
+    value = stroke.get("composite")
+    if value is None:
+        return False
+    try:
+        return int(value) == ERASE_COMPOSITE
+    except (TypeError, ValueError):
+        return False
 
 
 def _cover(dist, radius, fringe, hardness, monochrome):

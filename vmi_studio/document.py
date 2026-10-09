@@ -31,6 +31,13 @@ class Node:
         self.mute = False
         self.solo = False
         self.warp = ""
+        # target or mask, drawn by the warp tools. Empty means the file named it.
+        self.marker = ""
+        self.color = ""
+        # One polygon is a list of (x, y) document pixels. A target stores one.
+        self.vectors = []
+        # Frame numbers parallel to the specified cels. Empty means 0, 1, 2…
+        self.frames = []
 
 
 class ArtFile:
@@ -43,6 +50,7 @@ class ArtFile:
         self.layers = layers
         self.note = note
         self.project = None
+        self.clip_time = None
 
 
 class Ids:
@@ -300,17 +308,103 @@ def animation_folders(nodes):
 
 
 def timeline_cels(node):
-    """Direct children in timeline order. The top row is frame 0 until that order is moved."""
+    """Direct children in timeline order. The top row is frame 0 until that order is moved.
+
+    A Clip Studio specification stores frame numbers. Cels that were never
+    specified stay in the folder and are not frames.
+    """
     kids = list(panel_order(node.children))
     if not node.timeline:
         return kids
     by_id = {child.id: child for child in kids}
     ordered = [by_id[ident] for ident in node.timeline if ident in by_id]
+    if getattr(node, "frames", None):
+        return ordered
     seen = {child.id for child in ordered}
     for child in kids:
         if child.id not in seen:
             ordered.append(child)
     return ordered
+
+
+def spare_cels(node):
+    """Children of an animation folder that no frame specifies."""
+    if not getattr(node, "frames", None):
+        return []
+    shown = {cel.id for cel in timeline_cels(node)}
+    return [child for child in panel_order(node.children) if child.id not in shown]
+
+
+def frame_map(node):
+    """(frame, cel) pairs. A hand-marked folder uses 0, 1, 2…"""
+    cels = timeline_cels(node)
+    frames = [int(frame) for frame in (getattr(node, "frames", None) or [])]
+    if len(frames) != len(cels):
+        frames = list(range(len(cels)))
+    return sorted(zip(frames, cels), key=lambda item: (item[0], item[1].id))
+
+
+def cel_at(node, frame):
+    """The cel specified at this frame. It holds until the next specification."""
+    pairs = frame_map(node)
+    chosen = None
+    for index, (at, cel) in enumerate(pairs):
+        if int(frame) < int(at):
+            break
+        nxt = pairs[index + 1][0] if index + 1 < len(pairs) else None
+        if nxt is None or int(frame) < int(nxt):
+            chosen = cel
+            break
+    return chosen
+
+
+def playhead_cel(folder):
+    """(True, cel or None) when a Clip Studio playhead decides this folder.
+
+    The cel holds from its key until the next key. Before the first key the
+    picture gets nothing from the folder. A hand-marked folder has no frame
+    numbers, so the caller keeps the older focus rule.
+    """
+    if not getattr(folder, "frames", None) or not hasattr(folder, "show_frame"):
+        return False, None
+    return True, cel_at(folder, folder.show_frame)
+
+
+def place_cel(node, cel_id, frame):
+    """Put one cel on a frame. A cel already on that frame swaps with it.
+
+    A hand-marked folder has no frame numbers. There the move is along the
+    timeline order, and the layer stack stays where it is.
+    """
+    cels = timeline_cels(node)
+    ids = [cel.id for cel in cels]
+    if cel_id not in ids:
+        return False
+    index = ids.index(cel_id)
+    try:
+        frame = int(frame)
+    except (TypeError, ValueError):
+        return False
+    if frame < 0:
+        return False
+    frames = [int(item) for item in (getattr(node, "frames", None) or [])]
+    if len(frames) != len(ids):
+        if frame >= len(ids) or frame == index:
+            return False
+        order = list(ids)
+        moved = order.pop(index)
+        order.insert(frame, moved)
+        node.timeline = order
+        return True
+    if frame == frames[index]:
+        return False
+    other = next((pos for pos, value in enumerate(frames) if pos != index and value == frame), None)
+    if other is None:
+        frames[index] = frame
+    else:
+        frames[index], frames[other] = frames[other], frames[index]
+    node.frames = frames
+    return True
 
 
 def move_cel(node, cel_id, delta):
@@ -323,6 +417,10 @@ def move_cel(node, cel_id, delta):
     if nxt < 0 or nxt >= len(order):
         return False
     order[index], order[nxt] = order[nxt], order[index]
+    frames = [int(frame) for frame in (getattr(node, "frames", None) or [])]
+    if len(frames) == len(order):
+        frames[index], frames[nxt] = frames[nxt], frames[index]
+        node.frames = frames
     node.timeline = order
     return True
 
@@ -374,9 +472,12 @@ def set_animation(nodes, ident, on):
         for desc in walk(node.children):
             desc.animation = False
             desc.timeline = []
+            desc.frames = []
         node.timeline = [cel.id for cel in panel_order(node.children)]
+        node.frames = []
     else:
         node.timeline = []
+        node.frames = []
     return node
 
 
@@ -391,7 +492,19 @@ def apply_animations(nodes, rows):
             continue
         node.animation = True
         kids = {child.id for child in node.children}
-        node.timeline = [ident for ident in row.get("timeline") or [] if ident in kids]
+        saved = [ident for ident in row.get("timeline") or [] if ident in kids]
+        node.timeline = saved
+        raw = row.get("frames")
+        if isinstance(raw, list):
+            frames = []
+            ok = True
+            for item in raw:
+                try:
+                    frames.append(int(item))
+                except (TypeError, ValueError):
+                    ok = False
+                    break
+            node.frames = frames if ok and len(frames) == len(saved) else []
     return nodes
 
 
@@ -412,18 +525,26 @@ def preview_paint(nodes, focus_id=None):
                 continue
             child_solo = ancestor_solo or bool(node.solo)
             if node.kind == "group" and node.id in roots:
-                cels = [cel for cel in timeline_cels(node) if cel.visible]
-                if solo_on and not child_solo:
-                    cels = [cel for cel in cels if cel.solo or _contains_solo(cel)]
-                if not cels:
-                    continue
-                chosen = cels[0]
-                if focus_id and focus_id != node.id:
-                    for cel in cels:
-                        holds = cel.id == focus_id or (cel.kind == "group" and find_node(cel.children, focus_id))
-                        if holds:
-                            chosen = cel
-                            break
+                used, held = playhead_cel(node)
+                if used:
+                    if held is None or not held.visible:
+                        continue
+                    if solo_on and not child_solo and not (held.solo or _contains_solo(held)):
+                        continue
+                    chosen = held
+                else:
+                    cels = [cel for cel in timeline_cels(node) if cel.visible]
+                    if solo_on and not child_solo:
+                        cels = [cel for cel in cels if cel.solo or _contains_solo(cel)]
+                    if not cels:
+                        continue
+                    chosen = cels[0]
+                    if focus_id and focus_id != node.id:
+                        for cel in cels:
+                            holds = cel.id == focus_id or (cel.kind == "group" and find_node(cel.children, focus_id))
+                            if holds:
+                                chosen = cel
+                                break
                 chosen_gate = paint_gate(chosen, False, False, child_solo, solo_on)
                 if chosen_gate == "drop":
                     continue
@@ -641,6 +762,30 @@ def arrange(nodes, ids, target_id, place):
             at = index + 1 if place == "before" else index
             parent[at:at] = block
     return refresh(layers), block[-1].id
+
+
+def remove_nodes(nodes, ids):
+    """Remove these layers and folders. A folder takes everything inside it.
+
+    Returns (tree, removed nodes) or None when none of the ids are in the tree.
+    The removed list is the top rows only, back to front, not each child.
+    """
+    known = {ident for ident in ids if find_node(nodes, ident)}
+    if not known:
+        return None
+    top = _topmost(nodes, known)
+    removed = _collect(nodes, top)
+
+    def detach(lst):
+        kept = []
+        for node in lst:
+            if node.id in top:
+                continue
+            node.children = detach(node.children)
+            kept.append(node)
+        return kept
+
+    return refresh(detach(list(nodes))), removed
 
 
 def move_into(nodes, ids, folder_id):

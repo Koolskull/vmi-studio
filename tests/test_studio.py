@@ -32,6 +32,7 @@ from vmi_studio.xcf import parse
 
 _BG = os.path.join(os.path.expanduser("~"), "Documents", "work", "CSP", "BG")
 BUTTONS = os.environ.get("VMI_STUDIO_BUTTONS", os.path.join(_BG, "buttons.clip"))
+RADIO = os.environ.get("VMI_STUDIO_RADIO", os.path.join(_BG, "BEETL RADIO STATION.clip"))
 GAMER = os.environ.get("VMI_STUDIO_GAMER", os.path.join(_BG, "gamer.kra"))
 
 
@@ -383,6 +384,25 @@ class ObjectTests(unittest.TestCase):
             import shutil
             shutil.rmtree(parent, ignore_errors=True)
 
+    def test_every_object_is_listed_even_when_parents_cycle(self):
+        from vmi_studio.desk import scene_objects, scene_plate
+
+        wall = DeskObject("o1", "wall", [], parent="o2", stack=0)
+        door = DeskObject("o2", "door", [], parent="o1", stack=1)
+        self.assertEqual(paint_order([wall, door]), [])
+        self.assertEqual([obj.name for obj in scene_objects([wall, door])], ["wall", "door"])
+        ids = Ids()
+        ink = Node(ids.next(), "ink", "layer", raster=pixel(9, 0, 0))
+        art = ArtFile("wide.clip", "", "clip", 960, 20, refresh([ink]), "")
+        wall.layer_ids = [ink.id]
+        plate, rows = scene_plate(art, [wall, door])
+        self.assertEqual([row["name"] for row in rows], ["wall", "door"])
+        self.assertTrue(rows[0]["painted"])
+        self.assertFalse(rows[1]["painted"])
+        self.assertEqual(plate.size, (480, 10))
+        planned = [row["name"] for row in plan_scene(art, [wall, door])["objects"]]
+        self.assertEqual(planned, ["wall", "door"])
+
 
 class FolderMenuTests(unittest.TestCase):
     def test_a_plain_folder_is_one_static_picture(self):
@@ -534,6 +554,15 @@ class WarpTests(unittest.TestCase):
         self.assertEqual(by_name["door"]["parent"], "wall")
         self.assertEqual(by_name["wall"]["parent"], "")
         self.assertEqual(object_role(art, back), "")
+        from vmi_studio.desk import scene_plate, set_scene_order
+
+        set_scene_order([back, front], ["o2", "o1"])
+        self.assertEqual(front.parent, "")
+        self.assertEqual([obj.name for obj in paint_order([back, front])], ["door", "wall"])
+        plate, rows = scene_plate(art, [back, front])
+        self.assertEqual([row["name"] for row in rows], ["door", "wall"])
+        self.assertTrue(all(row["painted"] for row in rows))
+        self.assertEqual(plate.getpixel((0, 0))[:3], (1, 0, 0))
 
 
 class WindowTests(unittest.TestCase):
@@ -553,29 +582,84 @@ class WindowTests(unittest.TestCase):
         app.processEvents()
         return app, win
 
-    def test_the_object_outliner_puts_the_front_on_top_and_nests(self):
+    def test_the_object_list_is_the_scene_order_and_a_drag_changes_it(self):
+        from PySide6.QtCore import QMimeData, QPointF, Qt
+        from PySide6.QtGui import QDropEvent
+
         ids = Ids()
         wall = Node(ids.next(), "wall", "layer", raster=pixel(1, 0, 0))
         door = Node(ids.next(), "door", "layer", raster=pixel(0, 0, 1))
-        _app, win = self._desk(refresh([wall, door]))
+        app, win = self._desk(refresh([wall, door]))
         back = DeskObject("o1", "wall", [wall.id], stack=0)
-        front = DeskObject("o2", "door", [door.id], stack=3)
+        front = DeskObject("o2", "door", [door.id], stack=3, parent="o1")
         win.objects = [back, front]
         win._fill_objects()
         tree = win.objects_list
+        self.assertEqual(tree.topLevelItemCount(), 2)
+        self.assertEqual(tree.topLevelItem(0).text(0), "wall")
+        self.assertEqual(tree.topLevelItem(1).text(0), "door")
+        self.assertEqual(tree.topLevelItem(0).childCount(), 0)
+        flags = tree.topLevelItem(0).flags()
+        self.assertTrue(flags & Qt.ItemIsDragEnabled)
+        self.assertTrue(flags & Qt.ItemIsDropEnabled)
+        win._apply_scene_order(["o2", "o1"])
         self.assertEqual(tree.topLevelItem(0).text(0), "door")
         self.assertEqual(tree.topLevelItem(1).text(0), "wall")
-        item = tree.takeTopLevelItem(0)
-        tree.topLevelItem(0).addChild(item)
-        win._apply_object_tree()
-        self.assertEqual(front.parent, "o1")
-        self.assertEqual(tree.topLevelItem(0).text(0), "wall")
-        self.assertEqual(tree.topLevelItem(0).child(0).text(0), "door")
+        self.assertEqual(front.parent, "")
+        self.assertEqual(back.parent, "")
         planned = plan_scene(win.art, win.objects)
         by_name = {row["name"]: row for row in planned["objects"]}
-        self.assertEqual(by_name["wall"]["zIndex"], 0)
-        self.assertEqual(by_name["door"]["zIndex"], 1)
-        self.assertEqual(by_name["door"]["parent"], "wall")
+        self.assertEqual(by_name["door"]["zIndex"], 0)
+        self.assertEqual(by_name["wall"]["zIndex"], 1)
+        self.assertEqual(by_name["door"]["parent"], "")
+        win._show_editor_page()
+        win.resize(1400, 900)
+        win.show()
+        app.processEvents()
+        app.processEvents()
+        button = win.preview_button
+        pane = button.parentWidget()
+        self.assertIs(pane, win.objects_list.parentWidget())
+        self.assertEqual(button.text(), "Preview")
+        self.assertEqual(pane.layout().count(), 5)
+        self.assertEqual(pane.layout().itemAt(4).layout().indexOf(button), 1)
+        pane.layout().activate()
+        self.assertGreater(pane.width(), button.width())
+        self.assertGreater(button.geometry().right(), pane.width() // 2)
+        self.assertGreater(button.geometry().bottom(), pane.height() // 2)
+        self.assertFalse(win._scene_preview.isVisible())
+        win.preview_button.click()
+        app.processEvents()
+        self.assertTrue(win._scene_preview.isVisible())
+        self.assertIsNotNone(win._scene_preview.picture.pixmap())
+        self.assertFalse(win._scene_preview.picture.pixmap().isNull())
+        names = win._scene_preview.names.text()
+        self.assertLess(names.find("door"), names.find("wall"))
+        wall_item = tree.topLevelItem(1)
+        door_item = tree.topLevelItem(0)
+        tree.setCurrentItem(wall_item)
+        self.assertTrue(wall_item.isSelected())
+        rect = tree.visualRect(tree.indexFromItem(door_item))
+        self.assertGreater(rect.height(), 0)
+        pos = QPointF(rect.left() + 8, rect.top() + 1)
+        event = QDropEvent(
+            pos,
+            Qt.DropAction.MoveAction,
+            QMimeData(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        tree.dropEvent(event)
+        self.assertEqual(tree.topLevelItem(0).text(0), "wall")
+        self.assertEqual(tree.topLevelItem(1).text(0), "door")
+        self.assertEqual(tree.topLevelItem(0).childCount(), 0)
+        self.assertEqual(back.parent, "")
+        self.assertEqual(front.parent, "")
+        names = win._scene_preview.names.text()
+        self.assertLess(names.find("wall"), names.find("door"))
+        self.assertNotIn("(no picture)", names)
+        win.preview_button.click()
+        self.assertFalse(win._scene_preview.isVisible())
         win.close()
 
     def test_a_warp_system_folder_offers_prepare_first_and_makes_an_object(self):
@@ -860,29 +944,24 @@ class WindowTests(unittest.TestCase):
         win._fill_objects()
         app.processEvents()
         tree = win.objects_list
-        parent = tree.topLevelItem(0)
-        child = parent.child(0)
-        self.assertEqual(parent.text(0), "wall")
-        self.assertEqual(child.text(0), "door")
+        self.assertEqual(
+            [tree.topLevelItem(index).text(0) for index in range(tree.topLevelItemCount())],
+            ["wall", "door"],
+        )
         image = tree.viewport().grab().toImage()
 
-        def rule_start(item):
+        def has_white(item):
             rect = tree.visualRect(tree.indexFromItem(item))
-            y = rect.bottom()
-            for x in range(rect.left(), rect.right()):
-                color = image.pixelColor(x, y)
-                if (color.red(), color.green(), color.blue()) == (42, 42, 42):
-                    return x
-            return None
+            self.assertGreater(rect.height(), 0)
+            for y in range(rect.top() + 1, rect.bottom()):
+                for x in range(rect.left() + 4, rect.right() - 4):
+                    color = image.pixelColor(x, y)
+                    if (color.red(), color.green(), color.blue()) == (255, 255, 255):
+                        return True
+            return False
 
-        parent_start = rule_start(parent)
-        child_start = rule_start(child)
-        self.assertIsNotNone(parent_start)
-        self.assertGreater(child_start, parent_start)
-        child_rect = tree.visualRect(tree.indexFromItem(child))
-        branch = child_rect.x() + 4 + 16 + 8
-        guide = image.pixelColor(branch, child_rect.top() + 2)
-        self.assertEqual((guide.red(), guide.green(), guide.blue()), (42, 42, 42))
+        self.assertTrue(has_white(tree.topLevelItem(0)))
+        self.assertTrue(has_white(tree.topLevelItem(1)))
         win.close()
 
     def test_level_fields_round_trip_through_the_session_and_the_folder(self):
@@ -1202,6 +1281,12 @@ class WindowTests(unittest.TestCase):
         win.resize(900, 700)
         win.show()
         app.processEvents()
+        sizes = win.split.sizes()
+        total = sum(sizes)
+        left = 480
+        right = sizes[2]
+        win.split.setSizes([left, max(140, total - left - right), right])
+        app.processEvents()
         self.assertEqual([node.name for node in visible_paint(win.art.layers)], ["sky", "door"])
         rows = win.tree.visible_nodes()
         door_row = next(node for node in rows if node.name == "door")
@@ -1373,6 +1458,44 @@ class WindowTests(unittest.TestCase):
         self.assertIsNone(win._split_saved)
         win.close()
 
+    def test_the_blend_chip_stays_the_width_of_its_name_and_hides_first(self):
+        from PySide6.QtCore import QRect
+
+        from vmi_studio.window import MIN_TREE, blend_chip_width, row_tracks
+
+        ids = Ids()
+        door = Node(ids.next(), "door", "layer", raster=pixel(0, 0, 255))
+        app, win = self._desk(refresh([door]))
+        chip = blend_chip_width()
+        self.assertGreater(chip, 40)
+        self.assertLess(chip, 160)
+        wide = row_tracks(QRect(0, 0, 900, 22), 280)
+        wider = row_tracks(QRect(0, 0, 1400, 22), 40)
+        split, gutter, _track, mute, _solo, _clip, opacity, blend = wide
+        self.assertEqual(blend.width(), chip)
+        self.assertEqual(wider[7].width(), chip)
+        self.assertGreater(wider[0], split)
+        self.assertGreaterEqual(split, MIN_TREE)
+        self.assertGreater(blend.left(), opacity.right())
+        self.assertGreater(mute.left(), gutter.right())
+        self.assertLess(blend.right(), 900)
+        narrow = row_tracks(QRect(0, 0, 240, 22), 280)
+        self.assertFalse(narrow[7].isValid())
+        self.assertEqual(narrow[3].width(), 11)
+        self.assertEqual(narrow[5].width(), 11)
+        self.assertGreater(narrow[0], 80)
+        win.resize(1600, 700)
+        win.show()
+        app.processEvents()
+        sizes = win.split.sizes()
+        total = sum(sizes)
+        win.split.setSizes([720, max(140, total - 720 - sizes[2]), sizes[2]])
+        app.processEvents()
+        shown = win.tree.track_marks(win.model.index_for(door))
+        self.assertEqual(shown[7].width(), chip)
+        self.assertGreaterEqual(shown[0], MIN_TREE)
+        win.close()
+
     def test_track_rules_meet_the_names_without_a_vertical_bar(self):
         ids = Ids()
         group = Node(ids.next(), "Exterior", "group")
@@ -1416,6 +1539,7 @@ class WindowTests(unittest.TestCase):
         app, win = self._desk(refresh([sky, door]))
         win.resize(1100, 700)
         win.show()
+        win.split.setSizes([560, 400, 126])
         app.processEvents()
         tree = win.tree
         sky_index = tree.model().index_for(sky)
@@ -1423,11 +1547,22 @@ class WindowTests(unittest.TestCase):
 
         def peak(index):
             _split, _gutter, _track, _mute, _solo, _clip, _opacity, box = tree.track_marks(index)
+            bar = tree.horizontalScrollBar()
+            bar.setValue(max(0, box.left() - 4))
+            app.processEvents()
             image = tree.viewport().grab().toImage()
+            origin = bar.value()
             best = 0
-            for y in range(box.top() + 2, box.bottom() - 1):
-                for x in range(box.left() + 4, box.right() - 4):
-                    color = image.pixelColor(x, y)
+            y0 = max(0, box.top() + 2)
+            y1 = min(image.height(), box.bottom() - 1)
+            x0 = box.left() + 4
+            x1 = box.right() - 4
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    px = x - origin
+                    if px < 0 or px >= image.width():
+                        continue
+                    color = image.pixelColor(px, y)
                     best = max(best, color.red(), color.green(), color.blue())
             return best
 
@@ -1542,11 +1677,14 @@ class WindowTests(unittest.TestCase):
         from vmi_studio.window import choose_split, saved_split_fits, split_sizes
 
         stale = [562, 704, 640]
-        wide = [344, 3138, 344]
-        # The 4K panel is 1920 logical pixels at scale 2. Same ratio, half the counts.
-        self.assertEqual(split_sizes(1920), [172, 1562, 172])
+        wide = [918, 2564, 344]
+        narrow = [307, 1427, 172]
+        # The 4K panel is 1920 logical pixels at scale 2. The layers pane fits
+        # the names and a blend chip. The objects pane stays narrow.
+        self.assertEqual(split_sizes(1920), [457, 1277, 172])
         self.assertEqual(split_sizes(3840), wide)
-        self.assertEqual(choose_split(1920, None, 3840), [172, 1562, 172])
+        self.assertEqual(choose_split(1920, None, 3840), [457, 1277, 172])
+        self.assertEqual(choose_split(1920, narrow, 3840), [457, 1277, 172])
         self.assertEqual(sum(split_sizes(3840)), 3840 - 14)
         self.assertIsNone(split_sizes(400))
         self.assertFalse(saved_split_fits(stale, 3840))
@@ -1566,7 +1704,7 @@ class WindowTests(unittest.TestCase):
         win._screen_width = lambda: 3840
         win._apply_split(stale)
         self.assertEqual(win.split.width(), 3840)
-        self.assertEqual(win.split.sizes(), [344, 3138, 344])
+        self.assertEqual(win.split.sizes(), [918, 2564, 344])
         kept = [800, 2226, 800]
         win._split_custom = False
         win._apply_split(kept)
@@ -1575,6 +1713,84 @@ class WindowTests(unittest.TestCase):
         win._apply_split([100, 100, 100])
         self.assertEqual(win.split.sizes(), kept)
         win.close()
+
+    def test_backspace_and_delete_remove_a_layer_or_its_folder(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QMenu
+
+        ids = Ids()
+        door = Node(ids.next(), "door", "layer", raster=pixel(1, 0, 0))
+        wall = Node(ids.next(), "wall", "layer", raster=pixel(0, 1, 0))
+        room = Node(ids.next(), "room", "group")
+        room.children = [door, wall]
+        sky = Node(ids.next(), "sky", "layer", raster=pixel(0, 0, 1))
+        app, win = self._desk(refresh([room, sky]))
+        menu = QMenu()
+        win.tree._fill_menu(menu, room)
+        labels = [action.text() for action in menu.actions() if action.text()]
+        self.assertIn("Delete", labels)
+        sky_object = DeskObject("o1", "sky", [sky.id], explicit=True)
+        room_object = DeskObject("o2", "room", [door.id, wall.id], explicit=True)
+        win.objects = [sky_object, room_object]
+        win._fill_objects()
+        win.select_only(sky)
+        QTest.keyClick(win.tree, Qt.Key_Backspace)
+        app.processEvents()
+        self.assertEqual([node.name for node in win.art.layers], ["room"])
+        self.assertEqual([node.name for node in room.children], ["door", "wall"])
+        self.assertEqual([obj.name for obj in win.objects], ["room"])
+        self.assertEqual(len(win.history.undo_stack), 1)
+        win.undo()
+        self.assertEqual([node.name for node in win.art.layers], ["room", "sky"])
+        self.assertEqual(sorted(obj.name for obj in win.objects), ["room", "sky"])
+        win.select_only(door)
+        QTest.keyClick(win.tree, Qt.Key_Delete)
+        app.processEvents()
+        self.assertEqual([node.name for node in room.children], ["wall"])
+        self.assertEqual(sorted(obj.layer_ids for obj in win.objects if obj.name == "room"), [[wall.id]])
+        win.undo()
+        self.assertEqual([node.name for node in find_room(win).children], ["door", "wall"])
+        win.picked.clear()
+        win.picked.update([door.id, wall.id])
+        win._select_layer(door.id)
+        win.delete_layers()
+        room_now = find_room(win)
+        self.assertEqual(room_now.children, [])
+        self.assertEqual([node.name for node in win.art.layers if node.name == "sky"], ["sky"])
+        self.assertEqual([obj.name for obj in win.objects], ["sky"])
+        win.undo()
+        room_now = find_room(win)
+        win.select_only(room_now)
+        QTest.keyClick(win.tree, Qt.Key_Delete)
+        app.processEvents()
+        self.assertEqual([node.name for node in win.art.layers], ["sky"])
+        self.assertEqual(win.status.currentMessage(), "Deleted room and the layers inside it.")
+        win.undo()
+        self.assertEqual(sorted(node.name for node in find_room(win).children), ["door", "wall"])
+        win._fill_objects()
+        win.objects_list.setFocus()
+        win.objects_list.setCurrentItem(win.objects_list.topLevelItem(0))
+        before = [obj.name for obj in win.objects]
+        QTest.keyClick(win.objects_list, Qt.Key_Backspace)
+        app.processEvents()
+        self.assertEqual(len(win.objects), len(before) - 1)
+        win.close()
+
+    def test_closing_returns_to_the_launcher_until_quit(self):
+        _app, win = self._desk(refresh([
+            Node(Ids().next(), "wall", "layer", raster=pixel(1, 0, 0)),
+        ]))
+        seen = []
+        win._home = lambda: seen.append("home")
+        win.close()
+        self.assertEqual(seen, ["home"])
+        self.assertFalse(win.isVisible())
+        win._quitting = True
+        win.show()
+        win.close()
+        self.assertEqual(seen, ["home"])
+        self.assertFalse(win.isVisible())
 
 
 class FontTests(unittest.TestCase):
@@ -1597,7 +1813,7 @@ class FontTests(unittest.TestCase):
     def test_the_default_face_is_monospace_and_a_kit_face_can_replace_it(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtGui import QFontInfo
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QLabel
 
         import vmi_studio.window as window_mod
 
@@ -1608,19 +1824,17 @@ class FontTests(unittest.TestCase):
         self.assertTrue(QFontInfo(app.font()).fixedPitch())
         win = window_mod.MainWindow()
         titles = [action.text() for action in win.menuBar().actions()]
-        self.assertEqual(titles, ["File", "Edit", "View", "Font", "Layer"])
-        checked = [action.text() for action in win._font_actions.values() if action.isChecked()]
-        self.assertEqual(checked, ["Monospace"])
-        if "atwriter" not in win._font_actions:
+        self.assertEqual(titles, ["File", "Edit", "View", "Layer"])
+        self.assertEqual(win.settings_bar.findChild(QLabel, "settingsWord").text(), "Settings")
+        font_ids = [win.settings_bar.fonts.itemData(index) for index in range(win.settings_bar.fonts.count())]
+        self.assertEqual(win.settings_bar.fonts.currentData(), "monospace")
+        if "atwriter" not in font_ids:
             win.close()
             self.skipTest("the font catalog is not on this machine")
-        win._preview_font_menu()
-        self.assertEqual(win._font_actions["atwriter"].font().family(), "Another Typewriter")
         win.set_ui_font("atwriter")
         self.assertIn("Typewriter", QFontInfo(app.font()).family())
         self.assertIn("Typewriter", app.styleSheet())
-        self.assertTrue(win._font_actions["atwriter"].isChecked())
-        self.assertFalse(win._font_actions["monospace"].isChecked())
+        self.assertEqual(win.settings_bar.fonts.currentData(), "atwriter")
         win.show()
         app.processEvents()
         self.assertIn("Typewriter", win.caption.fontInfo().family())
@@ -2428,6 +2642,47 @@ class NavigateTests(unittest.TestCase):
         self.assertAlmostEqual(panned[1], 5, places=5)
         self.assertIsNone(view_to_image(0, 0, 100, 100, 10, 10, 1, 0, 0, 0))
 
+    def test_zoom_stays_on_the_canvas_center(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QColor, QPixmap
+        from PySide6.QtWidgets import QApplication
+
+        from vmi_studio.window import PictureView
+
+        app = QApplication.instance() or QApplication([])
+        view = PictureView()
+        view.resize(200, 120)
+        view.show()
+        app.processEvents()
+        pix = QPixmap(80, 40)
+        pix.fill(QColor("#ffffff"))
+        view.set_document(80, 40)
+        view.set_image(pix)
+        view.fit = False
+        view.zoom = 2.0
+        view.pan_x = 30.0
+        view.pan_y = -12.0
+        view.rotation = 90.0
+        center = QPoint(view.width() // 2, view.height() // 2)
+        before = view.document_point(center)
+        view.zoom_by(1.25)
+        after = view.document_point(center)
+        self.assertAlmostEqual(before[0], after[0], places=4)
+        self.assertAlmostEqual(before[1], after[1], places=4)
+        self.assertAlmostEqual(view.pan_x, 37.5, places=4)
+        self.assertAlmostEqual(view.pan_y, -15.0, places=4)
+        view.zoom_by(0.5)
+        back = view.document_point(center)
+        self.assertAlmostEqual(before[0], back[0], places=4)
+        self.assertAlmostEqual(before[1], back[1], places=4)
+        view.pan_x = 0.0
+        view.pan_y = 0.0
+        view.zoom_by(2.0)
+        self.assertEqual(view.pan_x, 0.0)
+        self.assertEqual(view.pan_y, 0.0)
+        view.close()
+
 
 class HistoryTests(unittest.TestCase):
     def _doc(self):
@@ -2667,6 +2922,934 @@ def _xcf_red(version=0):
     buf.patch(tile_ptr, tile_at, wide)
     buf.add(bytes([255, 0, 0, 255]) * 4)
     return bytes(buf.data)
+
+
+class ToolKernelTests(unittest.TestCase):
+    def test_hex_quiet_color_and_brush_math(self):
+        import numpy as np
+
+        from vmi_studio.paint import (
+            Brush,
+            curve_value,
+            dab,
+            parse_hex,
+            quiet_color,
+            stroke_steps,
+        )
+
+        self.assertEqual(parse_hex("#abc"), "#AABBCC")
+        self.assertIsNone(parse_hex("nope"))
+        self.assertIsNone(parse_hex("#abcd"))
+        quiet = quiet_color("#FF3EB8")
+        channels = [int(quiet[index:index + 2], 16) for index in (1, 3, 5)]
+        self.assertEqual(max(channels), 92)
+        self.assertEqual(curve_value([(0.0, 0.2), (1.0, 0.8)], 0), 0.2)
+        self.assertEqual(curve_value([(0.0, 0.2), (1.0, 0.8)], 1), 0.8)
+        steps = stroke_steps(0, 0, 0, 10, 0, 1, 5)
+        self.assertTrue(any(abs(point[0] - 5) < 0.01 and abs(point[1]) < 0.01 for point in steps))
+        brush = Brush()
+        brush.size = 40
+        brush.size_min = 4
+        brush.use_size_pressure = False
+        self.assertEqual(brush.diameter_for(0), 40)
+        brush.use_size_pressure = True
+        self.assertAlmostEqual(brush.diameter_for(0), 4)
+        self.assertAlmostEqual(brush.diameter_for(1), 40)
+        hard = np.zeros((32, 32, 4), dtype=np.uint8)
+        dab(hard, 16, 16, 4, 0, False, (255, 0, 128, 255), 1)
+        self.assertEqual(int(hard[16, 16, 3]), 255)
+        self.assertEqual(int(hard[0, 0, 3]), 0)
+        self.assertTrue(set(int(value) for value in hard[:, :, 3].reshape(-1)) <= {0, 255})
+        soft = np.zeros((32, 32, 4), dtype=np.uint8)
+        dab(soft, 16, 16, 8, 1, True, (255, 0, 0, 255), 1)
+        self.assertGreater(int(soft[16, 16, 3]), int(soft[16, 23, 3]))
+        aa = np.zeros((32, 32, 4), dtype=np.uint8)
+        dab(aa, 16.5, 16.5, 5, 0, True, (0, 0, 255, 255), 1)
+        alphas = aa[:, :, 3]
+        self.assertTrue(np.any((alphas > 0) & (alphas < 255)))
+
+    def test_markers_survive_warp_detection_and_a_mask_is_not_a_target(self):
+        from vmi_studio.paint import fill_polygon, quiet_color, recolor_raster
+        from vmi_studio.warp import (
+            WARP_PINK,
+            WARP_PURPLE,
+            mark_warps,
+            marker_ink,
+            warp_layer_kind,
+            warp_system_layers,
+        )
+
+        green = Node("g", "insert", "layer", raster=pixel(0, 180, 40))
+        green.marker = "target"
+        pink = Node("p", "WT", "layer", raster=pixel(255, 62, 184))
+        pink.marker = "mask"
+        hidden_mask = Node("m", "shade", "layer", visible=False)
+        hidden_mask.marker = "mask"
+        hidden_plain = Node("s", "sky", "layer", visible=False, raster=pixel(1, 2, 3))
+        folder = Node("f", "Folder", "group")
+        folder.children = [hidden_mask, hidden_plain]
+        window = Node("w", "screenmask", "layer")
+        colored = Node("c", "insert", "layer")
+        colored.marker = "target"
+        colored.color = "#FF0000"
+        root = refresh([green, pink, folder, window, colored])
+        mark_warps(root)
+        self.assertEqual(green.warp, "target")
+        self.assertEqual(pink.warp, "mask")
+        self.assertNotEqual(pink.warp, "window")
+        found = warp_system_layers(folder)
+        self.assertIn(hidden_mask, found)
+        self.assertNotIn(hidden_plain, found)
+        self.assertEqual(warp_layer_kind([green, pink]), "warp map")
+        self.assertEqual(warp_layer_kind([pink]), "mask")
+        self.assertEqual(marker_ink(window), WARP_PURPLE)
+        bare = Node("b", "insert", "layer")
+        bare.marker = "target"
+        mark_warps([bare])
+        self.assertEqual(marker_ink(bare), WARP_PINK)
+        self.assertEqual(marker_ink(colored), quiet_color("#FF0000"))
+        raster = fill_polygon([(2, 2), (40, 2), (40, 40), (2, 40)], "#FF3EB8", 64, 64)
+
+        def alpha_at(image, x, y):
+            if image is None:
+                return 0
+            lx, ly = x - image.x, y - image.y
+            if not (0 <= lx < image.w and 0 <= ly < image.h):
+                return 0
+            return image.rgba[(ly * image.w + lx) * 4 + 3]
+
+        self.assertEqual(alpha_at(raster, 21, 21), 255)
+        self.assertEqual(raster.rgba[((21 - raster.y) * raster.w + (21 - raster.x)) * 4], 255)
+        self.assertEqual(alpha_at(raster, 0, 0), 0)
+        painted = recolor_raster(raster, "#00FF00")
+        offset = ((21 - painted.y) * painted.w + (21 - painted.x)) * 4
+        self.assertEqual(painted.rgba[offset + 1], 255)
+        self.assertEqual(painted.rgba[offset + 3], 255)
+        self.assertEqual((painted.x, painted.y), (raster.x, raster.y))
+
+    def test_scale_keeps_100_percent_exact_and_grows_or_shrinks_the_rest(self):
+        from vmi_studio.pngout import scale_image
+
+        image = Image.new("RGBA", (4, 4), (255, 0, 0, 255))
+        self.assertIs(scale_image(image, 100), image)
+        half = scale_image(image, 50, "nearest")
+        self.assertEqual(half.size, (2, 2))
+        self.assertEqual(half.getpixel((0, 0)), (255, 0, 0, 255))
+        art = ArtFile("room.clip", "/tmp/room.clip", "clip", 4, 4, refresh([
+            Node("n0", "door", "layer", raster=fill(255, 0, 0)),
+        ]), "")
+        obj = DeskObject("o1", "door", ["n0"], {"n0": (0, 0)}, explicit=True)
+        parent = tempfile.mkdtemp(prefix="vmi-scale-")
+        try:
+            exact = write_scene(parent, art, [obj])
+            with Image.open(os.path.join(exact["root"], "objects", "door", "000000.PNG")) as png:
+                self.assertEqual(png.size, (4, 4))
+                self.assertEqual(png.getpixel((0, 0)), (255, 0, 0, 255))
+            with open(os.path.join(exact["root"], "scene.json"), encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertNotIn("exportScale", saved)
+            grown = write_scene(parent, art, [obj], percent=200, resample="nearest")
+            with Image.open(os.path.join(grown["root"], "objects", "door", "000000.PNG")) as png:
+                self.assertEqual(png.size, (8, 8))
+                self.assertEqual(png.getpixel((0, 0)), (255, 0, 0, 255))
+            soft = write_scene(parent, art, [obj], percent=50, resample="bicubic")
+            with Image.open(os.path.join(soft["root"], "objects", "door", "000000.PNG")) as png:
+                self.assertEqual(png.size, (2, 2))
+        finally:
+            import shutil
+            shutil.rmtree(parent, ignore_errors=True)
+
+    def test_clip_studio_specifies_cels_and_holds_the_last_one(self):
+        from vmi_studio.csptime import apply_clip_time, read_clip_time
+        from vmi_studio.document import cel_at, spare_cels
+
+        if os.path.isfile(BUTTONS):
+            info = read_clip_time(BUTTONS)
+            self.assertEqual(info["name"], "Timeline 1")
+            self.assertEqual(info["fps"], 30)
+            self.assertEqual(info["start"], 0)
+            self.assertEqual(info["end"], 120)
+            self.assertEqual(info["current"], 5)
+            folder2 = next(row for row in info["folders"] if row["name"] == "Folder 2")
+            self.assertEqual(folder2["keys"], {frame: str(frame + 1) for frame in range(9)})
+            self.assertIn("9", folder2["cels"])
+            self.assertEqual(folder2["keys"][8], "9")
+            self.assertNotIn(9, folder2["keys"])
+            folder1 = next(row for row in info["folders"] if row["name"] == "Folder 1")
+            self.assertEqual(folder1["keys"], {})
+        if os.path.isfile(RADIO):
+            radio = read_clip_time(RADIO)
+            self.assertEqual(radio["name"], "Timeline 1")
+            self.assertEqual(radio["fps"], 24)
+            self.assertEqual(radio["start"], 0)
+            self.assertEqual(radio["end"], 48)
+            self.assertEqual(radio["current"], 0)
+            by_name = {row["name"]: row for row in radio["folders"]}
+            self.assertEqual(by_name["Folder 4"]["keys"], {0: "1", 25: "2"})
+            self.assertEqual(by_name["Folder 1"]["keys"], {0: "1"})
+            self.assertIn("2", by_name["Folder 1"]["cels"])
+            self.assertNotIn("2", by_name["Folder 1"]["keys"].values())
+            for name in ("Animation folder", "Folder 3", "teevees", "Folder 2", "Folder 5"):
+                self.assertEqual(by_name[name]["keys"], {0: "1"})
+        folder = Node("f2", "Folder 2", "group")
+        folder.children = [
+            Node("c%s" % name, name, "layer", raster=pixel(int(name) * 20, 0, 0))
+            for name in list("123456789")
+        ]
+        art = ArtFile("buttons.clip", "", "clip", 8, 8, refresh([folder]), "")
+        apply_clip_time(art, {
+            "name": "Timeline 1",
+            "fps": 30,
+            "start": 0,
+            "end": 120,
+            "current": 5,
+            "folders": [{
+                "name": "Folder 2",
+                "cels": list("123456789"),
+                "keys": {frame: str(frame) for frame in range(1, 9)},
+            }],
+        })
+        self.assertEqual([cel.name for cel in timeline_cels(folder)], list("12345678"))
+        self.assertEqual(folder.frames, list(range(1, 9)))
+        self.assertEqual([cel.name for cel in spare_cels(folder)], ["9"])
+        self.assertEqual(cel_at(folder, 5).name, "5")
+        self.assertEqual(cel_at(folder, 100).name, "8")
+        self.assertIsNone(cel_at(folder, 0))
+        self.assertEqual(folder.show_frame, 5)
+        self.assertEqual([node.name for node in preview_paint(art.layers)], ["5"])
+        folder.show_frame = 0
+        self.assertEqual(preview_paint(art.layers), [])
+        folder.show_frame = 100
+        self.assertEqual([node.name for node in preview_paint(art.layers)], ["8"])
+
+    def test_blueprint_keeps_vectors_marker_and_color(self):
+        from vmi_studio.paint import fill_polygon
+        from vmi_studio.vmib import load_blueprint, write_blueprint
+
+        quad = Node("n0", "WT", "layer")
+        quad.marker = "target"
+        quad.color = "#00FF00"
+        quad.vectors = [[(2.0, 2.0), (20.0, 2.0), (20.0, 20.0)]]
+        quad.raster = fill_polygon(quad.vectors[0], quad.color, 32, 32)
+        art = ArtFile("room.clip", "/tmp/room.clip", "clip", 32, 32, refresh([quad]), "")
+        parent = tempfile.mkdtemp(prefix="vmi-vmib-")
+        path = os.path.join(parent, "room.vmib")
+        try:
+            write_blueprint(path, art, [])
+            loaded = load_blueprint(path)
+            node = loaded.layers[0]
+            self.assertEqual(node.marker, "target")
+            self.assertEqual(node.color, "#00FF00")
+            self.assertEqual(len(node.vectors[0]), 3)
+            self.assertIsNotNone(node.raster)
+        finally:
+            import shutil
+            shutil.rmtree(parent, ignore_errors=True)
+
+
+def find_room(win):
+    for node in win.art.layers:
+        if node.name == "room":
+            return node
+    raise AssertionError("room is gone")
+
+
+class ToolWindowTests(unittest.TestCase):
+    def _open(self, layers, width=64, height=64):
+        app, win = WindowTests()._desk(refresh(layers))
+        win.art.width = width
+        win.art.height = height
+        win.picture.set_document(width, height)
+        win.resize(1200, 800)
+        win.show()
+        win._show_editor_page()
+        app.processEvents()
+        return app, win
+
+    def test_warp_target_is_one_undo_and_a_click_is_not(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        from vmi_studio.warp import mark_warps
+
+        app, win = self._open([])
+        QTest.mouseClick(win.draw_bar.buttons["warp-target"], Qt.LeftButton)
+        app.processEvents()
+        self.assertEqual(win.picture.draw_mode, "warp-target")
+        before = len(win.history.undo_stack)
+        win.picture._poly = [(1.0, 1.0), (8.0, 1.0)]
+        self.assertFalse(win.picture.close_warp_polygon())
+        self.assertEqual(len(win.history.undo_stack), before)
+        self.assertEqual(win.art.layers, [])
+        win.picture._poly = [(2.0, 2.0), (40.0, 2.0), (40.0, 40.0), (2.0, 40.0)]
+        self.assertTrue(win.picture.close_warp_polygon())
+        app.processEvents()
+        node = win.art.layers[-1]
+        self.assertEqual(node.name, "WT")
+        self.assertEqual(node.marker, "target")
+        self.assertEqual(len(node.vectors[0]), 4)
+        mark_warps(win.art.layers)
+        self.assertEqual(node.warp, "target")
+        self.assertEqual(len(win.history.undo_stack), 1)
+        win.undo()
+        self.assertEqual(win.art.layers, [])
+        win.close()
+
+    def test_warp_mask_stroke_undoes_the_paint_then_the_layer(self):
+        from vmi_studio.drawbar import CurveDialog
+        from vmi_studio.paint import Brush
+
+        app, win = self._open([])
+        curve = CurveDialog(Brush(), win)
+        curve.show()
+        curve.close()
+        dialog = win._png_dialog("Export PNG", "/tmp", "One picture.")
+        dialog.show()
+        dialog.close()
+        win.set_draw_mode("warp-mask")
+        app.processEvents()
+        mask = win.art.layers[-1]
+        self.assertEqual(mask.name, "Warp Mask")
+        self.assertEqual(mask.marker, "mask")
+        self.assertEqual(len(win.history.undo_stack), 1)
+        win._mask_press(32, 32, 1)
+        win._mask_move(48, 32, 1)
+        win._mask_release()
+        self.assertIsNotNone(mask.raster)
+        self.assertTrue(any(mask.raster.rgba[index] for index in range(3, len(mask.raster.rgba), 4)))
+        win.undo()
+        self.assertIsNone(mask.raster)
+        win.undo()
+        self.assertEqual(win.art.layers, [])
+        win.close()
+
+    def test_headers_collapse_and_the_lock_does_not(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        import vmi_studio.window as window_mod
+
+        app, win = self._open([Node("a", "sky", "layer", raster=pixel(255, 0, 0))])
+        win._split_custom = True
+        win.split.setSizes([280, 640, 280])
+        app.processEvents()
+        checked = win.arrange_lock.isChecked()
+        QTest.mouseClick(win.arrange_lock, Qt.LeftButton)
+        app.processEvents()
+        self.assertTrue(win._pane_open["layers"])
+        self.assertNotEqual(win.arrange_lock.isChecked(), checked)
+        QTest.mouseClick(win._pane_headers["layers"], Qt.LeftButton)
+        app.processEvents()
+        self.assertFalse(win._pane_open["layers"])
+        self.assertLessEqual(win.split.sizes()[0], window_mod.PANE_COLLAPSED)
+        self.assertFalse(win.tree.isVisible())
+        self.assertTrue(win._pane_open["objects"])
+        self.assertGreaterEqual(win.split.sizes()[2], window_mod.PANE_MIN)
+        QTest.mouseClick(win._pane_headers["objects"], Qt.LeftButton)
+        app.processEvents()
+        self.assertFalse(win._pane_open["objects"])
+        self.assertLessEqual(win.split.sizes()[2], window_mod.PANE_COLLAPSED)
+        QTest.mouseClick(win._pane_headers["layers"], Qt.LeftButton)
+        app.processEvents()
+        self.assertTrue(win._pane_open["layers"])
+        self.assertGreaterEqual(win.split.sizes()[0], window_mod.PANE_MIN)
+        self.assertTrue(win.tree.isVisible())
+        win.close()
+
+    def test_png_push_scales_without_opening_the_dialog(self):
+        app, win = self._open([Node("n0", "door", "layer", raster=fill(0, 0, 255))], width=4, height=4)
+        win._select_layer("n0")
+        app.processEvents()
+        parent = tempfile.mkdtemp(prefix="vmi-png-")
+        try:
+            path = win.push_png(
+                {"percent": 50, "resample": "nearest", "path": parent, "favorites": [parent]},
+                ask=False,
+            )
+            self.assertTrue(os.path.isfile(path))
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (2, 2))
+                self.assertEqual(image.getpixel((0, 0)), (0, 0, 255, 255))
+            self.assertEqual(win._png_percent, 50)
+            self.assertIn(parent, win._png_favorites)
+        finally:
+            import shutil
+            shutil.rmtree(parent, ignore_errors=True)
+            win.close()
+
+    def test_an_old_clip_session_keeps_the_file_specification(self):
+        import vmi_studio.window as window_mod
+        from vmi_studio.csptime import apply_clip_time
+        from vmi_studio.window import signature
+
+        one = Node("n20", "1", "layer", raster=pixel(255, 0, 0))
+        two = Node("n21", "2", "layer", raster=pixel(0, 0, 255))
+        folder = Node("n19", "Folder 4", "group")
+        folder.children = [one, two]
+        layers = refresh([folder])
+        art = ArtFile("BEETL RADIO STATION.clip", "/tmp/beetl-radio.clip", "clip", 8, 8, layers, "")
+        apply_clip_time(art, {
+            "name": "Timeline 1",
+            "fps": 24,
+            "start": 0,
+            "end": 48,
+            "current": 0,
+            "folders": [{"name": "Folder 4", "cels": ["1", "2"], "keys": {0: "1", 25: "2"}}],
+        })
+        self.assertEqual(folder.frames, [0, 25])
+        app, win = self._open([])
+        stale = {
+            "path": art.path,
+            "signature": signature(layers),
+            "animations": [{"id": "n19", "timeline": ["n20", "n21"], "frames": [0, 1]}],
+        }
+        window_mod.load = lambda: stale
+        try:
+            win.show_file(art, restore=True)
+            app.processEvents()
+            self.assertEqual(folder.frames, [0, 25])
+            self.assertEqual([cel.name for cel in timeline_cels(folder)], ["1", "2"])
+            edited = dict(stale)
+            edited["time_version"] = 1
+            edited["animations"] = [{"id": "n19", "timeline": ["n20", "n21"], "frames": [0, 12]}]
+            window_mod.load = lambda: edited
+            win.show_file(art, restore=True)
+            app.processEvents()
+            self.assertEqual(folder.frames, [0, 12])
+            captured = {}
+            window_mod.save = lambda data: captured.update(data)
+            win._save_session()
+            self.assertEqual(captured.get("time_version"), 1)
+        finally:
+            window_mod.load = lambda: None
+            window_mod.save = lambda _data: None
+            win.close()
+
+    def test_timeline_button_hides_the_strip_and_stays_tappable(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        import vmi_studio.window as window_mod
+        from vmi_studio.window import signature
+
+        app, win = self._open([Node("a", "sky", "layer", raster=pixel(255, 0, 0))])
+        gutter = win.timeline_gutter
+        self.assertEqual(gutter.LABEL, "Timeline")
+        self.assertTrue(win.film.isVisible())
+        self.assertTrue(gutter.isVisible())
+        self.assertFalse(win.timeline.isVisible())
+        box = gutter.button_rect()
+        self.assertGreater(box.left(), 8)
+        self.assertLess(box.right(), gutter.width() - 8)
+        QTest.mouseClick(gutter, Qt.LeftButton, Qt.NoModifier, QPoint(2, box.center().y()))
+        app.processEvents()
+        self.assertTrue(win.film.isVisible())
+        QTest.mouseClick(gutter, Qt.LeftButton, Qt.NoModifier, box.center())
+        app.processEvents()
+        self.assertFalse(win.film.isVisible())
+        self.assertTrue(gutter.isVisible())
+        self.assertFalse(win.timeline.isVisible())
+        captured = {}
+        window_mod.save = lambda data: captured.update(data)
+        win._save_session()
+        self.assertIs(captured.get("timeline_open"), False)
+        QTest.mouseClick(gutter, Qt.LeftButton, Qt.NoModifier, gutter.button_rect().center())
+        app.processEvents()
+        self.assertTrue(win.film.isVisible())
+        art = win.art
+        window_mod.load = lambda: {
+            "path": art.path,
+            "signature": signature(art.layers),
+            "timeline_open": False,
+        }
+        try:
+            win.show_file(art, restore=True)
+            app.processEvents()
+            self.assertFalse(win.film.isVisible())
+            self.assertTrue(win.timeline_gutter.isVisible())
+            other = ArtFile("other.clip", "/tmp/other-timeline.clip", "clip", 8, 8, refresh([Node("z", "sky", "layer", raster=pixel(0, 0, 0))]), "")
+            win.show_file(other, restore=True)
+            app.processEvents()
+            self.assertTrue(win.film.isVisible())
+        finally:
+            window_mod.load = lambda: None
+            window_mod.save = lambda _data: None
+            win.close()
+
+    def test_the_timeline_bar_drags_the_picture_boundary(self):
+        from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        from vmi_studio.filmstrip import TimelineGutter
+
+        app, win = self._open([Node("a", "sky", "layer", raster=pixel(255, 0, 0))])
+        split = win.picture_split
+        gutter = win.timeline_gutter
+        self.assertIs(gutter, split.handle(1))
+        self.assertEqual(split.orientation(), Qt.Vertical)
+        self.assertEqual(split.handleWidth(), TimelineGutter.BAND)
+        self.assertEqual(gutter.height(), TimelineGutter.BAND)
+        self.assertEqual(win.split.handleWidth(), 7)
+        self.assertTrue(split.isAncestorOf(win.film))
+        self.assertTrue(split.isAncestorOf(win.picture))
+        self.assertTrue(split.isAncestorOf(win.transport))
+        self.assertFalse(split.isAncestorOf(win.caption))
+        app.processEvents()
+
+        def centers_match():
+            self.assertEqual(gutter.button_rect().center().y(), gutter._bar_rect().center().y())
+            self.assertIs(win.timeline_gutter, split.handle(1))
+
+        centers_match()
+        bar_y = gutter._bar_rect().center().y()
+        color = gutter.grab().toImage().pixelColor(4, bar_y)
+        self.assertEqual((color.red(), color.green(), color.blue()), (0x14, 0x14, 0x14))
+        gutter._bar_hover = True
+        gutter.repaint()
+        color = gutter.grab().toImage().pixelColor(4, bar_y)
+        self.assertEqual((color.red(), color.green(), color.blue()), (0x3A, 0x3A, 0x3A))
+        gutter._bar_hover = False
+        gutter._down = True
+        gutter.repaint()
+        color = gutter.grab().toImage().pixelColor(4, bar_y)
+        self.assertEqual((color.red(), color.green(), color.blue()), (255, 255, 255))
+        gutter._down = False
+        gutter.repaint()
+        before = [int(item) for item in split.sizes()]
+        film_before = win.film.height()
+        self.assertGreater(before[1], 0)
+        self.assertGreater(film_before, 0)
+        local = QPoint(4, gutter.button_rect().center().y())
+        origin = gutter.mapToGlobal(local)
+
+        def send(kind, global_pos, button, buttons):
+            event = QMouseEvent(
+                kind,
+                QPointF(local),
+                QPointF(global_pos),
+                button,
+                buttons,
+                Qt.NoModifier,
+            )
+            app.sendEvent(gutter, event)
+
+        send(QEvent.Type.MouseButtonPress, origin, Qt.LeftButton, Qt.LeftButton)
+        self.assertTrue(win.film.isVisible())
+        send(QEvent.Type.MouseButtonRelease, origin, Qt.LeftButton, Qt.MouseButton.NoButton)
+        self.assertEqual([int(item) for item in split.sizes()], before)
+        send(QEvent.Type.MouseButtonPress, origin, Qt.LeftButton, Qt.LeftButton)
+        send(
+            QEvent.Type.MouseMove,
+            QPoint(origin.x(), origin.y() - 120),
+            Qt.LeftButton,
+            Qt.LeftButton,
+        )
+        send(
+            QEvent.Type.MouseButtonRelease,
+            QPoint(origin.x(), origin.y() - 120),
+            Qt.LeftButton,
+            Qt.MouseButton.NoButton,
+        )
+        app.processEvents()
+        after = [int(item) for item in split.sizes()]
+        self.assertGreater(after[1], before[1])
+        self.assertLess(after[0], before[0])
+        self.assertGreater(win.film.height(), film_before)
+        self.assertTrue(win._timeline_dragged)
+        self.assertTrue(win.film.isVisible())
+        centers_match()
+        film_up = win.film.height()
+        picture_up = after[0]
+        origin = gutter.mapToGlobal(local)
+        send(QEvent.Type.MouseButtonPress, origin, Qt.LeftButton, Qt.LeftButton)
+        send(
+            QEvent.Type.MouseMove,
+            QPoint(origin.x(), origin.y() + 60),
+            Qt.LeftButton,
+            Qt.LeftButton,
+        )
+        send(
+            QEvent.Type.MouseButtonRelease,
+            QPoint(origin.x(), origin.y() + 60),
+            Qt.LeftButton,
+            Qt.MouseButton.NoButton,
+        )
+        app.processEvents()
+        down = [int(item) for item in split.sizes()]
+        self.assertLess(win.film.height(), film_up)
+        self.assertGreater(down[0], picture_up)
+        self.assertGreater(down[1], 0)
+        centers_match()
+        self.assertEqual(gutter.y(), split.handle(1).y())
+        win.close()
+        from vmi_studio.csptime import apply_clip_time
+        from vmi_studio.document import cel_at, spare_cels
+
+        ids = Ids()
+        line = Node(ids.next(), "line", "group")
+        line.children = [Node(ids.next(), "ink", "layer", raster=pixel(255, 0, 0))]
+        color = Node(ids.next(), "color", "group")
+        color.children = [Node(ids.next(), "fill", "layer", raster=pixel(0, 0, 255))]
+        beetle = Node(ids.next(), "beetle", "group")
+        beetle.children = [line, color]
+        app, win = self._open([beetle])
+        win.mark_animation(beetle)
+        app.processEvents()
+        self.assertEqual(beetle.frames, [])
+        self.assertEqual([cel.name for cel in timeline_cels(beetle)], ["color", "line"])
+        self.assertFalse(win.timeline.isVisible())
+        self.assertFalse(win.film.isHidden())
+        chosen = win.film.choose(beetle.id, 0)
+        app.processEvents()
+        self.assertEqual(chosen.name, "color")
+        folder = Node("f2", "Folder 2", "group")
+        folder.children = [
+            Node("c%s" % name, name, "layer", raster=pixel(int(name) * 20, 0, 0))
+            for name in list("123456789")
+        ]
+        win.show_file(ArtFile("buttons.clip", "", "clip", 8, 8, refresh([folder]), ""), restore=False)
+        apply_clip_time(win.art, {
+            "name": "Timeline 1",
+            "fps": 30,
+            "start": 0,
+            "end": 120,
+            "current": 5,
+            "folders": [{
+                "name": "Folder 2",
+                "cels": list("123456789"),
+                "keys": {frame: str(frame) for frame in range(1, 9)},
+            }],
+        })
+        win.model.set_layers(win.art.layers)
+        win._arm_playhead()
+        win._refresh_timeline()
+        win.show()
+        app.processEvents()
+        self.assertFalse(win.timeline.isVisible())
+        self.assertTrue(win.film.isVisible())
+        self.assertEqual([cel.name for cel in spare_cels(folder)], ["9"])
+        held = win.film.choose(folder.id, 100)
+        app.processEvents()
+        self.assertEqual(held.name, "8")
+        self.assertEqual(folder.show_frame, 100)
+        spare = next(cel for cel in folder.children if cel.name == "9")
+        play = win.film.playhead
+        win._select_layer(spare.id)
+        app.processEvents()
+        self.assertEqual(folder.show_frame, 100)
+        self.assertEqual(win.film.playhead, play)
+        before = len(win.history.undo_stack)
+        win._film_moved(folder.id, held.id, 20)
+        self.assertEqual(cel_at(folder, 20).name, "8")
+        self.assertEqual(len(win.history.undo_stack), before + 1)
+        win.undo()
+        self.assertEqual(cel_at(folder, 100).name, "8")
+        win.close()
+
+    def test_playhead_line_is_the_frame_and_the_ruler_scrubs(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication
+
+        from vmi_studio.filmstrip import CELL, Filmstrip
+
+        app = QApplication.instance() or QApplication([])
+        folder = Node("f4", "Folder 4", "group", animation=True)
+        one = Node("c1", "1", "layer", raster=pixel(9, 0, 0))
+        two = Node("c2", "2", "layer", raster=pixel(0, 9, 0))
+        folder.children = [one, two]
+        folder.timeline = [one.id, two.id]
+        folder.frames = [0, 25]
+        art = ArtFile("cut.clip", "/tmp/playhead.clip", "clip", 8, 8, refresh([folder]), "")
+        art.clip_time = {"name": "Timeline 1", "fps": 24, "start": 0, "end": 48, "current": 5}
+        film = Filmstrip()
+        film.setFixedWidth(900)
+        film.set_project(art)
+        film.playhead = 5
+        film.show()
+        app.processEvents()
+        image = film.grab().toImage()
+        ratio = film.devicePixelRatioF() or 1
+
+        def sample(x, y):
+            color = image.pixelColor(int(round(x * ratio)), int(round(y * ratio)))
+            return (color.red(), color.green(), color.blue())
+
+        from PySide6.QtGui import QColor
+
+        from vmi_studio.filmstrip import CELL_EDGE, EMPTY_LINE, GRID, HEAD, ROW
+
+        center = film.playhead_x()
+        grid = QColor(GRID)
+        line = QColor(EMPTY_LINE)
+        self.assertEqual(EMPTY_LINE, "#333333")
+        edge = QColor(CELL_EDGE)
+        self.assertEqual(CELL_EDGE, "#666666")
+        self.assertGreater(edge.red(), line.red())
+        row = HEAD + ROW // 2
+        self.assertEqual(film.playhead, 5)
+        self.assertGreaterEqual(film.width(), 800)
+        self.assertEqual(sample(center, row), (255, 0, 0))
+        self.assertNotEqual(sample(center - 4, row), (255, 255, 255))
+        self.assertEqual(sample(center, 1), (255, 0, 0))
+        self.assertEqual(sample(center - 4, 1), (255, 0, 0))
+        self.assertEqual(sample(center, 12), (255, 0, 0))
+        self.assertEqual(sample(center - 2, 12), (0, 0, 0))
+        border = (edge.red(), edge.green(), edge.blue())
+        self.assertEqual(sample(film._x_of(0), row), border)
+        self.assertEqual(sample(film._x_of(0) + 1, row), border)
+        from vmi_studio.document import panel_order
+
+        self.assertEqual([node.name for node in panel_order(folder.children)], ["2", "1"])
+        self.assertEqual(film.frame_numbers(folder, 0, 25), [1])
+        self.assertEqual(film.frame_numbers(folder, 25, 24), [2])
+        self.assertNotEqual(film.frame_numbers(folder, 0, 25), [0])
+        self.assertNotEqual(film.frame_numbers(folder, 25, 24), [25])
+        self.assertNotEqual(film.frame_numbers(folder, 0, 25), [2])
+        grid_rgb = (grid.red(), grid.green(), grid.blue())
+        for frame in (1, 2, 5, 10, 15, 24):
+            self.assertEqual(sample(film._x_of(frame), row), grid_rgb)
+            self.assertEqual(sample(film._x_of(frame) + 2, row), grid_rgb)
+        first = [sample(x, row) for x in range(film._x_of(0) + 2, film._x_of(1) - 1)]
+        self.assertTrue(any(min(pixel) >= 200 for pixel in first))
+        self.assertEqual(sample(film._x_of(49), row), (line.red(), line.green(), line.blue()))
+        self.assertEqual(sample(film._x_of(49) + 2, row), (0, 0, 0))
+        far = film._x_of(film.span()[1] + 6)
+        self.assertGreater(far, film.playhead_x())
+        self.assertLess(far + 2, film.width())
+        self.assertEqual(sample(far, row), (line.red(), line.green(), line.blue()))
+        self.assertEqual(sample(far + 2, row), (0, 0, 0))
+        self.assertEqual(sample(far, 8), (line.red(), line.green(), line.blue()))
+        scrubbed = []
+        moved = []
+        film.scrubbed.connect(scrubbed.append)
+        film.moved.connect(lambda *_args: moved.append("moved"))
+        frames = list(folder.frames)
+        start = QPoint(center, 4)
+        finish = QPoint(film._x_of(10) + CELL // 2, 4)
+        QTest.mousePress(film, Qt.LeftButton, Qt.NoModifier, start)
+        QTest.mouseMove(film, finish)
+        QTest.mouseRelease(film, Qt.LeftButton, Qt.NoModifier, finish)
+        app.processEvents()
+        self.assertEqual(film.playhead, 10)
+        self.assertIn(10, scrubbed)
+        self.assertEqual(moved, [])
+        self.assertEqual(folder.frames, frames)
+        moved.clear()
+        scrubbed.clear()
+        block = QPoint(film._x_of(0) + CELL // 2, row)
+        shift = QPoint(film._x_of(4) + CELL // 2, row)
+        QTest.mousePress(film, Qt.LeftButton, Qt.NoModifier, block)
+        QTest.mouseMove(film, shift)
+        QTest.mouseRelease(film, Qt.LeftButton, Qt.NoModifier, shift)
+        app.processEvents()
+        self.assertEqual(moved, ["moved"])
+        self.assertEqual(scrubbed, [])
+        self.assertEqual(folder.frames, frames)
+        film.close()
+
+    def test_empty_frames_stay_black_and_the_playhead_can_be_green(self):
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QApplication
+
+        from vmi_studio.filmstrip import CELL, CELL_EDGE, EMPTY_LINE, FRAME_LINE, GRID, HEAD, ROW, Filmstrip
+
+        app = QApplication.instance() or QApplication([])
+        folder = Node("f4", "Folder 4", "group", animation=True)
+        one = Node("c1", "1", "layer", raster=pixel(9, 0, 0))
+        folder.children = [one]
+        folder.timeline = [one.id]
+        folder.frames = [10]
+        art = ArtFile("cut.clip", "/tmp/empty-frames.clip", "clip", 8, 8, refresh([folder]), "")
+        art.clip_time = {"name": "Timeline 1", "fps": 24, "start": 0, "end": 20, "current": 3}
+        film = Filmstrip()
+        film.setFixedWidth(900)
+        film.set_project(art)
+        film.playhead = 3
+        film.show()
+        app.processEvents()
+        image = film.grab().toImage()
+        ratio = film.devicePixelRatioF() or 1
+
+        def sample(x, y):
+            color = image.pixelColor(int(round(x * ratio)), int(round(y * ratio)))
+            return (color.red(), color.green(), color.blue())
+
+        grid = QColor(GRID)
+        line = QColor(EMPTY_LINE)
+        edge = QColor(CELL_EDGE)
+        rule = QColor(FRAME_LINE)
+        self.assertEqual(EMPTY_LINE, "#333333")
+        self.assertEqual(CELL_EDGE, "#666666")
+        self.assertGreater(edge.red(), rule.red())
+        self.assertGreater(edge.red(), line.red())
+        row = HEAD + ROW // 2
+        center = film.playhead_x()
+        border = (edge.red(), edge.green(), edge.blue())
+        self.assertEqual(sample(center, row), (255, 0, 0))
+        self.assertEqual(sample(center - 2, row), (0, 0, 0))
+        self.assertEqual(sample(film._x_of(3), row), (line.red(), line.green(), line.blue()))
+        self.assertEqual(sample(film._x_of(3) + 1, row), (0, 0, 0))
+        far = film._x_of(film.span()[1] + 6)
+        self.assertGreater(far, center)
+        self.assertLess(far + 2, film.width())
+        self.assertEqual(sample(far, row), (line.red(), line.green(), line.blue()))
+        self.assertEqual(sample(far + 2, row), (0, 0, 0))
+        self.assertEqual(sample(far, 8), (line.red(), line.green(), line.blue()))
+        self.assertEqual(sample(film._x_of(3) + 4, HEAD), (rule.red(), rule.green(), rule.blue()))
+        self.assertEqual(sample(film._x_of(3) + 4, HEAD + 1), (0, 0, 0))
+        self.assertEqual(sample(film._x_of(10), row), border)
+        self.assertEqual(sample(film._x_of(10) + 1, row), border)
+        self.assertEqual(sample(film._x_of(10) + CELL // 2, HEAD), border)
+        self.assertEqual(sample(film._x_of(10) + CELL // 2, HEAD + 1), border)
+        grid_rgb = (grid.red(), grid.green(), grid.blue())
+        self.assertEqual(sample(film._x_of(13), row), grid_rgb)
+        self.assertEqual(sample(film._x_of(13) + 2, row), grid_rgb)
+        self.assertEqual(sample(film._x_of(16), row), grid_rgb)
+        self.assertEqual(film.frame_numbers(folder, 10, 11), [1])
+        self.assertNotEqual(film.frame_numbers(folder, 10, 11), [10])
+        first = [sample(x, row) for x in range(film._x_of(10) + 2, film._x_of(11) - 1)]
+        self.assertTrue(any(min(pixel) >= 200 for pixel in first))
+        self.assertEqual(film._playhead_tone, "red")
+        film.set_playhead_tone("green")
+        app.processEvents()
+        green = film.grab().toImage()
+        color = green.pixelColor(int(round(center * ratio)), int(round(row * ratio)))
+        self.assertEqual((color.red(), color.green(), color.blue()), (0, 255, 0))
+        film.set_playhead_tone("later")
+        app.processEvents()
+        red = film.grab().toImage()
+        color = red.pixelColor(int(round(center * ratio)), int(round(row * ratio)))
+        self.assertEqual((color.red(), color.green(), color.blue()), (255, 0, 0))
+        film.close()
+
+    def test_scrub_sets_the_frame_on_every_specified_folder(self):
+        app, win = self._open([Node("sky", "sky", "layer", raster=pixel(1, 2, 3))])
+        first = Node("a", "Folder 4", "group", animation=True)
+        first.children = [
+            Node("a1", "1", "layer", raster=pixel(9, 0, 0)),
+            Node("a2", "2", "layer", raster=pixel(0, 9, 0)),
+        ]
+        first.timeline = ["a1", "a2"]
+        first.frames = [0, 25]
+        second = Node("b", "Folder 1", "group", animation=True)
+        second.children = [Node("b1", "1", "layer", raster=pixel(0, 0, 9))]
+        second.timeline = ["b1"]
+        second.frames = [0]
+        hand = Node("h", "hand", "group", animation=True)
+        hand.children = [Node("h1", "ink", "layer", raster=pixel(4, 4, 4))]
+        hand.frames = []
+        art = ArtFile("cut.clip", "/tmp/playhead-scrub.clip", "clip", 8, 8, refresh([first, second, hand]), "")
+        art.clip_time = {"name": "Timeline 1", "fps": 24, "start": 0, "end": 48, "current": 0}
+        win.show_file(art, restore=False)
+        app.processEvents()
+        before = len(win.history.undo_stack)
+        win.film.scrubbed.emit(10)
+        app.processEvents()
+        self.assertEqual(first.show_frame, 10)
+        self.assertEqual(second.show_frame, 10)
+        self.assertFalse(hasattr(hand, "show_frame"))
+        self.assertEqual(hand.frames, [])
+        self.assertEqual(first.frames, [0, 25])
+        self.assertEqual(second.frames, [0])
+        self.assertEqual(len(win.history.undo_stack), before)
+        win.close()
+
+    def test_transport_steps_plays_and_the_keys_stay_out_of_text(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        folder = Node("f4", "Folder 4", "group", animation=True)
+        one = Node("c1", "1", "layer", raster=pixel(9, 0, 0))
+        two = Node("c2", "2", "layer", raster=pixel(0, 9, 0))
+        folder.children = [one, two]
+        folder.timeline = [one.id, two.id]
+        folder.frames = [0, 25]
+        hand = Node("h", "hand", "group", animation=True)
+        hand.children = [Node("h1", "ink", "layer", raster=pixel(4, 4, 4))]
+        hand.frames = []
+        app, win = self._open([Node("sky", "sky", "layer", raster=pixel(1, 2, 3))])
+        art = ArtFile("cut.clip", "/tmp/transport.clip", "clip", 8, 8, refresh([folder, hand]), "")
+        art.clip_time = {"name": "Timeline 1", "fps": 24, "start": 0, "end": 48, "current": 0}
+        win.show_file(art, restore=False)
+        app.processEvents()
+        self.assertTrue(win.transport.isVisible())
+        self.assertEqual(win.transport.play_button.text(), "Play")
+        before = len(win.history.undo_stack)
+        win.film.set_playhead(5)
+        QTest.mouseClick(win.transport.forward_button, Qt.LeftButton)
+        app.processEvents()
+        self.assertEqual(win.film.playhead, 6)
+        self.assertEqual(folder.show_frame, 6)
+        QTest.mouseClick(win.transport.back_button, Qt.LeftButton)
+        app.processEvents()
+        self.assertEqual(win.film.playhead, 5)
+        QTest.keyClick(win, Qt.Key_Period)
+        app.processEvents()
+        self.assertEqual(win.film.playhead, 6)
+        QTest.keyClick(win, Qt.Key_Comma)
+        app.processEvents()
+        self.assertEqual(win.film.playhead, 5)
+        QTest.keyClick(win, Qt.Key_W)
+        app.processEvents()
+        self.assertEqual(win.film.playhead, 0)
+        self.assertEqual(folder.show_frame, 0)
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+
+        typed = QKeyEvent(QEvent.Type.KeyPress, Qt.Key_Period, Qt.NoModifier)
+        self.assertFalse(win._transport_key(typed, win.object_name))
+        self.assertEqual(win.film.playhead, 0)
+        QTest.mouseClick(win.transport.loop_button, Qt.LeftButton)
+        app.processEvents()
+        self.assertTrue(win._loop)
+        QTest.mouseClick(win.transport.play_button, Qt.LeftButton)
+        self.assertTrue(win._playing)
+        self.assertEqual(win.transport.play_button.text(), "Stop")
+        self.assertTrue(win._play_timer.isActive())
+        win._stop_play()
+        self.assertFalse(win._playing)
+        self.assertEqual(win.transport.play_button.text(), "Play")
+        win.film.set_playhead(48)
+        win._playing = True
+        win._play_tick()
+        self.assertEqual(win.film.playhead, 0)
+        self.assertTrue(win._playing)
+        win._toggle_loop()
+        self.assertFalse(win._loop)
+        win.film.set_playhead(48)
+        win._playing = True
+        win._play_tick()
+        self.assertEqual(win.film.playhead, 48)
+        self.assertFalse(win._playing)
+        self.assertEqual(folder.frames, [0, 25])
+        self.assertEqual(hand.frames, [])
+        self.assertFalse(hasattr(hand, "show_frame"))
+        self.assertEqual(len(win.history.undo_stack), before)
+        win.close()
+
+    def test_warp_target_lands_below_the_selected_layer(self):
+        from vmi_studio.document import panel_order
+
+        folder = Node("f", "room", "group")
+        paper = Node("c", "paper", "layer", raster=pixel(0, 0, 1))
+        fill = Node("b", "fill", "layer", raster=pixel(0, 1, 0))
+        line = Node("a", "line", "layer", raster=pixel(1, 0, 0))
+        folder.children = [paper, fill, line]
+        app, win = self._open([folder])
+        win.select_only(fill)
+        app.processEvents()
+        win.set_draw_mode("warp-target")
+        win.picture._poly = [(2.0, 2.0), (40.0, 2.0), (40.0, 40.0), (2.0, 40.0)]
+        self.assertTrue(win.picture.close_warp_polygon())
+        app.processEvents()
+        self.assertEqual([node.name for node in panel_order(folder.children)], ["line", "fill", "WT", "paper"])
+        self.assertEqual(win.art.layers, [folder])
+        target = next(node for node in folder.children if node.name == "WT")
+        self.assertEqual(target.marker, "target")
+        win.undo()
+        self.assertEqual([node.name for node in win.art.layers[0].children], ["paper", "fill", "line"])
+        win.close()
 
 
 if __name__ == "__main__":

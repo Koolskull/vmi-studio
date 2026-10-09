@@ -11,6 +11,6 @@ name = "vmi-clip-vector"
 path = "src/main.rs"
 
 [dependencies]
-clipfile = { version = "1.2", features = ["sqlite"] }
+clipfile = { version = "1.2", features = ["sqlite", "raster"] }
 rusqlite = "0.39"
 serde_json = "1"

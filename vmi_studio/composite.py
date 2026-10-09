@@ -26,6 +26,7 @@ from vmi_studio.document import (
     gate_of,
     paint_gate,
     paint_layers,
+    playhead_cel,
     timeline_cels,
     _solo_on,
 )
@@ -274,9 +275,12 @@ def ink_count(image):
     return sum(hist[1:])
 
 
-def composite_image(width, height, layers):
-    """Full-canvas RGBA of this list, back to front. None when nothing has paint."""
-    return _composite(width, height, layers, gated=False, focus_id=None, max_edge=None)
+def composite_image(width, height, layers, max_edge=None):
+    """Full-canvas RGBA of this list, back to front. None when nothing has paint.
+
+    max_edge shrinks the long side before the paint. Export leaves it unset.
+    """
+    return _composite(width, height, layers, gated=False, focus_id=None, max_edge=max_edge)
 
 
 def composite_scene(width, height, nodes, focus_id=None, max_edge=None, flags=None):
@@ -413,6 +417,16 @@ def _slot(node, ctx):
 
 def _chosen_cel(folder, ctx):
     child_solo = ctx.solo or _trio(folder, ctx)[2]
+    used, held = playhead_cel(folder)
+    if used:
+        if held is None or not _trio(held, ctx)[0]:
+            return None
+        if ctx.solo_on and not child_solo and not (_trio(held, ctx)[2] or _branch_solo(held, ctx)):
+            return None
+        visible, mute, solo = _trio(held, ctx)
+        if gate_of(visible, mute, solo, False, False, child_solo, ctx.solo_on) == "drop":
+            return None
+        return held
     cels = [cel for cel in timeline_cels(folder) if _trio(cel, ctx)[0]]
     if ctx.solo_on and not child_solo:
         cels = [cel for cel in cels if _trio(cel, ctx)[2] or _branch_solo(cel, ctx)]

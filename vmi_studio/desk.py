@@ -465,6 +465,83 @@ def paint_order(objects):
     return ordered
 
 
+def scene_objects(objects):
+    """Every object, in the order the VMI scene draws them. Nothing is dropped."""
+    ordered = list(paint_order(objects))
+    seen = {obj.id for obj in ordered}
+    for obj in objects:
+        if obj.id not in seen:
+            ordered.append(obj)
+            seen.add(obj.id)
+    return ordered
+
+
+def set_scene_order(objects, ordered_ids):
+    """The list is the scene. The first id is behind. A drag clears nesting."""
+    by_id = {obj.id: obj for obj in objects}
+    seen = set()
+    stack = 0
+    for ident in ordered_ids or []:
+        obj = by_id.get(ident)
+        if obj is None or ident in seen:
+            continue
+        obj.parent = ""
+        obj.stack = stack
+        stack += 1
+        seen.add(ident)
+    for obj in objects:
+        if obj.id in seen:
+            continue
+        obj.parent = ""
+        obj.stack = stack
+        stack += 1
+
+
+def scene_plate(art, objects, max_edge=480):
+    """One still of the export. Back to front, each object's rest picture.
+
+    The paint is already at the preview size. A radio-station canvas is not
+    built at full resolution just to be thrown away.
+    """
+    from PIL import Image
+
+    from vmi_studio.composite import composite_image
+
+    width = int(getattr(art, "width", 0) or 0)
+    height = int(getattr(art, "height", 0) or 0)
+    rows = []
+    if width <= 0 or height <= 0:
+        return None, rows
+    edge = int(max_edge) if max_edge else 0
+    plate_edge = edge if edge > 0 else None
+    long_edge = max(width, height)
+    if plate_edge and long_edge > plate_edge:
+        scale = float(plate_edge) / float(long_edge)
+        pw = max(1, int(round(width * scale)))
+        ph = max(1, int(round(height * scale)))
+    else:
+        pw, ph = width, height
+    plate = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+    for obj in scene_objects(objects):
+        slots = slots_of(art, obj)
+        chosen = None
+        for slot in slots:
+            if slot["key"] == "000000":
+                chosen = slot
+                break
+        if chosen is None and slots:
+            chosen = slots[0]
+        image = composite_image(width, height, chosen["layers"], max_edge=plate_edge) if chosen else None
+        if image is not None:
+            if image.size != (pw, ph):
+                image = image.resize((pw, ph), Image.Resampling.NEAREST)
+            plate.alpha_composite(image.convert("RGBA"))
+        rows.append({"name": obj.name, "painted": image is not None})
+    field = Image.new("RGBA", plate.size, (0, 0, 0, 255))
+    field.alpha_composite(plate)
+    return field, rows
+
+
 def arrange_objects(objects, rows):
     """Apply the outliner. rows is visual order, the top row in front.
 
@@ -495,7 +572,7 @@ def plan_scene(art, objects, playlist=""):
     taken = set()
     folders = {}
     drafted = []
-    for obj in paint_order(objects):
+    for obj in scene_objects(objects):
         folder = _unique_name(obj.name, taken)
         taken.add(folder.lower())
         folders[obj.id] = folder

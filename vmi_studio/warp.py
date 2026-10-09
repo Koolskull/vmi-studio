@@ -1,12 +1,15 @@
-"""Warp targets are the pink quads a picture, video, or gif is bent into.
+"""Warp targets are the polygons a picture, video, or gif is bent into.
 
-Names vary. Some are vectors with no pixels, some are hot-pink polygons.
-A window is the screen, monitor, or mask those quads belong to.
+Names vary. Some are vectors with no pixels, some are painted polygons.
+Any hex is a warp target once the tool marks it. A window is the screen,
+monitor, or mask those polygons belong to. A warp mask is a tighter edge
+than the polygon.
 """
 
 import re
 
 from vmi_studio.document import find_node, walk
+from vmi_studio.paint import quiet_color
 
 # Unselected names stay as dark as the grey text. The pink is only a hue shift.
 WARP_PINK = "#5c3e4a"
@@ -70,7 +73,12 @@ def mark_warps(nodes):
 
     def visit(lst):
         for node in lst:
-            if node.kind == "layer" and (name_is_warp(node.name) or pink_raster(node.raster)):
+            marker = getattr(node, "marker", "") or ""
+            if marker == "mask":
+                node.warp = "mask"
+            elif marker == "target":
+                node.warp = "target"
+            elif node.kind == "layer" and (name_is_warp(node.name) or pink_raster(node.raster)):
                 node.warp = "target"
             elif node.kind == "group" and name_is_warp(node.name):
                 node.warp = "target"
@@ -93,7 +101,7 @@ def mark_warps(nodes):
     def visit_windows(lst):
         for node in lst:
             visit_windows(node.children)
-            if node.warp == "target":
+            if node.warp in ("target", "mask"):
                 continue
             if name_is_window(node.name):
                 node.warp = "window"
@@ -141,9 +149,9 @@ def warp_system_folder(node):
     """A folder that is a warp target, a warp window, or holds one directly."""
     if node is None or node.kind != "group":
         return False
-    if getattr(node, "warp", "") in ("target", "window"):
+    if getattr(node, "warp", "") in ("target", "window", "mask"):
         return True
-    return any(getattr(child, "warp", "") in ("target", "window") for child in node.children)
+    return any(getattr(child, "warp", "") in ("target", "window", "mask") for child in node.children)
 
 
 def warp_system_layers(node):
@@ -157,21 +165,37 @@ def warp_system_layers(node):
         if layer.kind != "layer":
             continue
         role = getattr(layer, "warp", "")
-        if role in ("target", "window") or (layer.visible and not layer.omit):
+        if role in ("target", "window", "mask") or (layer.visible and not layer.omit):
             layers.append(layer)
     return layers
 
 
 def warp_layer_kind(layers):
-    """A warp target is a warp map. A window with no target is a mask."""
-    saw_window = False
+    """A warp target is a warp map. A window or a warp mask with no target is a mask."""
+    saw_mask = False
     for layer in layers or []:
         role = getattr(layer, "warp", "")
-        if role == "target":
+        marker = getattr(layer, "marker", "") or ""
+        if role == "target" or marker == "target":
             return "warp map"
-        if role == "window":
-            saw_window = True
-    return "mask" if saw_window else ""
+        if role in ("window", "mask") or marker == "mask":
+            saw_mask = True
+    return "mask" if saw_mask else ""
+
+
+def marker_ink(node):
+    """Unselected name color. The polygon itself stays the bright hex."""
+    if node is None:
+        return ""
+    role = getattr(node, "warp", "") or ""
+    marker = getattr(node, "marker", "") or ""
+    if role == "window":
+        return WARP_PURPLE
+    if role == "target" or marker == "target":
+        return quiet_color(getattr(node, "color", "") or "") or WARP_PINK
+    if role == "mask" or marker == "mask":
+        return quiet_color(getattr(node, "color", "") or "") or "#3a3a3a"
+    return ""
 
 
 def object_role(art, obj):

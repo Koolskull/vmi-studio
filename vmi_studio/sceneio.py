@@ -5,6 +5,7 @@ import os
 
 from vmi_studio.composite import composite_image
 from vmi_studio.desk import plan_scene
+from vmi_studio.pngout import scale_image
 
 
 def standard_text(scene=""):
@@ -33,7 +34,7 @@ Layer 1, Folder 1, and a bare number will not make sense next month. Name the ob
 
 The folder name is the start of the object name. Change it when that name is wrong. Delete an object from the list when it does not belong. 000 rest, 001 hover, and 002 pressed are the button positions. 003 is after. Rename a position and that name is written in the object file.
 
-The object outliner is the stack for VMI. It filters the layer tree into the things in the level before the pictures are written. The top of a group is in front. Drop an object onto another to put it inside. That parent and the z order are written with the scene. The type, the name, a warp mask or a warp map, and a sound are set on the object. The level can turn on the menu playlist or the battle playlist.
+The object list is the stack for VMI. It is every object, in the order the scene draws them. The top row is behind. Drag a row up or down to change that order. The type, the name, a warp mask or a warp map, and a sound are set on the object. The level can turn on the menu playlist or the battle playlist.
 """ % name
 
 
@@ -42,6 +43,11 @@ def how_text(plan):
     lines.append("Canvas %d x %d. Source %s (%s)." % (
         plan["canvas"]["w"], plan["canvas"]["h"], plan["source"]["file"], plan["source"]["kind"],
     ))
+    percent = int(plan.get("export_percent") or 100)
+    if percent != 100:
+        lines.append("Pictures are %d%% of the canvas (%s)." % (
+            percent, plan.get("export_resample") or "nearest",
+        ))
     playlist = plan.get("playlist") or ""
     if playlist:
         lines.append("Webamp playlist %s." % playlist)
@@ -104,9 +110,21 @@ def _safe_folder(name):
     return clean
 
 
-def write_scene(parent, art, objects, playlist=""):
-    """Write <parent>/<scene>/ with HOW.txt, scene.json, layers.tsx, and objects/."""
+def write_scene(parent, art, objects, playlist="", percent=100, resample="nearest"):
+    """Write <parent>/<scene>/ with HOW.txt, scene.json, layers.tsx, and objects/.
+
+    100% writes the canvas size with no resample. Any other percent scales
+    each picture after the composite, nearest or bicubic.
+    """
     plan = plan_scene(art, objects, playlist)
+    try:
+        percent = int(percent)
+    except (TypeError, ValueError):
+        percent = 100
+    percent = max(1, min(800, percent))
+    resample = "bicubic" if str(resample).lower() == "bicubic" else "nearest"
+    plan["export_percent"] = percent
+    plan["export_resample"] = resample
     scene = _safe_folder(plan["scene"])
     plan["scene"] = scene
     parent_abs = os.path.abspath(parent)
@@ -125,6 +143,8 @@ def write_scene(parent, art, objects, playlist=""):
         slot_map = {}
         for slot in obj["slots"]:
             image = composite_image(art.width, art.height, slot["nodes"])
+            if image is not None and percent != 100:
+                image = scale_image(image, percent, resample)
             png = image is not None
             slot["png"] = png
             if png:
@@ -182,7 +202,7 @@ def write_scene(parent, art, objects, playlist=""):
     with open(os.path.join(root, "layers.tsx"), "w", encoding="utf-8") as handle:
         handle.write(layers_tsx(plan))
     with open(os.path.join(root, "scene.json"), "w", encoding="utf-8") as handle:
-        json.dump({
+        payload = {
             "vmi": 1,
             "naming": "SSSXXX",
             "scene": plan["scene"],
@@ -190,6 +210,9 @@ def write_scene(parent, art, objects, playlist=""):
             "source": plan["source"],
             "playlist": plan.get("playlist") or "",
             "objects": scene_objects,
-        }, handle, indent=2)
+        }
+        if percent != 100:
+            payload["exportScale"] = {"percent": percent, "resample": resample}
+        json.dump(payload, handle, indent=2)
         handle.write("\n")
     return {"root": root, "pictures": pictures, "missing": missing, "scene": plan["scene"]}

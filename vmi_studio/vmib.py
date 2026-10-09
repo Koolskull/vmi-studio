@@ -5,7 +5,9 @@ and the object list, plus the paint those layers already hold. Opening one
 skips the Clip Studio, Photoshop, Krita, and GIMP readers.
 
 The zip is the file a later 2kool.tv upload would send. This module does
-not upload anything. The cloud key in the manifest only reserves that step.
+not upload anything. A custom FTP or IPFS copy is a separate step and does
+not put a password in this zip. The cloud key in the manifest only reserves
+the 2kool.tv step.
 """
 
 import json
@@ -20,6 +22,7 @@ from vmi_studio.desk import (
     clean_warp_layer,
 )
 from vmi_studio.document import ArtFile, Node, Raster, refresh
+from vmi_studio.tasks import pack_colors, pack_tasks
 
 
 FORMAT = "vmib"
@@ -70,6 +73,13 @@ def _layer_row(node, used, blobs):
         "animation": bool(node.animation),
         "timeline": list(node.timeline or []),
         "warp": getattr(node, "warp", "") or "",
+        "marker": getattr(node, "marker", "") or "",
+        "color": getattr(node, "color", "") or "",
+        "vectors": [
+            [[float(x), float(y)] for x, y in poly]
+            for poly in (getattr(node, "vectors", None) or [])
+        ],
+        "frames": [int(frame) for frame in (getattr(node, "frames", None) or [])],
         "raster": None,
         "children": [_layer_row(child, used, blobs) for child in node.children],
     }
@@ -112,7 +122,7 @@ def _object_row(obj):
     }
 
 
-def prepare_blueprint(art, objects, playlist="", arrange_locked=True):
+def prepare_blueprint(art, objects, playlist="", arrange_locked=True, tasks=None, task_colors=None):
     """JSON document plus the raster blobs. The blobs alias the layer bytes."""
     if art is None:
         raise RuntimeError("Open a drawing first.")
@@ -131,12 +141,25 @@ def prepare_blueprint(art, objects, playlist="", arrange_locked=True):
         "cloud": dict(CLOUD),
         "layers": [_layer_row(node, used, blobs) for node in art.layers],
         "objects": [_object_row(obj) for obj in objects or []],
+        "tasks": pack_tasks(tasks),
+        "task_colors": pack_colors(task_colors),
     }
+    clip_time = getattr(art, "clip_time", None)
+    if isinstance(clip_time, dict) and clip_time.get("name"):
+        document["clip_time"] = {
+            "name": clip_time.get("name") or "Timeline",
+            "fps": int(clip_time.get("fps") or 24),
+            "start": int(clip_time.get("start") or 0),
+            "end": int(clip_time.get("end") or 0),
+            "current": int(clip_time.get("current") or 0),
+        }
     return document, blobs
 
 
-def write_blueprint(path, art, objects, playlist="", arrange_locked=True):
-    document, blobs = prepare_blueprint(art, objects, playlist, arrange_locked)
+def write_blueprint(path, art, objects, playlist="", arrange_locked=True, tasks=None, task_colors=None):
+    document, blobs = prepare_blueprint(
+        art, objects, playlist, arrange_locked, tasks, task_colors
+    )
     write_parts(path, document, blobs)
     return document
 
@@ -226,6 +249,21 @@ def _node_from(row, archive, seen):
     node.mute = bool(row.get("mute"))
     node.solo = bool(row.get("solo"))
     node.warp = row.get("warp") or ""
+    marker = row.get("marker") or ""
+    node.marker = marker if marker in ("target", "mask") else ""
+    node.color = row.get("color") or ""
+    vectors = []
+    for poly in row.get("vectors") or []:
+        if not isinstance(poly, (list, tuple)):
+            continue
+        points = []
+        for point in poly:
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                points.append((float(point[0]), float(point[1])))
+        if len(points) >= 3:
+            vectors.append(points)
+    node.vectors = vectors
+    node.frames = [int(frame) for frame in (row.get("frames") or []) if isinstance(frame, (int, float))]
     node.children = [_node_from(child, archive, seen) for child in row.get("children") or []]
     kids = {child.id for child in node.children}
     node.timeline = [ident for ident in row.get("timeline") or [] if ident in kids]
@@ -307,5 +345,16 @@ def load_blueprint(path, progress=None):
         "arrange_locked": bool(document.get("arrange_locked", True)),
         "source_file": source.get("file") or "",
         "source_kind": source.get("kind") or "",
+        "tasks": pack_tasks(document.get("tasks")),
+        "task_colors": pack_colors(document.get("task_colors")),
     }
+    clip_time = document.get("clip_time")
+    if isinstance(clip_time, dict):
+        art.clip_time = {
+            "name": clip_time.get("name") or "Timeline",
+            "fps": int(clip_time.get("fps") or 24),
+            "start": int(clip_time.get("start") or 0),
+            "end": int(clip_time.get("end") or 0),
+            "current": int(clip_time.get("current") or 0),
+        }
     return art

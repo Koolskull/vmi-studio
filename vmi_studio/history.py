@@ -31,6 +31,13 @@ def _layer_props(node):
         tuple(node.timeline or []),
         getattr(node, "warp", "") or "",
         node.raster,
+        getattr(node, "marker", "") or "",
+        getattr(node, "color", "") or "",
+        tuple(
+            tuple((float(x), float(y)) for x, y in poly)
+            for poly in (getattr(node, "vectors", None) or [])
+        ),
+        tuple(int(frame) for frame in (getattr(node, "frames", None) or [])),
     )
 
 
@@ -116,6 +123,7 @@ def apply_snap(window, snap):
         (
             name, kind, visible, opacity, blend, clip, shapes,
             mute, solo, animation, timeline, warp, raster,
+            marker, color, vectors, frames,
         ) = props
         node.name = name
         node.kind = kind
@@ -130,6 +138,10 @@ def apply_snap(window, snap):
         node.timeline = list(timeline)
         node.warp = warp
         node.raster = raster
+        node.marker = marker if marker in ("target", "mask") else ""
+        node.color = color or ""
+        node.vectors = [[(float(x), float(y)) for x, y in poly] for poly in vectors]
+        node.frames = [int(frame) for frame in frames]
     window.art.layers = _build(snap.skeleton, snap.nodes)
     refresh(window.art.layers)
     objects = []

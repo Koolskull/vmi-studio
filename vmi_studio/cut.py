@@ -87,6 +87,14 @@ def _copy_common(node, source):
     node.shapes = getattr(source, "shapes", True)
     node.mute = bool(getattr(source, "mute", False))
     node.solo = bool(getattr(source, "solo", False))
+    marker = getattr(source, "marker", "") or ""
+    node.marker = marker if marker in ("target", "mask") else ""
+    node.color = getattr(source, "color", "") or ""
+    node.vectors = [
+        [(float(x), float(y)) for x, y in poly]
+        for poly in (getattr(source, "vectors", None) or [])
+    ]
+    node.frames = [int(frame) for frame in (getattr(source, "frames", None) or [])]
     return node
 
 

@@ -97,6 +97,18 @@ def _open_clip(path, progress):
     art.path = os.path.abspath(path)
     art.kind = "clip"
     art.note = "Clip Studio paint is loaded."
+    try:
+        from vmi_studio.vectorbake import apply_vector_previews
+
+        if progress:
+            progress("Reading vector layers")
+        count = apply_vector_previews(art, path)
+        if count:
+            art.note = "%s %d vector layer%s." % (
+                art.note, count, "" if count == 1 else "s",
+            )
+    except Exception as exc:
+        sys.stderr.write("vector: %s\n" % exc)
     return art
 
 

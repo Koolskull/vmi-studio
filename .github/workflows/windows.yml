@@ -39,12 +39,11 @@ jobs:
         shell: cmd
         run: |
           dist\vmi-studio\vmi-studio.exe --version
-          set STUDIO=!ERRORLEVEL!
-          if !STUDIO! NEQ 0 exit /b !STUDIO!
+          if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
           dist\vmi-studio\vmi-clip-vector.exe images
-          set SIDECAR=!ERRORLEVEL!
-          echo sidecar exit !SIDECAR!
-          if !SIDECAR! NEQ 2 exit /b 1
+          set SIDECAR=%ERRORLEVEL%
+          echo sidecar exit %SIDECAR%
+          if %SIDECAR% NEQ 2 exit /b 1
 
       - name: Zip the folder
         run: tar -a -cf vmi-studio-0.01-windows-x86_64.zip -C dist vmi-studio

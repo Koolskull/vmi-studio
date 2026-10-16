@@ -34,7 +34,7 @@ It prints `VMI STUDIO 0.01`. The program is a window. It needs a normal desktop 
 
 The Windows download is `vmi-studio-0.01-windows-x86_64.zip` on that same release. It is a 64-bit build. Unzip it and run `vmi-studio\vmi-studio.exe`. `vmi-clip-vector.exe` sits beside it. A console window stays open with the studio. Check it with `vmi-studio.exe --version`.
 
-The Mac app is an Apple Silicon bundle, `VMI STUDIO.app`, built from this repo. There is no 0.01 Mac archive on the releases page. The build steps are under Run from source. Shortcuts written as Ctrl in this document are the Command key on a Mac.
+The Mac download is `vmi-studio-0.01-macos-arm64.zip` on that same release. It is an Apple Silicon build. Unzip it and open `VMI STUDIO.app`. The first time a downloaded copy is opened, Gatekeeper may refuse it until you right-click the app and choose Open. Shortcuts written as Ctrl in this document are the Command key on a Mac.
 
 ## The window
 

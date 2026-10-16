@@ -34,7 +34,7 @@ It prints `VMI STUDIO 0.01`. The program is a window. It needs a normal desktop 
 
 The Windows download is `vmi-studio-0.01-windows-x86_64.zip` on that same release. It is a 64-bit build. Unzip it and run `vmi-studio\vmi-studio.exe`. `vmi-clip-vector.exe` sits beside it. A console window stays open with the studio. Check it with `vmi-studio.exe --version`.
 
-The Mac download is `vmi-studio-0.01-macos-arm64.zip` on that same release. It is an Apple Silicon build. Unzip it and open `VMI STUDIO.app`. The first time a downloaded copy is opened, Gatekeeper may refuse it until you right-click the app and choose Open. Shortcuts written as Ctrl in this document are the Command key on a Mac.
+The Mac download is `vmi-studio-0.01-macos-arm64.zip` on that same release. It is an Apple Silicon build. Unzip it and open `VMI STUDIO.app`. The first time a downloaded copy is opened, macOS shows “VMI STUDIO” Not Opened, with Move to Trash and Done. Click Done. Then open System Settings, go to Privacy & Security, and click Open Anyway next to the VMI STUDIO note. Open the app again and confirm Open. Shortcuts written as Ctrl in this document are the Command key on a Mac.
 
 ## The window
 
@@ -207,7 +207,7 @@ The program is `dist/VMI STUDIO.app`. Open that bundle. Check the build from a t
 "dist/VMI STUDIO.app/Contents/MacOS/vmi-studio" --version
 ```
 
-It prints `VMI STUDIO 0.01`. A drawing dropped on the icon, or chosen with Open With, opens in the studio. The first time a downloaded copy is opened, Gatekeeper may refuse it until you right-click the app and choose Open.
+It prints `VMI STUDIO 0.01`. A drawing dropped on the icon, or chosen with Open With, opens in the studio. The first time a downloaded copy is opened, macOS shows “VMI STUDIO” Not Opened, with Move to Trash and Done. Click Done. Then open System Settings, go to Privacy & Security, and click Open Anyway next to the VMI STUDIO note. Open the app again and confirm Open.
 
 An optional font catalog can live in `~/Documents/work/Github/bgcardbuilder`, or in the directory named by `BGCARDBUILDER`. Without it, the header font list is the system monospace. That is the default face either way.
 

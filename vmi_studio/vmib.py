@@ -11,6 +11,7 @@ the 2kool.tv step.
 """
 
 import json
+import math
 import os
 import zipfile
 
@@ -80,6 +81,9 @@ def _layer_row(node, used, blobs):
             for poly in (getattr(node, "vectors", None) or [])
         ],
         "frames": [int(frame) for frame in (getattr(node, "frames", None) or [])],
+        "outline": bool(getattr(node, "outline", False)),
+        "outline_px": float(getattr(node, "outline_px", 0) or 0),
+        "outline_rgb": [int(channel) for channel in (getattr(node, "outline_rgb", None) or (0, 0, 0))[:3]],
         "raster": None,
         "children": [_layer_row(child, used, blobs) for child in node.children],
     }
@@ -264,6 +268,26 @@ def _node_from(row, archive, seen):
             vectors.append(points)
     node.vectors = vectors
     node.frames = [int(frame) for frame in (row.get("frames") or []) if isinstance(frame, (int, float))]
+    node.outline = bool(row.get("outline"))
+    try:
+        node.outline_px = float(row.get("outline_px") or 0)
+    except (TypeError, ValueError):
+        node.outline_px = 0.0
+    if not math.isfinite(node.outline_px) or node.outline_px < 0:
+        node.outline_px = 0.0
+    node.outline_px = min(250.0, node.outline_px)
+    rgb = row.get("outline_rgb") or (0, 0, 0)
+    if isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
+        channels = []
+        for channel in rgb[:3]:
+            try:
+                number = int(round(float(channel)))
+            except (TypeError, ValueError):
+                number = 0
+            channels.append(max(0, min(255, number)))
+        node.outline_rgb = tuple(channels)
+    else:
+        node.outline_rgb = (0, 0, 0)
     node.children = [_node_from(child, archive, seen) for child in row.get("children") or []]
     kids = {child.id for child in node.children}
     node.timeline = [ident for ident in row.get("timeline") or [] if ident in kids]

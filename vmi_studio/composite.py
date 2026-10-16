@@ -30,6 +30,7 @@ from vmi_studio.document import (
     timeline_cels,
     _solo_on,
 )
+from vmi_studio.outline import active_outline, outline_disc_image, outline_image, outline_key, outlined_raster
 
 
 _MODES = {
@@ -681,6 +682,7 @@ def _tree_sig(nodes, ctx):
             bool(getattr(node, "shapes", True)),
             bool(getattr(node, "clip", False)),
             bool(getattr(node, "animation", False)),
+            outline_key(node),
             _raster_sig(getattr(node, "raster", None)),
         )
         if getattr(node, "kind", "") == "group":
@@ -689,10 +691,12 @@ def _tree_sig(nodes, ctx):
     return tuple(rows)
 
 
-def _plate_key(node, ctx, canvas, scale):
+def _plate_key(node, ctx, canvas, scale, outlined=True):
     child = ctx.child(node)
     # Gated and full export walk the same pixels differently. A hidden child
     # stays in the signature either way, so the gate has to be part of the key.
+    # A pass-through folder asks for the bare plate, then draws the outline under
+    # the children. That plate must not share a cache entry with the outlined one.
     return (
         int(round(float(scale) * 100000)),
         canvas[0],
@@ -703,6 +707,7 @@ def _plate_key(node, ctx, canvas, scale):
         bool(child.hidden),
         bool(child.muted),
         _focus_key(node, child.focus),
+        outline_key(node) if outlined else ("bare",),
         _tree_sig(node.children, child),
     )
 
@@ -742,7 +747,7 @@ def _paint_list(dest, nodes, ctx):
         opacity = int(getattr(item, "opacity", 255) or 0)
         direct = item.kind == "group" and _is_pass(item) and not clips and opacity >= 255
         if direct:
-            _paint_list(dest, item.children, ctx.child(item))
+            _paint_pass(dest, item, ctx)
         elif item.kind != "group" and not clips:
             _stamp(dest, item, ctx, clip_to_dest=False)
         else:
@@ -757,6 +762,41 @@ def _paint_list(dest, nodes, ctx):
         index = nxt
 
 
+def _paint_raster(node):
+    return outlined_raster(getattr(node, "raster", None), node)
+
+
+def _paint_pass(dest, node, ctx):
+    """Pass through paints each child on the picture below. The outline goes down first."""
+    spec = active_outline(node)
+    if spec is not None:
+        scale = float(getattr(ctx, "scale", 1) or 1)
+        raw = _appearance(dest.canvas, node, ctx, outlined=False)
+        if raw is not None:
+            disc = outline_disc_image(raw.image, spec[0] * scale, spec[1])
+            if disc is not None:
+                image, dx, dy = disc
+                _blend(dest, image, (raw.ox + dx, raw.oy + dy), _Plain(), False)
+    _paint_list(dest, node.children, ctx.child(node))
+
+
+class _Plain:
+    blend = "normal"
+    opacity = 255
+    shapes = True
+
+
+def _outline_plate(plate, node, scale):
+    spec = active_outline(node)
+    if plate is None or spec is None:
+        return plate
+    px = spec[0] * float(scale or 1)
+    if px <= 0:
+        return plate
+    image, dx, dy = outline_image(plate.image, px, spec[1])
+    return _Surface(image, plate.ox + dx, plate.oy + dy, plate.canvas)
+
+
 def _stamp(dest, node, ctx, clip_to_dest):
     """Paint one node onto dest. A group is flattened first, then blended."""
     if node.kind == "group":
@@ -764,14 +804,14 @@ def _stamp(dest, node, ctx, clip_to_dest):
         if nested is not None:
             _blend(dest, nested.image, (nested.ox, nested.oy), node, clip_to_dest)
         return
-    placed = _raster_view(node.raster, getattr(ctx, "scale", 1), dest.canvas)
+    placed = _raster_view(_paint_raster(node), getattr(ctx, "scale", 1), dest.canvas)
     if placed is None:
         return
     src, origin = placed
     _blend(dest, src, origin, node, clip_to_dest)
 
 
-def _appearance(canvas, node, ctx):
+def _appearance(canvas, node, ctx, outlined=True):
     """This node's paint before its blend hits the parent.
 
     The plate covers the paint, not the whole document. The base of a clipping
@@ -779,13 +819,13 @@ def _appearance(canvas, node, ctx):
     """
     scale = getattr(ctx, "scale", 1)
     if node.kind != "group":
-        placed = _raster_view(node.raster, scale, canvas)
+        placed = _raster_view(_paint_raster(node), scale, canvas)
         if placed is None:
             return None
         src, origin = placed
         return _Surface(src, origin[0], origin[1], canvas)
     plates = getattr(ctx, "plates", None)
-    key = _plate_key(node, ctx, canvas, scale) if plates is not None else None
+    key = _plate_key(node, ctx, canvas, scale, outlined) if plates is not None else None
     if plates is not None:
         found = plates.lookup(key)
         if found is not None:
@@ -797,6 +837,8 @@ def _appearance(canvas, node, ctx):
     x, y, w, h = bounds
     plate = _Surface(Image.new("RGBA", (w, h), (0, 0, 0, 0)), x, y, canvas)
     _paint_list(plate, node.children, ctx.child(node))
+    if outlined:
+        plate = _outline_plate(plate, node, scale)
     if plates is not None:
         plates.store(key, plate.image, plate.ox, plate.oy)
     return plate
@@ -828,8 +870,16 @@ def _list_bounds(nodes, ctx, canvas, scale):
 
 def _item_bounds(item, ctx, canvas, scale):
     if item.kind != "group":
-        return _raster_box(item.raster, scale, canvas)
-    return _list_bounds(item.children, ctx.child(item), canvas, scale)
+        return _raster_box(_paint_raster(item), scale, canvas)
+    bounds = _list_bounds(item.children, ctx.child(item), canvas, scale)
+    spec = active_outline(item)
+    if bounds is None or spec is None:
+        return bounds
+    pad = int(math.ceil(spec[0] * float(scale or 1)))
+    if pad <= 0:
+        return bounds
+    x, y, w, h = bounds
+    return x - pad, y - pad, w + 2 * pad, h + 2 * pad
 
 
 def _union(a, b):

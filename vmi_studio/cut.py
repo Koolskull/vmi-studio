@@ -95,6 +95,10 @@ def _copy_common(node, source):
         for poly in (getattr(source, "vectors", None) or [])
     ]
     node.frames = [int(frame) for frame in (getattr(source, "frames", None) or [])]
+    node.outline = bool(getattr(source, "outline", False))
+    node.outline_px = float(getattr(source, "outline_px", 0) or 0)
+    rgb = getattr(source, "outline_rgb", None) or (0, 0, 0)
+    node.outline_rgb = tuple(int(channel) for channel in rgb[:3])
     return node
 
 

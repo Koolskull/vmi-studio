@@ -38,6 +38,10 @@ class Node:
         self.vectors = []
         # Frame numbers parallel to the specified cels. Empty means 0, 1, 2…
         self.frames = []
+        # Clip Studio border edge. Off leaves the paint alone. Width is in pixels.
+        self.outline = False
+        self.outline_px = 0.0
+        self.outline_rgb = (0, 0, 0)
 
 
 class ArtFile:

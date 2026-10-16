@@ -46,6 +46,7 @@ a = Analysis(
         "vmi_studio.exportdialog",
         "vmi_studio.filmstrip",
         "vmi_studio.imagebake",
+        "vmi_studio.outline",
         "vmi_studio.launchui",
         "vmi_studio.loadgate",
         "vmi_studio.paint",

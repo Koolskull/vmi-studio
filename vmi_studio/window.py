@@ -78,6 +78,7 @@ from vmi_studio.composite import (
     reset_plate_cache,
 )
 from vmi_studio import fonts
+from vmi_studio.outline import apply_outlines, clamp_px, outline_rows
 from vmi_studio.navigate import (
     ROTATE_PER_PIXEL,
     ZOOM_STEP,
@@ -2940,8 +2941,33 @@ class MainWindow(QMainWindow):
         self.arrange_locked = True
         self.arrange_lock = ArrangeLock()
         self.arrange_lock.toggled.connect(self._arrange_toggled)
+        self._outline_guard = False
+        layers_body = QWidget()
+        layers_layout = QVBoxLayout(layers_body)
+        layers_layout.setContentsMargins(0, 0, 0, 0)
+        layers_layout.setSpacing(4)
+        layers_layout.addWidget(self.tree, 1)
+        outline_row = QHBoxLayout()
+        outline_row.setContentsMargins(0, 0, 0, 0)
+        outline_row.setSpacing(6)
+        self.outline_box = QCheckBox("Outline")
+        self.outline_box.setObjectName("outlineToggle")
+        self.outline_box.setToolTip("Clip Studio's border edge, around the non-transparent pixels.")
+        self.outline_px = QSpinBox()
+        self.outline_px.setObjectName("outlinePx")
+        self.outline_px.setRange(1, 250)
+        self.outline_px.setSuffix(" px")
+        self.outline_px.setKeyboardTracking(False)
+        self.outline_px.setToolTip("How many pixels the outline stands off the paint.")
+        self.outline_box.toggled.connect(self._outline_toggled)
+        self.outline_px.valueChanged.connect(self._outline_px_changed)
+        outline_row.addWidget(self.outline_box)
+        outline_row.addWidget(self.outline_px)
+        outline_row.addStretch(1)
+        layers_layout.addLayout(outline_row)
+        self._sync_outline_controls()
         self.split = QSplitter(Qt.Horizontal)
-        self.split.addWidget(self._pane("LAYERS", self.tree, self.arrange_lock, "layers"))
+        self.split.addWidget(self._pane("LAYERS", layers_body, self.arrange_lock, "layers"))
         picture_body = QWidget()
         picture_layout = QVBoxLayout(picture_body)
         picture_layout.setContentsMargins(0, 0, 0, 0)
@@ -4268,6 +4294,8 @@ class MainWindow(QMainWindow):
             apply_track_flags(art.layers, session.get("mute"), session.get("solo"))
             if "clips" in session:
                 apply_clips(art.layers, session.get("clips"))
+            if "outlines" in session:
+                apply_outlines(art.layers, session.get("outlines"))
         if session and session.get("tree_width"):
             self.tree.tree_width = max(MIN_TREE, int(session["tree_width"]))
         self.model.set_layers(art.layers)
@@ -4563,6 +4591,7 @@ class MainWindow(QMainWindow):
             return
         self._export_side = "layers"
         self._sync_playhead_to_selection()
+        self._sync_outline_controls()
         self._caption()
         self._refresh_timeline()
         if self.art and animation_folders(self.art.layers):
@@ -5346,6 +5375,95 @@ class MainWindow(QMainWindow):
         else:
             self.status.showMessage("Solo off. Every track is back in the picture.")
         self._save_soon()
+
+    def _current_layer(self):
+        if not self.art or getattr(self, "tree", None) is None:
+            return None
+        index = self.tree.currentIndex()
+        if not index.isValid():
+            return None
+        return self.model.node_of(index)
+
+    def _outline_targets(self):
+        node = self._current_layer()
+        if node is None:
+            return []
+        picked = []
+        for ident in self.picked:
+            found = find_node(self.art.layers, ident)
+            if found is not None:
+                picked.append(found)
+        if len(picked) > 1 and any(item.id == node.id for item in picked):
+            return picked
+        return [node]
+
+    def _drop_outline_cache(self, node):
+        if hasattr(node, "_outline_cache"):
+            del node._outline_cache
+
+    def _sync_outline_controls(self):
+        box = getattr(self, "outline_box", None)
+        spin = getattr(self, "outline_px", None)
+        if box is None or spin is None:
+            return
+        node = self._current_layer() if self.art else None
+        self._outline_guard = True
+        try:
+            if node is None:
+                box.setEnabled(False)
+                spin.setEnabled(False)
+                box.setChecked(False)
+                return
+            box.setEnabled(True)
+            spin.setEnabled(True)
+            box.setChecked(bool(getattr(node, "outline", False)))
+            px = clamp_px(getattr(node, "outline_px", 0))
+            spin.setValue(max(1, min(250, int(round(px)) if px > 0 else 1)))
+        finally:
+            self._outline_guard = False
+
+    def _outline_toggled(self, on):
+        if self._outline_guard or not self.art:
+            return
+        targets = self._outline_targets()
+        if not targets:
+            return
+        with self._edit("the outline"):
+            for node in targets:
+                node.outline = bool(on)
+                if on and clamp_px(node.outline_px) <= 0:
+                    node.outline_px = float(self.outline_px.value() or 1)
+                self._drop_outline_cache(node)
+        self.recomposite()
+        self._save_soon()
+        width = clamp_px(targets[0].outline_px)
+        if len(targets) == 1:
+            name = targets[0].name
+            if on:
+                self.status.showMessage("Outline on %s, %g px." % (name, width))
+            else:
+                self.status.showMessage("Outline off for %s." % name)
+        elif on:
+            self.status.showMessage("Outline on %d layers, %g px." % (len(targets), width))
+        else:
+            self.status.showMessage("Outline off for %d layers." % len(targets))
+
+    def _outline_px_changed(self, value):
+        if self._outline_guard or not self.art:
+            return
+        targets = self._outline_targets()
+        if not targets:
+            return
+        with self._edit("the outline"):
+            for node in targets:
+                node.outline_px = float(value)
+                self._drop_outline_cache(node)
+        self.recomposite()
+        self._save_soon()
+        if len(targets) == 1:
+            self.status.showMessage("Outline on %s is %d px." % (targets[0].name, int(value)))
+        else:
+            self.status.showMessage("Outline on %d layers is %d px." % (len(targets), int(value)))
 
     def toggle_clip(self, node):
         if not self.art or node is None:
@@ -6860,6 +6978,7 @@ class MainWindow(QMainWindow):
             "solo": track_ids(self.art.layers, "solo"),
             "clips": track_ids(self.art.layers, "clip"),
             "blends": blend_rows(self.art.layers),
+            "outlines": outline_rows(self.art.layers),
             "split_version": SPLIT_VERSION,
             "tree_width": int(self.tree.tree_width),
             "playlist": self.playlist or "",

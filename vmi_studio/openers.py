@@ -134,6 +134,18 @@ def _open_clip(path, progress):
             )
     except Exception as exc:
         sys.stderr.write("image: %s\n" % exc)
+    try:
+        from vmi_studio.outline import apply_clip_outlines
+
+        if progress:
+            progress("Reading outlines")
+        count = apply_clip_outlines(art, path)
+        if count:
+            art.note = "%s %d outline%s." % (
+                art.note, count, "" if count == 1 else "s",
+            )
+    except Exception as exc:
+        sys.stderr.write("outline: %s\n" % exc)
     return art
 
 

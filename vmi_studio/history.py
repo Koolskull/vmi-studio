@@ -38,6 +38,9 @@ def _layer_props(node):
             for poly in (getattr(node, "vectors", None) or [])
         ),
         tuple(int(frame) for frame in (getattr(node, "frames", None) or [])),
+        bool(getattr(node, "outline", False)),
+        float(getattr(node, "outline_px", 0) or 0),
+        tuple(int(channel) for channel in (getattr(node, "outline_rgb", None) or (0, 0, 0))[:3]),
     )
 
 
@@ -123,7 +126,7 @@ def apply_snap(window, snap):
         (
             name, kind, visible, opacity, blend, clip, shapes,
             mute, solo, animation, timeline, warp, raster,
-            marker, color, vectors, frames,
+            marker, color, vectors, frames, outline, outline_px, outline_rgb,
         ) = props
         node.name = name
         node.kind = kind
@@ -142,6 +145,11 @@ def apply_snap(window, snap):
         node.color = color or ""
         node.vectors = [[(float(x), float(y)) for x, y in poly] for poly in vectors]
         node.frames = [int(frame) for frame in frames]
+        node.outline = bool(outline)
+        node.outline_px = float(outline_px or 0)
+        node.outline_rgb = tuple(int(channel) for channel in outline_rgb)
+        if hasattr(node, "_outline_cache"):
+            del node._outline_cache
     window.art.layers = _build(snap.skeleton, snap.nodes)
     refresh(window.art.layers)
     objects = []

@@ -554,6 +554,11 @@ class LoadThread(QThread):
 
     def run(self):
         try:
+            from vmi_studio.icloud import ensure_local, is_evicted
+
+            if is_evicted(self.path):
+                self.note.emit("Downloading %s from iCloud." % os.path.basename(self.path))
+                ensure_local(self.path)
             art = open_drawing(self.path, progress=lambda text: self.note.emit(text))
         except Exception as exc:
             self.bad.emit(str(exc))
@@ -3205,7 +3210,8 @@ class MainWindow(QMainWindow):
         open_action = QAction("Open", self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.choose_file)
-        save_action = QAction("Save blueprint\tCtrl+S", self)
+        save_action = QAction("Save blueprint", self)
+        save_action.setShortcut(QKeySequence("Ctrl+S"))
         save_action.triggered.connect(self.save_blueprint)
         save_as_action = QAction("Save blueprint as", self)
         save_as_action.triggered.connect(self.save_blueprint_as)
@@ -3231,9 +3237,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(home_action)
         file_menu.addAction(quit_action)
         edit_menu = self.menuBar().addMenu("Edit")
-        undo_action = QAction("Undo\tCtrl+Z", self)
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence("Ctrl+Z"))
         undo_action.triggered.connect(self.undo)
-        redo_action = QAction("Redo\tCtrl+Shift+Z", self)
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence("Ctrl+Shift+Z"))
         redo_action.triggered.connect(self.redo)
         edit_menu.addAction(undo_action)
         edit_menu.addAction(redo_action)
@@ -4727,6 +4735,8 @@ class MainWindow(QMainWindow):
         if not self.art:
             self.status.showMessage("Open a drawing first.")
             return
+        if not self._fetch_icloud(path):
+            return
         try:
             stem, raster = raster_from_image(path)
         except Exception as exc:
@@ -4742,6 +4752,24 @@ class MainWindow(QMainWindow):
         self.recomposite()
         self.select_only(node)
         self.status.showMessage("Inserted %s." % name)
+
+    def _fetch_icloud(self, path):
+        """Bring an iCloud-only file onto this Mac. A local file is unchanged."""
+        from vmi_studio.icloud import ensure_local, is_evicted
+
+        if not is_evicted(path):
+            return True
+        name = os.path.basename(path)
+        self.status.showMessage("Downloading %s from iCloud." % name)
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        try:
+            ensure_local(path)
+        except OSError as exc:
+            self.status.showMessage(str(exc))
+            return False
+        return True
 
     def _place_in_front(self, node):
         """A new layer sits in front of the current row. A folder receives it inside."""
@@ -5411,6 +5439,11 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         kind = event.type()
+        if kind == QEvent.Type.FileOpen:
+            path = event.file()
+            if path:
+                self.open_path(path)
+            return True
         if kind in (
             QEvent.Type.TouchBegin,
             QEvent.Type.TouchUpdate,

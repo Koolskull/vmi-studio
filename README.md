@@ -34,6 +34,8 @@ It prints `VMI STUDIO 0.01`. The program is a window. It needs a normal desktop 
 
 The Windows download is `vmi-studio-0.01-windows-x86_64.zip` on that same release. It is a 64-bit build. Unzip it and run `vmi-studio\vmi-studio.exe`. `vmi-clip-vector.exe` sits beside it. A console window stays open with the studio. Check it with `vmi-studio.exe --version`.
 
+The Mac app is an Apple Silicon bundle, `VMI STUDIO.app`, built from this repo. There is no 0.01 Mac archive on the releases page. The build steps are under Run from source. Shortcuts written as Ctrl in this document are the Command key on a Mac.
+
 ## The window
 
 The title is `VMI STUDIO — <file>`. The menu bar is File, Edit, View, and Layer. Settings, the font list, and the theme list sit at the right of that bar. Themes are Studio, Paper, Charcoal, Peach, Mint, and Lilac. Three panes sit side by side. Drag the gutters to resize them.
@@ -50,7 +52,7 @@ White means the thing is highlighted: the selected row, an open arrangement lock
 
 The browser is the leftmost tab. Its name is browser, and it stays there. File → Open selects it. The studio does not read a drawing until you open one from that tab.
 
-Projects and tasks are named lists. A project is a body of work. A task list belongs to one project, and that same list is there for every drawing and blueprint in the project. Each file has a label, the user who tagged it, and a finished or working mark. Recent files are a separate list. The folder browser walks the disk from Home, Work, Documents, Desktop, Downloads, or the rest of the computer, and shows drawing files and folders. A folder row uses the studio folder picture. A file name has no icon. The insert-image browser uses the same rule. Shift+Left and Shift+Right move between the lists, the files, and the browser.
+Projects and tasks are named lists. A project is a body of work. A task list belongs to one project, and that same list is there for every drawing and blueprint in the project. Each file has a label, the user who tagged it, and a finished or working mark. Recent files are a separate list. The folder browser walks the disk from Home, Work, Documents, Desktop, Downloads, iCloud, or the rest of the computer, and shows drawing files and folders. iCloud is iCloud Drive. A file that is still only in the cloud stays in the list. Opening it downloads the file onto this Mac, and the loading window says so. The drawing in iCloud is not changed. A folder row uses the studio folder picture. A file name has no icon. The insert-image browser uses the same rule. Shift+Left and Shift+Right move between the lists, the files, and the browser.
 
 Choose Open on a row to load that file as a project tab to the right of the browser. File → Launcher selects the browser tab again. Quit leaves the program. A path on the command line opens that file and leaves the browser tab in place.
 
@@ -190,6 +192,22 @@ cargo build --manifest-path tools/vmi-clip-vector/Cargo.toml --release
 The program is `dist/vmi-studio/vmi-studio`. The spec copies `vmi-clip-vector` into that folder. The `.so` speeds up Krita files. Without it, those files still open through the Python decoder.
 
 The Windows build runs on a Windows machine. The workflow is `.github/workflows/windows.yml`. It compiles `lzf_d.dll`, builds `vmi-clip-vector.exe`, and packs `dist\vmi-studio\vmi-studio.exe`.
+
+The Mac build runs on an Apple Silicon Mac. Python 3.12 and a Rust toolchain have to be installed first. The same decoder command used on Linux writes `vmi_studio/lzf_d.so`. On macOS that file is a Mach-O shared library under the Linux name, which is the name the studio loads.
+
+```bash
+gcc -O3 -shared -fPIC -o vmi_studio/lzf_d.so vmi_studio/lzf_d.c
+cargo build --manifest-path tools/vmi-clip-vector/Cargo.toml --release
+.venv/bin/pyinstaller --noconfirm --clean vmi-studio.spec
+```
+
+The program is `dist/VMI STUDIO.app`. Open that bundle. Check the build from a terminal with:
+
+```bash
+"dist/VMI STUDIO.app/Contents/MacOS/vmi-studio" --version
+```
+
+It prints `VMI STUDIO 0.01`. A drawing dropped on the icon, or chosen with Open With, opens in the studio. The first time a downloaded copy is opened, Gatekeeper may refuse it until you right-click the app and choose Open.
 
 An optional font catalog can live in `~/Documents/work/Github/bgcardbuilder`, or in the directory named by `BGCARDBUILDER`. Without it, the header font list is the system monospace. That is the default face either way.
 

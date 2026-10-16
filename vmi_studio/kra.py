@@ -204,7 +204,7 @@ def _lzf_decode(src, size):
 
 
 def _lzf_paths():
-    """The compiled decoder. Windows ships a dll. Linux ships a .so."""
+    """The compiled decoder. Windows ships a dll. Linux and macOS ship a .so."""
     filename = "lzf_d.dll" if sys.platform == "win32" else "lzf_d.so"
     here = os.path.dirname(os.path.abspath(__file__))
     paths = [os.path.join(here, filename)]

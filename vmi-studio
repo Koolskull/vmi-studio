@@ -1,5 +1,15 @@
 #!/bin/bash
-ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# readlink -f is GNU. macOS readlink has no -f, so walk the links here.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$DIR/$SOURCE" ;;
+  esac
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 if [ -z "${CLIP2KRITA_SRC:-}" ]; then
   sibling="${HOME}/Documents/work/clip2krita/src"
   vendored="$ROOT/third_party/clip2krita/src"

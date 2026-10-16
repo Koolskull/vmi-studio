@@ -1,5 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""VMI STUDIO executable. Run from the repository root on the target system."""
+"""VMI STUDIO executable. Run from the repository root on the target system.
+
+Linux and Windows collect a folder. macOS also wraps that folder in
+VMI STUDIO.app. The Krita decoder keeps the name lzf_d.so on macOS. That
+file is a Mach-O shared library.
+"""
 
 import os
 import sys
@@ -8,6 +13,7 @@ root = os.path.abspath(SPECPATH)
 clip_pkg = os.path.join(root, "third_party", "clip2krita", "src", "clip2krita")
 clip_vendor = os.path.join(root, "third_party", "clip2krita", "third_party")
 windows = sys.platform == "win32"
+darwin = sys.platform == "darwin"
 lzf = os.path.join(root, "vmi_studio", "lzf_d.dll" if windows else "lzf_d.so")
 vector_name = "vmi-clip-vector.exe" if windows else "vmi-clip-vector"
 vector = os.path.join(root, "tools", "vmi-clip-vector", "target", "release", vector_name)
@@ -33,6 +39,7 @@ a = Analysis(
         "PIL",
         "numpy",
         "vmi_studio.catalog",
+        "vmi_studio.icloud",
         "vmi_studio.cloud",
         "vmi_studio.csptime",
         "vmi_studio.drawbar",
@@ -65,7 +72,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=not darwin,
 )
 coll = COLLECT(
     exe,
@@ -75,3 +82,49 @@ coll = COLLECT(
     upx=False,
     name="vmi-studio",
 )
+if darwin:
+    app = BUNDLE(
+        coll,
+        name="VMI STUDIO.app",
+        bundle_identifier="com.beetlelabs.vmistudio",
+        info_plist={
+            "CFBundleName": "VMI STUDIO",
+            "CFBundleDisplayName": "VMI STUDIO",
+            "CFBundleShortVersionString": "0.01",
+            "CFBundleVersion": "0.01",
+            "NSHighResolutionCapable": True,
+            "LSMinimumSystemVersion": "11.0",
+            "CFBundleDocumentTypes": [
+                {
+                    "CFBundleTypeName": "Clip Studio Paint document",
+                    "CFBundleTypeRole": "Viewer",
+                    "LSHandlerRank": "Alternate",
+                    "CFBundleTypeExtensions": ["clip"],
+                },
+                {
+                    "CFBundleTypeName": "Photoshop document",
+                    "CFBundleTypeRole": "Viewer",
+                    "LSHandlerRank": "Alternate",
+                    "CFBundleTypeExtensions": ["psd", "psb"],
+                },
+                {
+                    "CFBundleTypeName": "Krita document",
+                    "CFBundleTypeRole": "Viewer",
+                    "LSHandlerRank": "Alternate",
+                    "CFBundleTypeExtensions": ["kra"],
+                },
+                {
+                    "CFBundleTypeName": "GIMP document",
+                    "CFBundleTypeRole": "Viewer",
+                    "LSHandlerRank": "Alternate",
+                    "CFBundleTypeExtensions": ["xcf"],
+                },
+                {
+                    "CFBundleTypeName": "VMI STUDIO blueprint",
+                    "CFBundleTypeRole": "Editor",
+                    "LSHandlerRank": "Owner",
+                    "CFBundleTypeExtensions": ["vmib"],
+                },
+            ],
+        },
+    )

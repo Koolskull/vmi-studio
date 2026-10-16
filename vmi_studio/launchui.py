@@ -3,12 +3,23 @@
 import os
 import sys
 
-from PySide6.QtCore import QDir, QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QDir,
+    QEvent,
+    QObject,
+    QSize,
+    QStandardPaths,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QAction, QIcon, QIconEngine, QImage, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QDialog,
+    QFileIconProvider,
     QFileSystemModel,
     QGridLayout,
     QHBoxLayout,
@@ -27,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from vmi_studio import catalog, theme
+from vmi_studio import catalog, icloud, theme
 
 _FOLDER_ICON = None
 
@@ -86,8 +97,67 @@ def folder_icon():
     return _FOLDER_ICON
 
 
+# Weight 80 is a literal glob. Qt then names the file without reading it.
+# A read is what makes iCloud download the whole drawing during a folder listing.
+_DRAWING_MIME = """<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-vmi-drawing">
+    <comment>VMI drawing</comment>
+    <glob pattern="*.clip" weight="80"/>
+    <glob pattern="*.psb" weight="80"/>
+    <glob pattern="*.kra" weight="80"/>
+    <glob pattern="*.vmib" weight="80"/>
+  </mime-type>
+</mime-info>
+"""
+
+
+def install_drawing_types():
+    """Register drawing extensions so a folder listing does not open the files."""
+    root = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation)
+    if not root:
+        return ""
+    folder = os.path.join(root, "mime", "packages")
+    path = os.path.join(folder, "vmi-studio.xml")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        current = ""
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                current = handle.read()
+        if current != _DRAWING_MIME:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(_DRAWING_MIME)
+    except OSError:
+        return ""
+    return path
+
+
+install_drawing_types()
+
+
+class _NameOnlyIcons(QFileIconProvider):
+    """The stock provider reads a file to name its type. That downloads iCloud."""
+
+    def icon(self, kind):
+        return QIcon()
+
+    def type(self, info):
+        if info.isDir():
+            return "Folder"
+        suffix = info.suffix()
+        return suffix if suffix else "File"
+
+
 class DiskModel(QFileSystemModel):
-    """Directory rows show the folder picture. File rows show no icon."""
+    """Directory rows show the folder picture. File rows show no icon.
+
+    Listing uses names and stat only. It does not open the file.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setIconProvider(_NameOnlyIcons())
 
     def data(self, index, role=Qt.DisplayRole):
         if role == Qt.DecorationRole and index.isValid() and index.column() == 0:
@@ -154,6 +224,63 @@ def _code_snapshot():
         except OSError:
             continue
     return tuple(sorted(found))
+
+
+class _FolderWarm(QThread):
+    """List one folder away from the UI thread."""
+
+    ok = Signal(str)
+    bad = Signal(str, str)
+
+    def __init__(self, path):
+        super().__init__()
+        self._path = path
+
+    def run(self):
+        try:
+            icloud.warm(self._path)
+        except OSError as exc:
+            self.bad.emit(self._path, str(exc))
+            return
+        self.ok.emit(self._path)
+
+
+class _CloudOpen(QObject):
+    """Open an iCloud folder after its names are listed."""
+
+    def __init__(self, tell):
+        super().__init__()
+        self._tell = tell
+        self._generation = 0
+        self._workers = []
+
+    def start(self, path, done):
+        self._generation += 1
+        generation = self._generation
+        self._tell("Opening iCloud.")
+        worker = _FolderWarm(path)
+        worker.ok.connect(lambda folder, gen=generation, done=done: self._done(gen, folder, done))
+        worker.bad.connect(lambda _folder, text, gen=generation: self._fail(gen, text))
+        worker.finished.connect(lambda worker=worker: self._drop(worker))
+        self._workers.append(worker)
+        worker.start()
+
+    def cancel(self):
+        self._generation += 1
+
+    def _done(self, generation, path, done):
+        if generation != self._generation:
+            return
+        done(path)
+
+    def _fail(self, generation, text):
+        if generation != self._generation:
+            return
+        self._tell(text)
+
+    def _drop(self, worker):
+        if worker in self._workers:
+            self._workers.remove(worker)
 
 
 class _LineStatus:
@@ -1185,6 +1312,23 @@ class Launcher(QWidget):
         if not os.path.isdir(path):
             self.status.showMessage("That folder is not there.")
             return
+        if icloud.in_drive(path):
+            self._cloud_open().start(path, lambda folder, record=record: self._show_browse(folder, record))
+            return
+        self._show_browse(path, record)
+
+    def _cloud_open(self):
+        opener = getattr(self, "_cloud", None)
+        if opener is None:
+            opener = _CloudOpen(self.status.showMessage)
+            opener.setParent(self)
+            self._cloud = opener
+        return opener
+
+    def _show_browse(self, path, record=True):
+        opener = getattr(self, "_cloud", None)
+        if opener is not None:
+            opener.cancel()
         current = os.path.abspath(self.book.get("browse") or "") if self.book.get("browse") else ""
         if record and current and current != path:
             self._trail.append(current)
@@ -1228,6 +1372,11 @@ class Launcher(QWidget):
         self.disk.setNameFilters(catalog.drawing_globs(text))
 
     def _directory_loaded(self, path):
+        browsing = os.path.abspath(self.book.get("browse") or "") if self.book.get("browse") else ""
+        if browsing and os.path.abspath(path) == browsing:
+            index = self.disk.index(browsing)
+            if index.isValid():
+                self.browser.setRootIndex(index)
         pending = self._pending_select
         if not pending:
             return
@@ -1426,6 +1575,7 @@ class ImagePick(QDialog):
         self.disk.setNameFilterDisables(False)
         self.disk.setNameFilters(catalog.image_globs(""))
         self.disk.setResolveSymlinks(True)
+        self.disk.directoryLoaded.connect(self._directory_loaded)
         self.view = QTreeView()
         self.view.setObjectName("browser")
         self.view.setIconSize(QSize(16, 16))
@@ -1461,6 +1611,23 @@ class ImagePick(QDialog):
         if not os.path.isdir(folder):
             self._status.setText("That folder is not there.")
             return
+        if icloud.in_drive(folder):
+            self._cloud_open().start(folder, self._show_folder)
+            return
+        self._show_folder(folder)
+
+    def _cloud_open(self):
+        opener = getattr(self, "_cloud", None)
+        if opener is None:
+            opener = _CloudOpen(self._status.setText)
+            opener.setParent(self)
+            self._cloud = opener
+        return opener
+
+    def _show_folder(self, folder):
+        opener = getattr(self, "_cloud", None)
+        if opener is not None:
+            opener.cancel()
         self._folder = folder
         self.path_edit.setText(folder)
         self.view.setRootIndex(self.disk.setRootPath(folder))
@@ -1470,6 +1637,12 @@ class ImagePick(QDialog):
             button.setProperty("current", "true" if on else "false")
             button.style().unpolish(button)
             button.style().polish(button)
+
+    def _directory_loaded(self, path):
+        if self._folder and os.path.abspath(path) == os.path.abspath(self._folder):
+            index = self.disk.index(self._folder)
+            if index.isValid():
+                self.view.setRootIndex(index)
 
     def browse_up(self):
         if not self._folder:

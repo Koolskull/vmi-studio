@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,7 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from vmi_studio import catalog
-from vmi_studio.launchui import DiskModel, ImagePick, Launcher, folder_png_path
+from vmi_studio.launchui import DiskModel, ImagePick, Launcher, folder_png_path, install_drawing_types
 
 
 class CatalogTests(unittest.TestCase):
@@ -164,6 +165,50 @@ class LauncherTests(unittest.TestCase):
             time.sleep(0.02)
         self.app.processEvents()
 
+    def test_an_icloud_folder_lists_after_the_background_open(self):
+        win = self._launcher()
+        with patch("vmi_studio.icloud.in_drive", return_value=True):
+            win.browse_at(self.folder, record=False)
+            self.assertNotEqual(os.path.abspath(win.path_edit.text()), os.path.abspath(self.folder))
+            shown = False
+            for _index in range(100):
+                self.app.processEvents()
+                if "door.clip" in self._names(win):
+                    shown = True
+                    break
+                time.sleep(0.02)
+        self.assertTrue(shown)
+        self.assertIn("extra", self._names(win))
+        self.assertEqual(os.path.abspath(win.path_edit.text()), os.path.abspath(self.folder))
+
+    def test_a_closed_icloud_folder_stays_off_the_path(self):
+        win = self._launcher()
+        before = win.path_edit.text()
+        with patch("vmi_studio.icloud.in_drive", return_value=True):
+            with patch("vmi_studio.icloud.warm", side_effect=OSError("iCloud did not open door. denied")):
+                win.browse_at(self.folder, record=False)
+                seen = False
+                for _index in range(100):
+                    self.app.processEvents()
+                    if "denied" in win.status.currentMessage():
+                        seen = True
+                        break
+                    time.sleep(0.02)
+        self.assertTrue(seen)
+        self.assertEqual(win.path_edit.text(), before)
+
+    def test_a_drawing_extension_is_named_without_reading_the_file(self):
+        from PySide6.QtCore import QMimeDatabase
+
+        self.assertTrue(install_drawing_types())
+        folder = tempfile.mkdtemp()
+        for ext in (".clip", ".psb", ".kra", ".vmib"):
+            path = os.path.join(folder, "door" + ext)
+            with open(path, "wb") as handle:
+                handle.write(b"NOTACLIP this is text\n")
+            named = QMimeDatabase().mimeTypeForFile(path).name()
+            self.assertEqual(named, "application/x-vmi-drawing", ext)
+
     def test_new_project_sits_left_of_new_task_list(self):
         win = self._launcher()
         labels = [button.text() for button in win.findChildren(QPushButton)]
@@ -255,6 +300,7 @@ class LauncherTests(unittest.TestCase):
         for row in range(win.disk.rowCount(root)):
             index = win.disk.index(row, 0, root)
             if win.disk.fileName(index) == "door.clip":
+                self.assertEqual(win.disk.type(index), "clip")
                 win.browser.setCurrentIndex(index)
                 break
         result = win.add_browser_selection()

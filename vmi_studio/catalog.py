@@ -4,6 +4,8 @@ import json
 import os
 import time
 
+from vmi_studio.icloud import drive_root, is_evicted
+
 
 PATH = os.path.join(os.path.expanduser("~"), ".cache", "vmi-studio", "launcher.json")
 DRAWING_EXTS = (".clip", ".psd", ".psb", ".kra", ".xcf", ".vmib")
@@ -563,6 +565,9 @@ def selection_note(path):
         return "That file is missing. It stays on the list until you remove it."
     size = size_text(path)
     hint = open_hint(path)
+    if is_evicted(path):
+        cloud = "This copy is in iCloud. Opening it downloads the file."
+        hint = "%s %s" % (cloud, hint) if hint else cloud
     if size and hint:
         return "%s. %s" % (size, hint)
     return hint or size or os.path.basename(path)
@@ -588,6 +593,9 @@ def places(home=None):
     ):
         if os.path.isdir(path) and os.path.abspath(path) != os.path.abspath(home):
             rows.append((label, path))
+    cloud = drive_root(home)
+    if cloud and os.path.abspath(cloud) != os.path.abspath(home):
+        rows.append(("iCloud", cloud))
     rows.append(("Computer", os.path.abspath(os.sep)))
     return rows
 

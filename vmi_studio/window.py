@@ -1,5 +1,6 @@
 """The desk. Layers, the visible stack, and one object per thing."""
 
+import copy
 import faulthandler
 import math
 import os
@@ -30,6 +31,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -82,13 +84,14 @@ from vmi_studio.composite import (
 from vmi_studio import fonts
 from vmi_studio.outline import apply_outlines, clamp_px, outline_rows
 from vmi_studio.navigate import (
-    ROTATE_PER_PIXEL,
     ZOOM_STEP,
     clamp_zoom,
     format_zoom,
     gesture,
+    orbit_pan,
     view_to_image,
     wheel_factor,
+    zoom_drag_factor,
 )
 from vmi_studio.desk import (
     SOUND_EFFECTS,
@@ -167,11 +170,15 @@ from vmi_studio import cloud as cloudstore
 from vmi_studio.vmib import prepare_blueprint, write_parts
 from vmi_studio.drawbar import DrawBar
 from vmi_studio.effectbar import EffectBar
+from vmi_studio.onion import apply_onion, next_frame_slot
+from vmi_studio.scrub import ScrubFilter
+from vmi_studio.toggles import show_toggle, watch_check
 from vmi_studio.exportdialog import PngDialog, favorite_places
 from vmi_studio.exposure import ExposureSheet, project_slots, sheet_from_slots
 from vmi_studio.filmstrip import Filmstrip, TimelineGutter, Transport
 from vmi_studio.xsheet import XSheet, run_command as _run_xsheet
 from vmi_studio.paint import (
+    TOOLS,
     INK_MODES,
     MaskCanvas,
     fill_polygon,
@@ -1476,10 +1483,11 @@ class PaneHeader(QWidget):
 
 
 class PictureView(QWidget):
-    """The picture, with KOOLDRAW's zoom, pan, and rotate.
+    """The picture.
 
-    Scroll zooms. Space+drag and the middle button pan. Shift+drag rotates
-    a mouse. A plain left click picks the layer under the cursor.
+    Scroll zooms. Space+drag and the middle button pan. Shift+Space+drag
+    rotates around the center of the view. Ctrl+Space+drag zooms. A pen and
+    a mouse use the same chords. A plain left click picks the layer.
     """
 
     def __init__(self):
@@ -1517,10 +1525,12 @@ class PictureView(QWidget):
         self._under = None
         self._spine = []
         self._tablet_at = 0.0
+        self._tablet_nav = False
         self._space = False
         self._drag = None
         self._last = None
         self._press = None
+        self._nav_angle = 0.0
         self._pinch_scale = 1.0
         self._pinch_rotation = 0.0
         self._pinch_center = None
@@ -1528,10 +1538,10 @@ class PictureView(QWidget):
         self.setFocusPolicy(Qt.ClickFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         self.grabGesture(Qt.GestureType.PinchGesture)
-        self._zoom_out = self._zoom_button("−", "Zoom out")
-        self._zoom_label = self._zoom_button("1×", "Fit picture")
+        self._zoom_out = self._zoom_button("−", "Zoom out    Shift+−")
+        self._zoom_label = self._zoom_button("1×", "Reset view    Shift+R")
         self._zoom_label.setFixedSize(48, 24)
-        self._zoom_in = self._zoom_button("+", "Zoom in")
+        self._zoom_in = self._zoom_button("+", "Zoom in    Shift+=")
         self._zoom_out.clicked.connect(lambda: self.zoom_by(1.0 / ZOOM_STEP))
         self._zoom_in.clicked.connect(lambda: self.zoom_by(ZOOM_STEP))
         self._zoom_label.clicked.connect(lambda: self.set_fit(True))
@@ -1751,7 +1761,7 @@ class PictureView(QWidget):
             elif self.cut_active:
                 text = "SHIFT+X DONE   ·   DRAG A SELECTION   ·   CUT TO FOLDER OR DELETE"
             else:
-                text = "SCROLL ZOOM   ·   SPACE PAN   ·   SHIFT ROTATE   ·   CLICK A LAYER"
+                text = "SCROLL ZOOM   ·   SPACE PAN   ·   SHIFT+SPACE ROTATE   ·   CTRL+SPACE ZOOM"
             painter.setPen(QColor(RULE))
             painter.drawText(8, self.height() - 8, text)
         if self._busy and self.width() > 24 and self.height() > 48:
@@ -2011,15 +2021,22 @@ class PictureView(QWidget):
         return True
 
     def keyPressEvent(self, event):
-        if not self._text_focus() and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
-            if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
-                self.zoom_by(ZOOM_STEP)
-                event.accept()
-                return
-            if event.key() == Qt.Key_Minus:
-                self.zoom_by(1.0 / ZOOM_STEP)
-                event.accept()
-                return
+        if self._text_focus() or event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            super().keyPressEvent(event)
+            return
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+        if shift and event.key() == Qt.Key_R and not event.isAutoRepeat():
+            self.set_fit(True)
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.zoom_by(ZOOM_STEP)
+            event.accept()
+            return
+        if event.key() == Qt.Key_Minus:
+            self.zoom_by(1.0 / ZOOM_STEP)
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def wheelEvent(self, event):
@@ -2054,20 +2071,20 @@ class PictureView(QWidget):
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
+        mode = self._gesture(event)
+        if mode in ("pan", "rotate", "zoom"):
+            if self._drag in ("pan", "rotate", "zoom") or (self._tablet_nav and self._tablet_mouse(event)):
+                event.accept()
+                return
+            self._begin_nav(mode, event.position(), grab=True)
+            event.accept()
+            return
         if self.draw_mode and self._tablet_mouse(event):
             event.accept()
             return
         if self._draw_press(event):
             return
         if self._cut_press(event):
-            return
-        mode = self._gesture(event)
-        if mode in ("pan", "rotate"):
-            self._drag = mode
-            self._last = event.position()
-            self.grabMouse()
-            self._cursor()
-            event.accept()
             return
         if mode == "pick":
             self._drag = "pick"
@@ -2077,10 +2094,15 @@ class PictureView(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._drag in ("pan", "rotate", "zoom"):
+            if not (self._tablet_nav and self._tablet_mouse(event)):
+                self._drag_nav(event.position())
+            event.accept()
+            return
         if self.draw_mode and self._tablet_mouse(event) and self._drag != "mask":
             event.accept()
             return
-        if self.draw_mode == "warp-target" and self._drag not in ("pan", "rotate", "cut"):
+        if self.draw_mode == "warp-target" and self._drag not in ("pan", "rotate", "zoom", "cut"):
             self._hover = self.document_point(event.position())
             self.update()
         elif self._draws_brush() and self._drag != "mask":
@@ -2105,25 +2127,17 @@ class PictureView(QWidget):
             self.update()
             event.accept()
             return
-        if self._drag == "pan" and self._last is not None:
-            pos = event.position()
-            self.pan_x += pos.x() - self._last.x()
-            self.pan_y += pos.y() - self._last.y()
-            self._last = pos
-            self.update()
-            event.accept()
-            return
-        if self._drag == "rotate" and self._last is not None:
-            pos = event.position()
-            self.rotation += (pos.x() - self._last.x()) * ROTATE_PER_PIXEL
-            self._last = pos
-            self.update()
-            event.accept()
-            return
         self._cursor()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._drag in ("pan", "rotate", "zoom"):
+            if self._tablet_nav and self._tablet_mouse(event):
+                event.accept()
+                return
+            self._end_nav()
+            event.accept()
+            return
         drag = self._drag
         press = self._press
         self._drag = None
@@ -2166,15 +2180,36 @@ class PictureView(QWidget):
             pressure = max(0.0, min(1.0, float(event.pressure())))
         except Exception:
             pressure = 1.0
+        class _Press(object):
+            pass
+        fake = _Press()
+        fake.button = lambda: Qt.LeftButton
+        fake.position = lambda: pos
+        fake.modifiers = event.modifiers
+        fake.points = lambda: []
+        mode = self._gesture(fake)
+        if kind == QEvent.Type.TabletPress and mode in ("pan", "rotate", "zoom"):
+            self._tablet_nav = True
+            if self.mouseGrabber() is self:
+                self.releaseMouse()
+            if self._drag not in ("pan", "rotate", "zoom"):
+                self._begin_nav(mode, pos, grab=False)
+            else:
+                self._drag = mode
+                self._last = pos
+                self._nav_angle = self._pointer_angle(pos)
+            event.accept()
+            return
+        if kind == QEvent.Type.TabletMove and self._tablet_nav and self._drag in ("pan", "rotate", "zoom"):
+            self._drag_nav(pos)
+            event.accept()
+            return
+        if kind == QEvent.Type.TabletRelease and self._tablet_nav and self._drag in ("pan", "rotate", "zoom"):
+            self._end_nav()
+            event.accept()
+            return
         if kind == QEvent.Type.TabletPress and self.draw_mode:
-            class _Press(object):
-                pass
-            fake = _Press()
-            fake.button = lambda: Qt.LeftButton
-            fake.position = lambda: pos
-            fake.modifiers = event.modifiers
-            fake.points = lambda: []
-            if self._gesture(fake) == "pick" and not self._space:
+            if mode == "pick" and not self._space:
                 doc = self.document_point(pos)
                 if doc is not None and self._draws_brush():
                     self._drag = "mask"
@@ -2230,17 +2265,77 @@ class PictureView(QWidget):
         event.accept()
         return True
 
+    def _pointer_angle(self, pos):
+        dx = float(pos.x()) - self.width() / 2.0
+        dy = float(pos.y()) - self.height() / 2.0
+        return math.degrees(math.atan2(dy, dx))
+
+    def _begin_nav(self, mode, pos, grab):
+        self._drag = mode
+        self._last = pos
+        self._nav_angle = self._pointer_angle(pos)
+        if grab:
+            self.grabMouse()
+        self._cursor()
+
+    def _drag_nav(self, pos):
+        if self._last is None:
+            self._last = pos
+            self._nav_angle = self._pointer_angle(pos)
+            return
+        if self._drag == "pan":
+            self.pan_x += pos.x() - self._last.x()
+            self.pan_y += pos.y() - self._last.y()
+            self._last = pos
+            self.update()
+            return
+        if self._drag == "rotate":
+            angle = self._pointer_angle(pos)
+            delta = angle - self._nav_angle
+            while delta > 180.0:
+                delta -= 360.0
+            while delta < -180.0:
+                delta += 360.0
+            self._nav_angle = angle
+            self._last = pos
+            if delta != 0.0:
+                self.pan_x, self.pan_y = orbit_pan(self.pan_x, self.pan_y, delta)
+                self.rotation += delta
+                self.update()
+            return
+        if self._drag == "zoom":
+            dy = pos.y() - self._last.y()
+            self._last = pos
+            factor = zoom_drag_factor(dy)
+            if factor != 1.0:
+                self.zoom_by(factor)
+
+    def _end_nav(self):
+        self._drag = None
+        self._last = None
+        self._press = None
+        self._tablet_nav = False
+        if self.mouseGrabber() is self:
+            self.releaseMouse()
+        self._cursor()
+
     def eventFilter(self, watched, event):
         kind = event.type()
+        if kind == QEvent.Type.WindowDeactivate and watched is self.window():
+            self._space = False
+            self._cursor()
+            return False
         if kind not in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             return False
-        if event.key() != Qt.Key_Space or event.isAutoRepeat():
+        if event.key() != Qt.Key_Space:
             return False
         if self._text_focus():
             return False
         window = self.window()
         if window is None or not window.isActiveWindow():
             return False
+        if event.isAutoRepeat():
+            return True
         self._space = kind == QEvent.Type.KeyPress
         self._cursor()
         return True
@@ -2271,13 +2366,16 @@ class PictureView(QWidget):
         return isinstance(widget, (QLineEdit, QSpinBox, QPlainTextEdit))
 
     def _cursor(self):
+        mods = QApplication.keyboardModifiers() if QApplication.instance() is not None else Qt.NoModifier
         if self._drag == "pan":
             self.setCursor(Qt.ClosedHandCursor)
+        elif self._drag == "zoom" or (self._space and (mods & Qt.ControlModifier)):
+            self.setCursor(Qt.SizeVerCursor)
+        elif self._drag == "rotate" or (self._space and (mods & Qt.ShiftModifier)):
+            self.setCursor(Qt.SizeAllCursor)
         elif self._space:
             self.setCursor(Qt.OpenHandCursor)
-        elif self._drag == "rotate":
-            self.setCursor(Qt.SizeHorCursor)
-        elif self.draw_mode and not self._space:
+        elif self.draw_mode:
             self.setCursor(Qt.CrossCursor)
         else:
             self.unsetCursor()
@@ -2851,7 +2949,7 @@ class _PictureJob(QThread):
 
     ready = Signal(int, object, str)
 
-    def __init__(self, generation, width, height, layers, focus, edge, flags, showing, frame=0):
+    def __init__(self, generation, width, height, layers, focus, edge, flags, showing, frame=0, live=None, onion=False, onion_frame=0):
         super().__init__()
         self.generation = int(generation)
         self.width = width
@@ -2863,6 +2961,9 @@ class _PictureJob(QThread):
         self.flags = flags
         self.showing = showing
         self.frame = int(frame or 0)
+        self.live = None if live is None else int(live)
+        self.onion = bool(onion)
+        self.onion_frame = int(onion_frame or 0)
 
     def run(self):
         image = None
@@ -2872,7 +2973,13 @@ class _PictureJob(QThread):
                 image = composite_scene(
                     self.width, self.height, self.layers, self.focus,
                     max_edge=self.edge, flags=self.flags, frame=self.frame,
+                    live=self.live,
                 )
+                if self.onion:
+                    image = apply_onion(
+                        image, self.width, self.height, self.layers,
+                        self.onion_frame, self.edge,
+                    )
         except Exception:
             error = traceback.format_exc()
         self.ready.emit(self.generation, image, error)
@@ -2953,6 +3060,7 @@ class MainWindow(QMainWindow):
         self._picture_job = None
         self._picture_generation = 0
         self._picture_pending = False
+        self._picture_quiet = False
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(200)
@@ -3084,6 +3192,7 @@ class MainWindow(QMainWindow):
         self.outline_px.setKeyboardTracking(False)
         self.outline_px.setToolTip("How many pixels the outline stands off the paint.")
         self.outline_box.toggled.connect(self._outline_toggled)
+        watch_check(self.outline_box)
         self.outline_px.valueChanged.connect(self._outline_px_changed)
         outline_row.addWidget(self.outline_box)
         outline_row.addWidget(self.outline_px)
@@ -3102,8 +3211,13 @@ class MainWindow(QMainWindow):
         top_layout = QVBoxLayout(picture_top)
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(4)
-        top_layout.addWidget(self.picture, 1)
+        stage = QWidget()
+        stage_row = QHBoxLayout(stage)
+        stage_row.setContentsMargins(0, 0, 0, 0)
+        stage_row.setSpacing(4)
+        stage_row.addWidget(self.picture, 1)
         self.draw_bar = DrawBar()
+        stage_row.insertWidget(0, self.draw_bar.tool_column, 0)
         self.draw_bar.mode_requested.connect(self.set_draw_mode)
         self.draw_bar.color_changed.connect(self._warp_recolor)
         self.draw_bar.setEnabled(False)
@@ -3111,11 +3225,19 @@ class MainWindow(QMainWindow):
         self._effect_before = None
         self.effect_bar.editing.connect(self._effect_bar_edit)
         self.effect_bar.changed.connect(self._effect_bar_changed)
+        self.effect_bar.load_plate.connect(self.load_effect_plate)
+        stage_row.addWidget(self.effect_bar, 0)
         self._cut_target = None
         self.cut_bar = self._cut_bar()
+        top_layout.addWidget(stage, 1)
         top_layout.addWidget(self.draw_bar)
-        top_layout.addWidget(self.effect_bar)
         top_layout.addWidget(self.cut_bar)
+        self._kosv_live = 0
+        self._kosv_force_live = False
+        self._picture_quiet = False
+        self._kosv_timer = QTimer(self)
+        self._kosv_timer.setInterval(84)
+        self._kosv_timer.timeout.connect(self._kosv_tick)
         picture_top.setMinimumHeight(80)
         self.film = Filmstrip()
         self.film.cel_chosen.connect(self._film_chosen)
@@ -3123,6 +3245,7 @@ class MainWindow(QMainWindow):
         self.film.scrubbed.connect(self._film_scrubbed)
         self._playing = False
         self._loop = False
+        self._onion = False
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._play_tick)
         self.transport = Transport()
@@ -3130,6 +3253,7 @@ class MainWindow(QMainWindow):
         self.transport.forward_frame.connect(lambda: self._step_frame(1))
         self.transport.play.connect(self._toggle_play)
         self.transport.loop.connect(self._toggle_loop)
+        self.transport.onion.connect(self._toggle_onion)
         self.transport.sheet.connect(self._toggle_xsheet)
         self._xsheet_open = False
         self.xsheet = XSheet()
@@ -3163,6 +3287,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+            self._scrub = ScrubFilter(self)
+            app.installEventFilter(self._scrub)
         self.split.addWidget(self._pane("PICTURE", picture_body))
         self.split.addWidget(self._pane("OBJECTS", self._objects_body(), key="objects"))
         self.split.setHandleWidth(GUTTER)
@@ -3439,10 +3565,16 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         pan_hint = QAction("Pan    Space + drag, or middle-click", self)
         pan_hint.setEnabled(False)
-        rotate_hint = QAction("Rotate    Shift + drag", self)
+        rotate_hint = QAction("Rotate    Shift+Space + drag", self)
         rotate_hint.setEnabled(False)
+        zoom_hint = QAction("Zoom drag    Ctrl+Space + drag", self)
+        zoom_hint.setEnabled(False)
+        reset_hint = QAction("Reset view    Shift+R", self)
+        reset_hint.setEnabled(False)
         view_menu.addAction(pan_hint)
         view_menu.addAction(rotate_hint)
+        view_menu.addAction(zoom_hint)
+        view_menu.addAction(reset_hint)
         layer_menu = self.menuBar().addMenu("Layer")
         fresh_action = QAction("New layer", self)
         fresh_action.setShortcut(QKeySequence("Ctrl+Shift+N"))
@@ -3453,6 +3585,20 @@ class MainWindow(QMainWindow):
         group_action.setShortcut(QKeySequence("Ctrl+G"))
         group_action.setShortcutContext(Qt.WindowShortcut)
         group_action.triggered.connect(self.group_selection)
+        duplicate_action = QAction("Duplicate layers", self)
+        duplicate_action.setShortcut(QKeySequence("Ctrl+J"))
+        duplicate_action.setShortcutContext(Qt.WindowShortcut)
+        duplicate_action.triggered.connect(self.duplicate_layers)
+        flatten_action = QAction("Flatten selected layers", self)
+        flatten_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        flatten_action.setShortcutContext(Qt.WindowShortcut)
+        flatten_action.triggered.connect(self.flatten_layers)
+        raster_action = QAction("Rasterize vector layers", self)
+        raster_action.triggered.connect(self.rasterize_layers)
+        frame_action = QAction("New frame", self)
+        frame_action.setShortcut(QKeySequence("Shift+F"))
+        frame_action.setShortcutContext(Qt.WindowShortcut)
+        frame_action.triggered.connect(self.new_animation_frame)
         anim_action = QAction("Animation folder", self)
         anim_action.triggered.connect(self.mark_current_animation)
         target_action = QAction("Create warp target", self)
@@ -3469,7 +3615,23 @@ class MainWindow(QMainWindow):
         vector_action.triggered.connect(lambda: self.set_draw_mode("vector"))
         line_action = QAction("Line", self)
         line_action.triggered.connect(lambda: self.set_draw_mode("line"))
+        for action, ident in (
+            (pen_action, "pen"),
+            (paint_action, "paint"),
+            (eraser_action, "eraser"),
+            (vector_action, "vector"),
+            (line_action, "line"),
+            (target_action, "warp-target"),
+            (mask_action, "warp-mask"),
+        ):
+            shortcut = next(tool.shortcut for tool in TOOLS if tool.id == ident)
+            action.setShortcut(QKeySequence(shortcut))
+            action.setShortcutContext(Qt.WindowShortcut)
         layer_menu.addAction(fresh_action)
+        layer_menu.addAction(duplicate_action)
+        layer_menu.addAction(flatten_action)
+        layer_menu.addAction(raster_action)
+        layer_menu.addAction(frame_action)
         layer_menu.addAction(image_action)
         layer_menu.addAction(group_action)
         layer_menu.addAction(anim_action)
@@ -3598,11 +3760,22 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         wide, high = dialog.plate()
-        self.open_blank(wide, high)
+        try:
+            self.open_blank(
+                wide, high,
+                background=dialog.background(),
+                texture=dialog.texture_path() or None,
+                grid=dialog.wants_grid(),
+            )
+        except ValueError as exc:
+            self.status.showMessage(str(exc))
 
-    def open_blank(self, width, height):
+    def open_blank(self, width, height, background="#FFFFFF", texture=None, grid=False):
         """Open an unsaved plate. Fit view keeps a large preset on this screen."""
-        art = blank_picture(width, height, self._fresh_title(width, height))
+        art = blank_picture(
+            width, height, self._fresh_title(width, height),
+            background=background, texture=texture, grid=grid,
+        )
         self._stash(self._shown_index)
         index = self._begin_blank(art)
         project = self._projects[index]
@@ -3614,15 +3787,18 @@ class MainWindow(QMainWindow):
         self.show_file(art, restore=False)
         self._loading_index = -1
         self._finish_tab(index)
-        if art.layers:
-            self.picked.add(art.layers[0].id)
-            self._select_layer(art.layers[0].id)
+        ink = next((node for node in art.layers if node.name == "Ink"), None)
+        if ink is None and art.layers:
+            ink = art.layers[0]
+        if ink is not None:
+            self.picked.add(ink.id)
+            self._select_layer(ink.id)
         if getattr(self, "draw_bar", None) is not None:
             self.draw_bar.set_color("#FFFFFF")
-        self.status.showMessage(
-            "New picture %d×%d. Draw on Ink. Save blueprint writes the file."
-            % (art.width, art.height)
-        )
+        note = "New picture %d×%d. Draw on Ink." % (art.width, art.height)
+        if any(node.name == "2Kool Grid" for node in art.layers):
+            note += " The 2kool grid sits on top."
+        self.status.showMessage(note + " Save blueprint writes the file.")
 
     def _fresh_title(self, width, height):
         base = "Untitled %d×%d" % (int(width), int(height))
@@ -4708,7 +4884,7 @@ class MainWindow(QMainWindow):
             return False
         return bool(running)
 
-    def recomposite(self, notice=None):
+    def recomposite(self, notice=None, quiet=False):
         if not self.art:
             self._picture_generation += 1
             self.ink = 0
@@ -4722,10 +4898,12 @@ class MainWindow(QMainWindow):
             self._finish_picture(generation, self._build_picture(), "")
             return
         self._picture_pending = True
-        self.picture.set_busy(True, notice or PICTURE_WAIT)
+        self._picture_quiet = bool(quiet)
+        if not quiet:
+            self.picture.set_busy(True, notice or PICTURE_WAIT)
         if self._job_alive():
             return
-        self._start_picture_job()
+        self._start_picture_job(quiet)
 
     def _picture_request(self):
         """Focus, fit edge, and the hide/mute/solo copy for one picture build."""
@@ -4734,7 +4912,7 @@ class MainWindow(QMainWindow):
         self._preview_edge = edge
         flags = capture_flags(self.art.layers)
         showing = bool(preview_paint(self.art.layers, focus))
-        return focus, edge, flags, showing, self._kosv_frame()
+        return focus, edge, flags, showing, self._kosv_frame(), self._kosv_live_clock()
 
     def _kosv_frame(self):
         clip = getattr(self.art, "clip_time", None) or {}
@@ -4743,16 +4921,73 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return 0
 
+    def _kosv_live_clock(self):
+        """The grain clock. None keeps the grain locked to the playhead frame."""
+        timer = getattr(self, "_kosv_timer", None)
+        running = timer is not None and timer.isActive()
+        if not running and not getattr(self, "_kosv_force_live", False):
+            return None
+        return int(getattr(self, "_kosv_live", 0) or 0)
+
+    def _kosv_tick(self):
+        """About 12 fps. The plate under the stroke crawls. The pen does not wait."""
+        pages = getattr(self, "_pages", None)
+        split = getattr(self, "split", None)
+        if pages is not None and split is not None and pages.currentWidget() is not split:
+            return
+        if not self.isVisible():
+            return
+        if not self._kosv_live_needed():
+            timer = getattr(self, "_kosv_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+        picture = getattr(self, "picture", None)
+        if picture is not None and getattr(picture, "_under", None) is not None:
+            return
+        if self._job_alive() or getattr(self, "_picture_pending", False):
+            return
+        self._kosv_live = (int(getattr(self, "_kosv_live", 0) or 0) + 1) & 0xFFFF
+        self.recomposite(quiet=True)
+
+    def _kosv_live_needed(self):
+        from vmi_studio.kosv import has_live
+
+        return bool(self.art) and has_live(self.art.layers)
+
+    def _arm_kosv_live(self):
+        """Start the grain clock when a live effect is on the picture."""
+        timer = getattr(self, "_kosv_timer", None)
+        if timer is None or self._picture_sync():
+            return
+        if self._kosv_live_needed():
+            if not timer.isActive():
+                timer.start()
+        elif timer.isActive():
+            timer.stop()
+
+    def _onion_frame(self):
+        film = getattr(self, "film", None)
+        if film is not None:
+            return int(film.playhead)
+        return self._kosv_frame()
+
     def _build_picture(self):
-        focus, edge, flags, showing, frame = self._picture_request()
+        focus, edge, flags, showing, frame, live = self._picture_request()
         if not showing:
             return None
-        return composite_scene(
+        image = composite_scene(
             self.art.width, self.art.height, self.art.layers, focus,
-            max_edge=edge, flags=flags, frame=frame,
+            max_edge=edge, flags=flags, frame=frame, live=live,
         )
+        if image is not None and getattr(self, "_onion", False):
+            image = apply_onion(
+                image, self.art.width, self.art.height, self.art.layers,
+                self._onion_frame(), edge,
+            )
+        return image
 
-    def _start_picture_job(self):
+    def _start_picture_job(self, quiet=False):
         if getattr(self, "_hold_gate", False) and self._gate is not None:
             self._gate.hear("Painting the picture")
         if not self.art:
@@ -4761,15 +4996,18 @@ class MainWindow(QMainWindow):
             return
         self._picture_pending = False
         generation = self._picture_generation
-        focus, edge, flags, showing, frame = self._picture_request()
+        focus, edge, flags, showing, frame, live = self._picture_request()
+        onion = bool(getattr(self, "_onion", False))
         job = _PictureJob(
             generation, self.art.width, self.art.height, self.art.layers,
-            focus, edge, flags, showing, frame,
+            focus, edge, flags, showing, frame, live,
+            onion, self._onion_frame() if onion else 0,
         )
         job.ready.connect(self._finish_picture)
         job.finished.connect(lambda job=job: self._drop_picture_job(job))
         self._picture_job = job
-        self.picture.set_busy(True)
+        if not quiet:
+            self.picture.set_busy(True)
         job.start()
 
     def _drop_picture_job(self, job):
@@ -4808,7 +5046,9 @@ class MainWindow(QMainWindow):
         follow = self._picture_pending and self.art and not self._picture_sync()
         if follow:
             self._picture_pending = False
-            QTimer.singleShot(0, self._start_picture_job)
+            quiet = bool(getattr(self, "_picture_quiet", False))
+            self._picture_quiet = False
+            QTimer.singleShot(0, lambda quiet=quiet: self._start_picture_job(quiet))
         else:
             self.picture.set_busy(False)
             if getattr(self, "_hold_gate", False) and current:
@@ -5082,6 +5322,76 @@ class MainWindow(QMainWindow):
         self.select_only(node)
         self.status.showMessage("Inserted %s." % name)
 
+    def load_effect_plate(self, path=None):
+        """A picture, or the first frame of a video, under the current folder's stack."""
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return
+        current = self._current_node()
+        folder_id = current.id if current is not None and current.kind == "group" else None
+        if not path:
+            path, _selected = QFileDialog.getOpenFileName(
+                self,
+                "Load plate",
+                self._png_recent[0] if getattr(self, "_png_recent", None) else os.path.expanduser("~"),
+                "Pictures and video (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.mp4 *.mov *.m4v *.webm *.mkv *.avi)",
+            )
+        if not path:
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".mpg", ".mpeg"):
+            try:
+                still = self._video_still(path)
+            except Exception as exc:
+                self.status.showMessage(str(exc))
+                return
+            try:
+                self.insert_image(still)
+            finally:
+                try:
+                    os.remove(still)
+                except OSError:
+                    pass
+            self._keep_effect_folder(folder_id)
+            return
+        self.insert_image(path)
+        self._keep_effect_folder(folder_id)
+
+    def _keep_effect_folder(self, folder_id):
+        """The plate lands inside the folder. The effects column stays on that folder."""
+        if not folder_id or not self.art or find_node(self.art.layers, folder_id) is None:
+            return
+        self._select_layer(folder_id)
+
+    def _video_still(self, path):
+        """One PNG frame from a video. ffmpeg does the decode, off the audio thread."""
+        import subprocess
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError("Install ffmpeg to load a video plate.")
+        fd, dest = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-y", "-i", path, "-frames:v", "1", dest],
+                capture_output=True,
+                timeout=20,
+            )
+        except Exception:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+        if proc.returncode != 0 or not os.path.isfile(dest) or os.path.getsize(dest) < 32:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise RuntimeError("That video did not give a frame.")
+        return dest
+
     def _fetch_icloud(self, path):
         """Bring an iCloud-only file onto this Mac. A local file is unchanged."""
         from vmi_studio.icloud import ensure_local, is_evicted
@@ -5304,26 +5614,40 @@ class MainWindow(QMainWindow):
         self._spine = []
         self._live_stroke = False
 
-    def _ink_layer(self):
-        """The selected layer, or a new Ink layer in front. A warp layer is left alone."""
-        current = self._current_node()
-        if current is not None and current.kind == "layer" and getattr(current, "marker", "") not in ("target", "mask"):
-            return current
-        if not self.art:
+    def _paint_layer(self, node):
+        """A layer the pen can draw on. Folders and warp rows are not one."""
+        if node is None or node.kind != "layer":
             return None
-        name = fresh_name(list(walk(self.art.layers)), "Ink")
-        node = Node(_next_id(self.art.layers), name, "layer")
-        with self._edit("the ink layer"):
-            if current is not None and current.kind == "group":
-                current.children.append(node)
-            else:
-                self._draw_home().append(node)
-            refresh(self.art.layers)
-        reset_plate_cache()
-        self.model.set_layers(self.art.layers)
-        self.select_only(node)
-        self._save_session()
+        if getattr(node, "marker", "") in ("target", "mask"):
+            return None
         return node
+
+    def _ink_layer(self):
+        """The selected paint layer. A stroke never makes a layer."""
+        current = self._current_node()
+        if current is not None:
+            layer = self._paint_layer(current)
+            if layer is not None:
+                return layer
+            self.status.showMessage("Select a layer.")
+            return None
+        # A picture refresh clears the current row. The highlight is still the selection.
+        chosen = []
+        for ident in list(getattr(self, "picked", ()) or ()):
+            node = find_node(self.art.layers, ident) if self.art else None
+            layer = self._paint_layer(node)
+            if layer is not None:
+                chosen.append(layer)
+        if len(chosen) == 1:
+            return chosen[0]
+        self.status.showMessage("Select a layer.")
+        return None
+
+    def _hold_layer(self, node):
+        """Put the current row back on this layer after the list rebuilds."""
+        if node is None or not self.art or find_node(self.art.layers, node.id) is None:
+            return
+        self._select_layer(node.id)
 
     def _is_front_layer(self, node):
         visible = [
@@ -5370,7 +5694,7 @@ class MainWindow(QMainWindow):
         if not self._is_front_layer(node):
             self.picture.set_under(None)
             return
-        focus, edge, flags, showing, frame = self._picture_request()
+        focus, edge, flags, showing, frame, live = self._picture_request()
         row = flags.get(node.id)
         if row is not None:
             flags[node.id] = (False, row[1], row[2])
@@ -5378,7 +5702,7 @@ class MainWindow(QMainWindow):
         if showing:
             image = composite_scene(
                 self.art.width, self.art.height, self.art.layers, focus,
-                max_edge=edge, flags=flags, frame=frame,
+                max_edge=edge, flags=flags, frame=frame, live=live,
             )
         if image is None:
             width, height = self.picture._doc
@@ -5390,6 +5714,13 @@ class MainWindow(QMainWindow):
             self.picture.set_under(QPixmap.fromImage(blank))
             return
         self.picture.set_under(_pixmap(present(image).convert("RGBA")))
+
+    def _punches(self, mode):
+        """Eraser, or C, cuts alpha. C keeps the current tool selected."""
+        if mode == "eraser":
+            return True
+        bar = getattr(self, "draw_bar", None)
+        return bool(bar is not None and bar.clears() and mode in ("pen", "paint", "vector", "line"))
 
     def _ink_press(self, x, y, pressure):
         if not self.art:
@@ -5411,7 +5742,8 @@ class MainWindow(QMainWindow):
             self.picture._spine = [(float(x), float(y), radius)]
             self.picture.update()
             return
-        if mode == "eraser":
+        punch = self._punches(mode)
+        if punch:
             self._ink = MaskCanvas(self.art.width, self.art.height, node.raster)
             self._erase_under(node)
             preview = "layer" if self.picture._under is not None else "hide"
@@ -5420,7 +5752,7 @@ class MainWindow(QMainWindow):
             self.picture.set_under(None)
             preview = "over"
         soft = paint_softness(mode, brush.softness)
-        self._ink.stamp(x, y, brush, pressure, color, erase=(mode == "eraser"), softness=soft)
+        self._ink.stamp(x, y, brush, pressure, color, erase=punch, softness=soft)
         self._ink_last = (float(x), float(y), float(pressure))
         self._publish_ink(preview)
 
@@ -5462,7 +5794,7 @@ class MainWindow(QMainWindow):
         if not steps or abs(steps[-1][0] - float(x)) > 0.01 or abs(steps[-1][1] - float(y)) > 0.01:
             steps.append((float(x), float(y), float(pressure)))
         soft = paint_softness(mode, brush.softness)
-        erase = mode == "eraser"
+        erase = self._punches(mode)
         for sx, sy, sp in steps:
             self._ink.stamp(sx, sy, brush, sp, color, erase=erase, softness=soft)
         self._ink_last = (float(x), float(y), float(pressure))
@@ -5486,8 +5818,8 @@ class MainWindow(QMainWindow):
             if self.picture is not None:
                 self.picture.clear_live()
             return
-        soft = paint_softness(mode, self.draw_bar.brush.softness)
-        if mode == "eraser":
+        punch = self._punches(mode)
+        if punch:
             painted = canvas.raster()
             if painted is None and node.raster is None:
                 self._drop_ink()
@@ -5501,12 +5833,13 @@ class MainWindow(QMainWindow):
                 return
         with self._edit("the stroke"):
             node.raster = painted
-            if mode != "eraser":
+            if not punch:
                 node.color = node.color or self.draw_bar.color()
         self._ink = None
         self._ink_hold = True
         reset_plate_cache()
         self.model.set_layers(self.art.layers)
+        self._hold_layer(node)
         self.recomposite()
         self._save_session()
 
@@ -5520,27 +5853,32 @@ class MainWindow(QMainWindow):
         color = self.draw_bar.color()
         mode = "vector" if keep_spine else "line"
         soft = paint_softness(mode, brush.softness)
-        canvas = self._fresh_canvas()
+        punch = self._punches(mode)
+        canvas = MaskCanvas(self.art.width, self.art.height, node.raster) if punch else self._fresh_canvas()
 
         def spacing_at(pressure):
             return ink_spacing(brush.diameter_for(pressure), mode)
 
         for x, y, pressure in sample_stroke(points, spacing_at):
-            canvas.stamp(x, y, brush, pressure, color, softness=soft)
+            canvas.stamp(x, y, brush, pressure, color, erase=punch, softness=soft)
         if not canvas.changed:
             self._drop_ink()
             self.picture.clear_live()
             return
-        row = stroke_row(color, points, brush, soft)
+        row = None if punch else stroke_row(color, points, brush, soft)
         with self._edit("the vector stroke" if keep_spine else "the line"):
-            node.raster = raster_over(node.raster, canvas.raster())
-            if keep_spine:
-                node.strokes = list(getattr(node, "strokes", None) or []) + [row]
-            node.color = node.color or color
+            if punch:
+                node.raster = canvas.raster()
+            else:
+                node.raster = raster_over(node.raster, canvas.raster())
+                if keep_spine:
+                    node.strokes = list(getattr(node, "strokes", None) or []) + [row]
+                node.color = node.color or color
         self._drop_ink()
         self._ink_hold = True
         reset_plate_cache()
         self.model.set_layers(self.art.layers)
+        self._hold_layer(node)
         self.recomposite()
         self._save_session()
 
@@ -5769,6 +6107,9 @@ class MainWindow(QMainWindow):
     def _film_scrubbed(self, frame):
         """The ruler or the line moved. The picture follows. This is not an edit."""
         self._stamp_playhead(frame)
+        bar = getattr(self, "effect_bar", None)
+        if bar is not None:
+            bar.show_frame(frame)
         sheet = getattr(self, "xsheet", None)
         if sheet is not None:
             sheet.set_playhead(frame)
@@ -5894,8 +6235,38 @@ class MainWindow(QMainWindow):
             self._export_side = "objects"
         self._show_slots()
 
+    def _png_nodes(self):
+        """The selected layers and groups. One PNG each."""
+        node = self._current_node()
+        if node is None or node.kind not in ("layer", "group"):
+            return []
+        chosen = []
+        for ident in getattr(self, "picked", ()):
+            found = find_node(self.art.layers, ident)
+            if found is not None and found.kind in ("layer", "group"):
+                chosen.append(found)
+        if len(chosen) > 1 and any(item.id == node.id for item in chosen):
+            return chosen
+        return [node]
+
+    def _png_target(self, node):
+        """(name, image or None, reason) for one layer or one group."""
+        if node is None:
+            return "", None, "Select a layer or a group."
+        if node.kind == "group":
+            image = composite_scene(
+                self.art.width, self.art.height, [node], flags=capture_flags([node]),
+            )
+        elif node.kind == "layer" and node.visible and not getattr(node, "omit", False):
+            image = composite_image(self.art.width, self.art.height, [node])
+        else:
+            image = None
+        if image is None:
+            return getattr(node, "name", ""), None, "Nothing visible to export."
+        return node.name, image, ""
+
     def _png_subject(self):
-        """(name, image or None, reason) for the folder or object Shift+E writes."""
+        """(name, image or None, reason) for the layer, group, or object Shift+E writes."""
         if not self.art:
             return "", None, "Open a drawing first."
         if self._export_side == "objects":
@@ -5916,35 +6287,34 @@ class MainWindow(QMainWindow):
             if image is None:
                 return obj.name, None, "%s has nothing to export." % obj.name
             return obj.name, image, ""
-        node = self._current_node()
-        if node is None:
-            return "", None, "Select a folder or an object."
-        if node.kind == "group":
-            folder = node
-        else:
-            folder = parent_of(self.art.layers, node.id)
-        if folder is None:
-            if node.kind != "layer" or not node.visible or node.omit:
-                return node.name, None, "Nothing visible to export."
-            image = composite_image(self.art.width, self.art.height, [node])
-            if image is None:
-                return node.name, None, "Nothing visible to export."
-            return node.name, image, ""
-        flags = {item.id: (bool(item.visible), False, False) for item in walk([folder])}
-        image = composite_scene(self.art.width, self.art.height, [folder], flags=flags)
-        if image is None:
-            return folder.name, None, "Nothing visible to export."
-        return folder.name, image, ""
+        return self._png_target(self._current_node())
 
     def export_png(self):
         if not self.art:
             self.status.showMessage("Open a drawing first.")
             return
         start = self._export_dialog_start()
-        dialog = self._png_dialog("Export PNG", start, "Writes one PNG of the selected folder or object.")
+        targets = None
+        if self._export_side == "objects":
+            note = "Writes one PNG of the selected object."
+        else:
+            targets = self._png_nodes()
+            if not targets:
+                self.status.showMessage("Select a layer or a group.")
+                return
+            note = "Writes one PNG of each selected layer or group."
+        dialog = self._png_dialog("Export PNG", start, note)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.push_png(dialog.values())
+        if targets is None:
+            self.push_png(dialog.values())
+            return
+        wrote = 0
+        for node in targets:
+            if self.push_png(dialog.values(), target=self._png_target(node), ask=True):
+                wrote += 1
+        if wrote > 1:
+            self.status.showMessage("Wrote %d PNGs." % wrote)
 
     def push_png(self, values, target=None, ask=True):
         """Write one PNG. Tests pass ask=False so this never opens a question box."""
@@ -6198,6 +6568,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage("%s has no KOSV effects." % node.name)
         self.tree.viewport().update()
         self._sync_effect_bar()
+        self._arm_kosv_live()
         self.recomposite()
         self._save_session()
 
@@ -6205,7 +6576,11 @@ class MainWindow(QMainWindow):
         bar = getattr(self, "effect_bar", None)
         if bar is None:
             return
+        film = getattr(self, "film", None)
+        if film is not None:
+            bar._frame = int(film.playhead)
         bar.bind(self._current_layer() if self.art else None)
+        self._arm_kosv_live()
 
     def _effect_bar_edit(self):
         if self._effect_before is None and self.art:
@@ -6218,6 +6593,7 @@ class MainWindow(QMainWindow):
             return
         if before is not None:
             self.history.remember(self, "the KOSV effects", before)
+        self._arm_kosv_live()
         self.recomposite()
 
     def toggle_pick(self, node):
@@ -6232,6 +6608,11 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         kind = event.type()
+        if kind == QEvent.Type.WindowDeactivate and watched is self:
+            picture = getattr(self, "picture", None)
+            if picture is not None and picture._space:
+                picture._space = False
+                picture._cursor()
         if kind == QEvent.Type.FileOpen:
             path = event.file()
             if path:
@@ -6245,7 +6626,12 @@ class MainWindow(QMainWindow):
         ) and self.isVisible():
             if self._take_fingers(event):
                 return True
+        if kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) and self.isVisible():
+            if self._space_key(event, kind):
+                return True
         if kind == QEvent.Type.KeyPress and self.isVisible():
+            if self._view_key(event):
+                return True
             if self._save_key(event):
                 return True
             if not self._text_focus() and self._history_key(event):
@@ -6258,8 +6644,13 @@ class MainWindow(QMainWindow):
                 return True
             if not self._text_focus() and self._cut_key(event):
                 return True
+            if self._studio_key(event, watched):
+                return True
             if self._transport_key(event, watched):
                 return True
+        if kind == QEvent.Type.ShortcutOverride and self.isVisible() and self._studio_claims(event):
+            event.accept()
+            return True
         return super().eventFilter(watched, event)
 
     def _under(self, watched, target):
@@ -6335,6 +6726,18 @@ class MainWindow(QMainWindow):
         transport = getattr(self, "transport", None)
         if transport is not None:
             transport.set_looping(self._loop)
+
+    def _toggle_onion(self):
+        self._set_onion(not getattr(self, "_onion", False), refresh=True)
+
+    def _set_onion(self, on, refresh=False):
+        """Onion skin is a view. Turning it on does not recolor the file."""
+        self._onion = bool(on)
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            transport.set_onion(self._onion)
+        if refresh:
+            self.recomposite()
 
     def _toggle_play(self):
         if self._playing:
@@ -6462,9 +6865,19 @@ class MainWindow(QMainWindow):
     def _after_history(self):
         if not self.art:
             return
+        focus = None
+        current = self._current_node()
+        if current is not None:
+            focus = current.id
         self.picked = {ident for ident in self.picked if find_node(self.art.layers, ident)}
+        if focus and find_node(self.art.layers, focus) is None:
+            focus = None
+        if focus is None and len(self.picked) == 1:
+            focus = next(iter(self.picked))
         reset_plate_cache()
         self.model.set_layers(self.art.layers)
+        if focus:
+            self._select_layer(focus)
         self._show_playlist()
         self._fill_objects(keep=True)
         self._refresh_timeline()
@@ -6515,7 +6928,10 @@ class MainWindow(QMainWindow):
         if self._cut_key(event):
             event.accept()
             return
-        if not self._text_focus() and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
+        if self._view_key(event):
+            event.accept()
+            return
+        if not self._text_focus() and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)):
             if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
                 self.picture.zoom_by(ZOOM_STEP)
                 event.accept()
@@ -6525,6 +6941,46 @@ class MainWindow(QMainWindow):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def _space_key(self, event, kind):
+        """Space arms pan, rotate, and zoom. A text field still takes the key."""
+        if event.key() != Qt.Key_Space:
+            return False
+        if self._text_focus() or QApplication.activeModalWidget() is not None or not self.isActiveWindow():
+            return False
+        picture = getattr(self, "picture", None)
+        if picture is None:
+            return False
+        if event.isAutoRepeat():
+            return True
+        picture._space = kind == QEvent.Type.KeyPress
+        picture._cursor()
+        return True
+
+    def _view_key(self, event):
+        """Shift+R resets. Shift+= zooms in. Shift+− zooms out."""
+        if event.isAutoRepeat() or QApplication.activeModalWidget() is not None or self._text_focus():
+            return False
+        mods = event.modifiers()
+        if not (mods & Qt.ShiftModifier):
+            return False
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+        picture = getattr(self, "picture", None)
+        if picture is None:
+            return False
+        key = event.key()
+        if key == Qt.Key_R:
+            picture.set_fit(True)
+            self.status.showMessage("View reset.")
+            return True
+        if key in (Qt.Key_Equal, Qt.Key_Plus):
+            picture.zoom_by(ZOOM_STEP)
+            return True
+        if key == Qt.Key_Minus:
+            picture.zoom_by(1.0 / ZOOM_STEP)
+            return True
+        return False
 
     def _cut_bar(self):
         bar = QWidget()
@@ -6556,9 +7012,9 @@ class MainWindow(QMainWindow):
         self.picture._hover = None
         self.picture.update()
         for key, button in self.cut_tools.items():
-            button.setObjectName("cutOn" if key == name else "")
-            button.style().unpolish(button)
-            button.style().polish(button)
+            on = key == name
+            button.setObjectName("cutOn" if on else "")
+            show_toggle(button, on)
         if name == "poly":
             self.status.showMessage("Polygon: click each corner. Enter or double-click closes it.")
         elif name == "lasso":
@@ -6689,7 +7145,90 @@ class MainWindow(QMainWindow):
 
     def _text_focus(self):
         widget = QApplication.focusWidget()
-        return isinstance(widget, (QLineEdit, QSpinBox, QPlainTextEdit))
+        return isinstance(widget, (QLineEdit, QAbstractSpinBox, QPlainTextEdit))
+
+    def _tool_keys(self):
+        """Plain letter to tool id. The tooltip and the Layer menu use the same letter."""
+        mapped = getattr(self, "_tool_key_map", None)
+        if mapped is None:
+            mapped = {}
+            for tool in TOOLS:
+                letter = (tool.shortcut or "").upper()
+                if len(letter) == 1 and "A" <= letter <= "Z":
+                    mapped[getattr(Qt, "Key_" + letter)] = tool.id
+            self._tool_key_map = mapped
+        return mapped
+
+    def _studio_claims(self, event):
+        """Keys the draw bar and the timeline own, so a menu shortcut does not run them twice."""
+        if self._text_focus() and not self._key_setting_ok(event):
+            return False
+        key = event.key()
+        mods = event.modifiers()
+        shift = bool(mods & Qt.ShiftModifier)
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+        if key in (Qt.Key_BracketLeft, Qt.Key_BracketRight, Qt.Key_X):
+            return not shift
+        if key == Qt.Key_C:
+            return True
+        if key in self._tool_keys() and not shift:
+            return True
+        if key in (Qt.Key_F, Qt.Key_V, Qt.Key_I):
+            return shift
+        return False
+
+    def _key_setting_ok(self, event):
+        """Shift+I may land on an effect spin. A text field still keeps the key."""
+        widget = QApplication.focusWidget()
+        if isinstance(widget, (QLineEdit, QPlainTextEdit)):
+            return False
+        mods = event.modifiers()
+        if mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+        return event.key() == Qt.Key_I and bool(mods & Qt.ShiftModifier)
+
+    def _studio_key(self, event, watched=None):
+        """Brush size, the two inks, and the timeline keys. Text fields keep their letters."""
+        if QApplication.activeModalWidget() is not None:
+            return False
+        if isinstance(watched, (QLineEdit, QPlainTextEdit)):
+            return False
+        if not self._studio_claims(event):
+            return False
+        if event.isAutoRepeat() and event.key() not in (Qt.Key_BracketLeft, Qt.Key_BracketRight):
+            return False
+        key = event.key()
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+        bar = getattr(self, "draw_bar", None)
+        if key == Qt.Key_BracketLeft and bar is not None:
+            bar.nudge_size(-10 if shift else -1)
+            return True
+        if key == Qt.Key_BracketRight and bar is not None:
+            bar.nudge_size(10 if shift else 1)
+            return True
+        if key == Qt.Key_X and bar is not None:
+            bar.swap_colors()
+            return True
+        if key == Qt.Key_C and not shift and bar is not None:
+            bar.toggle_clear()
+            return True
+        if not shift and key in self._tool_keys():
+            self.set_draw_mode(self._tool_keys()[key])
+            return True
+        if key == Qt.Key_C and shift:
+            self.copy_frames()
+            return True
+        if key == Qt.Key_V and shift:
+            self.paste_frames()
+            return True
+        if key == Qt.Key_F and shift:
+            self.new_animation_frame()
+            return True
+        if key == Qt.Key_I and shift:
+            self.key_effect_param()
+            return True
+        return False
 
     def _focus_id(self):
         index = self.tree.currentIndex()
@@ -6755,6 +7294,311 @@ class MainWindow(QMainWindow):
         self._save_session()
         count = len(ids)
         self.status.showMessage("Grouped %d layer%s." % (count, "" if count == 1 else "s"))
+
+    def _paint_picks(self):
+        """Selected paint layers. Warp rows stay out of flatten and duplicate."""
+        found = []
+        if not self.art:
+            return found
+        for ident in list(self.picked):
+            node = find_node(self.art.layers, ident)
+            if node is None or node.kind != "layer":
+                continue
+            if getattr(node, "marker", "") in ("target", "mask"):
+                continue
+            found.append(node)
+        if not found:
+            current = self._current_node()
+            if current is not None and current.kind == "layer" and getattr(current, "marker", "") not in ("target", "mask"):
+                found.append(current)
+        return found
+
+    def _clone_layer(self, node):
+        raster = None
+        if node.raster is not None:
+            source = node.raster
+            raster = Raster(source.x, source.y, source.w, source.h, bytes(source.rgba))
+        name = fresh_name(list(walk(self.art.layers)), node.name or "Layer")
+        clone = Node(_next_id(self.art.layers), name, "layer", raster=raster)
+        clone.opacity = node.opacity
+        clone.blend = node.blend
+        clone.clip = node.clip
+        clone.color = node.color or ""
+        clone.visible = node.visible
+        clone.outline = bool(getattr(node, "outline", False))
+        clone.outline_px = getattr(node, "outline_px", 0.0)
+        clone.outline_rgb = tuple(getattr(node, "outline_rgb", (0, 0, 0)))
+        clone.strokes = copy.deepcopy(getattr(node, "strokes", None) or [])
+        clone.vectors = copy.deepcopy(getattr(node, "vectors", None) or [])
+        clone.effects = copy.deepcopy(getattr(node, "effects", None) or [])
+        return clone
+
+    def duplicate_layers(self):
+        """A copy in front of each selected paint layer. New pixels, new id."""
+        if not self.art:
+            return
+        nodes = self._paint_picks()
+        if not nodes:
+            self.status.showMessage("Select a layer.")
+            return
+        made = []
+        with self._edit("the duplicate"):
+            for node in nodes:
+                clone = self._clone_layer(node)
+                parent = parent_of(self.art.layers, node.id)
+                home = self.art.layers if parent is None else parent.children
+                index = next((i for i, item in enumerate(home) if item is node), None)
+                if index is None:
+                    home.append(clone)
+                else:
+                    home.insert(index + 1, clone)
+                made.append(clone)
+            refresh(self.art.layers)
+            self.model.set_layers(self.art.layers)
+        if made:
+            self.select_only(made[-1])
+        self.recomposite()
+        self.status.showMessage("Duplicated %d layer%s." % (len(made), "" if len(made) == 1 else "s"))
+
+    def flatten_layers(self):
+        """Merge the selected paint layers into the front one. Warp rows stay."""
+        if not self.art:
+            return
+        chosen = [node for node in walk(self.art.layers) if node in self._paint_picks()]
+        if len(chosen) < 2:
+            self.status.showMessage("Select paint layers to flatten.")
+            return
+        merged = None
+        for node in chosen:
+            merged = raster_over(merged, node.raster)
+        keep = chosen[-1]
+        with self._edit("the flatten"):
+            keep.raster = merged
+            keep.strokes = []
+            result = remove_nodes(self.art.layers, [node.id for node in chosen[:-1]])
+            if result:
+                self.art.layers = result[0]
+            refresh(self.art.layers)
+            self.model.set_layers(self.art.layers)
+        self.select_only(keep)
+        self.recomposite()
+        self.status.showMessage("Flattened %d layers." % len(chosen))
+
+    def rasterize_layers(self):
+        """Keep the pixels and drop the vector spine."""
+        if not self.art:
+            return
+        nodes = [node for node in self._paint_picks() if getattr(node, "strokes", None)]
+        if not nodes:
+            self.status.showMessage("Already pixels.")
+            return
+        with self._edit("the rasterize"):
+            for node in nodes:
+                node.strokes = []
+            self.model.set_layers(self.art.layers)
+        self.recomposite()
+        self.status.showMessage("Rasterized %d layer%s." % (len(nodes), "" if len(nodes) == 1 else "s"))
+
+    def _playhead_frame(self):
+        film = getattr(self, "film", None)
+        if film is None:
+            return 0
+        return int(film.playhead)
+
+    def _animation_folder(self):
+        if not self.art:
+            return None
+        node = self._current_node()
+        if node is None:
+            return None
+        return owning_animation(self.art.layers, node.id)
+
+    def _snapshot_layer(self, node):
+        raster = None
+        if node.raster is not None:
+            source = node.raster
+            raster = (source.x, source.y, source.w, source.h, bytes(source.rgba))
+        return {
+            "name": node.name or "Layer",
+            "color": node.color or "",
+            "raster": raster,
+            "strokes": copy.deepcopy(getattr(node, "strokes", None) or []),
+        }
+
+    def _layer_from_snapshot(self, snap):
+        raster = None
+        packed = snap.get("raster")
+        if packed:
+            raster = Raster(packed[0], packed[1], packed[2], packed[3], bytes(packed[4]))
+        name = fresh_name(list(walk(self.art.layers)), snap.get("name") or "Layer")
+        node = Node(_next_id(self.art.layers), name, "layer", raster=raster)
+        node.color = snap.get("color") or ""
+        node.strokes = copy.deepcopy(snap.get("strokes") or [])
+        return node
+
+    def _write_frames(self, folder, frames, ids):
+        order = sorted(zip(frames, ids), key=lambda item: (item[0], item[1]))
+        folder.frames = [int(frame) for frame, _ident in order]
+        folder.timeline = [ident for _frame, ident in order]
+
+    def _ensure_animation(self):
+        """The folder this layer already belongs to, or a new one around it.
+
+        Paper stays put when Ink is the selection. A folder that is already
+        an animation is not wrapped again.
+        """
+        node = self._current_node()
+        if node is None:
+            return None
+        folder = owning_animation(self.art.layers, node.id)
+        if folder is not None:
+            return folder
+        if node.kind == "group":
+            return set_animation(self.art.layers, node.id, True)
+        if node.kind != "layer" or getattr(node, "marker", "") in ("target", "mask"):
+            return None
+        layers, focus = new_folder(self.art.layers, None, [node.id])
+        self.art.layers = layers
+        folder = find_node(self.art.layers, focus)
+        if folder is None:
+            return None
+        folder.name = fresh_name(list(walk(self.art.layers)), "Animation")
+        return set_animation(self.art.layers, folder.id, True)
+
+    def new_animation_frame(self):
+        """Shift+F. An animation folder, then an empty frame after this drawing.
+
+        Onion skin turns on. Past frames read purple and future frames read
+        green, on the picture only.
+        """
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return None
+        node = self._current_node()
+        if node is None:
+            self.status.showMessage("Select a layer.")
+            return None
+        if owning_animation(self.art.layers, node.id) is None:
+            if node.kind != "group" and (
+                node.kind != "layer" or getattr(node, "marker", "") in ("target", "mask")
+            ):
+                self.status.showMessage("Select a layer.")
+                return None
+        playhead = self._playhead_frame()
+        cel = None
+        target = playhead
+        with self._edit("the frame"):
+            folder = self._ensure_animation()
+            if folder is None:
+                self.status.showMessage("Select a layer.")
+                return None
+            pairs = frame_map(folder)
+            frames = [int(frame) for frame, _item in pairs]
+            ids = [item.id for _frame, item in pairs]
+            target, frames = next_frame_slot(frames, playhead)
+            cel = Node(_next_id(self.art.layers), fresh_name(list(walk(self.art.layers)), "1"), "layer")
+            folder.children.append(cel)
+            frames.append(target)
+            ids.append(cel.id)
+            self._write_frames(folder, frames, ids)
+            folder.show_frame = int(target)
+            refresh(self.art.layers)
+            self.model.set_layers(self.art.layers)
+            self._sync_animations()
+        if cel is None:
+            self.status.showMessage("Select a layer.")
+            return None
+        self._set_onion(True)
+        film = getattr(self, "film", None)
+        if film is not None:
+            film.set_playhead(int(target))
+        self._stamp_playhead(int(target))
+        bar = getattr(self, "effect_bar", None)
+        if bar is not None:
+            bar.show_frame(int(target))
+        self.select_only(cel)
+        self._sync_film()
+        self.recomposite()
+        self.status.showMessage("Frame %d. Onion skin on." % int(target))
+        return cel
+
+    def copy_frames(self):
+        """Shift+C. Selected cels, in timeline order."""
+        folder = self._animation_folder()
+        if folder is None:
+            self.status.showMessage("Select a layer in an animation.")
+            return
+        chosen = []
+        for frame, cel in frame_map(folder):
+            if cel.id in self.picked:
+                chosen.append((int(frame), cel))
+        if not chosen:
+            node = self._current_node()
+            cel = cel_of(folder, node.id) if node is not None else None
+            if cel is not None:
+                for frame, item in frame_map(folder):
+                    if item.id == cel.id:
+                        chosen.append((int(frame), item))
+                        break
+        if not chosen:
+            self.status.showMessage("Select frames to copy.")
+            return
+        origin = chosen[0][0]
+        self._frame_clip = [
+            {"offset": int(frame) - origin, **self._snapshot_layer(cel)}
+            for frame, cel in chosen
+        ]
+        self.status.showMessage("Copied %d frame%s." % (len(chosen), "" if len(chosen) == 1 else "s"))
+
+    def paste_frames(self):
+        """Shift+V. New layers at the playhead. They do not share the copied ids."""
+        clip = getattr(self, "_frame_clip", None) or []
+        folder = self._animation_folder()
+        if folder is None or not clip:
+            self.status.showMessage("Copy frames, then select a layer in an animation.")
+            return
+        playhead = self._playhead_frame()
+        made = []
+        with self._edit("the paste"):
+            pairs = frame_map(folder)
+            frames = [int(frame) for frame, _cel in pairs]
+            ids = [item.id for _frame, item in pairs]
+            added = set()
+            for snap in sorted(clip, key=lambda item: int(item.get("offset") or 0)):
+                cel = self._layer_from_snapshot(snap)
+                folder.children.append(cel)
+                frame = playhead + int(snap.get("offset") or 0)
+                frames = [
+                    value + 1 if value >= frame and ident not in added else value
+                    for value, ident in zip(frames, ids)
+                ]
+                frames.append(frame)
+                ids.append(cel.id)
+                added.add(cel.id)
+                made.append(cel)
+            self._write_frames(folder, frames, ids)
+            folder.show_frame = playhead
+            refresh(self.art.layers)
+            self.model.set_layers(self.art.layers)
+            self._sync_animations()
+        if made:
+            self.select_only(made[0])
+        film = getattr(self, "film", None)
+        if film is not None:
+            film.set_playhead(playhead)
+        self._stamp_playhead(playhead)
+        self._sync_film()
+        self.recomposite()
+        self.status.showMessage("Pasted %d frame%s." % (len(made), "" if len(made) == 1 else "s"))
+
+    def key_effect_param(self):
+        """Shift+I. The focused effect setting, or the last one, at the playhead."""
+        bar = getattr(self, "effect_bar", None)
+        frame = self._playhead_frame()
+        if bar is None or not bar.insert_key(frame):
+            self.status.showMessage("No effect setting to key.")
+            return
+        self.status.showMessage("Keyed at frame %d." % frame)
 
     def rename_layer(self, ident, name):
         if not self.art:

@@ -1,8 +1,8 @@
-"""Picture navigation, the same gestures KOOLDRAW uses.
+"""Picture navigation.
 
-Scroll zooms. Space+drag and the middle button pan. Shift+drag rotates a
-mouse (a pen still picks the layer under it). Pinch zooms and twists.
-+ and - step by 1.25, the same amount as the KOOLDRAW zoom buttons.
+Scroll zooms. Space+drag and the middle button pan. Shift+Space+drag
+rotates around the center of the view. Ctrl+Space+drag zooms. A pen and a
+mouse use the same chords. Pinch zooms and twists. + and - step by 1.25.
 """
 
 import math
@@ -62,19 +62,47 @@ def format_zoom(value):
 def gesture(button, space=False, shift=False, alt=False, ctrl=False, meta=False, pointer="mouse"):
     """What a press does. button is 0 left, 1 middle, 2 right.
 
-    Right-click, Ctrl, and Meta are left alone (on a Mac, Ctrl-click is a
-    right-click). Space or the middle button pans. Shift rotates a mouse.
-    A pen never rotates. The left button picks the layer under the cursor.
+    Right-click and Command stay free. Space pans. Shift+Space rotates.
+    Ctrl+Space zooms. The middle button pans. A pen uses the same chords
+    as a mouse. The left button picks the layer under the cursor.
     """
-    if button == 2 or ctrl or meta:
+    del alt, pointer
+    if button == 2 or meta:
         return "none"
-    if space or button == 1:
-        return "pan"
-    if shift and not alt and pointer == "mouse" and button == 0:
+    if space and ctrl and button == 0:
+        return "zoom"
+    if space and shift and button == 0:
         return "rotate"
+    if (space and button == 0) or button == 1:
+        return "pan"
+    if ctrl:
+        return "none"
     if button == 0:
         return "pick"
     return "none"
+
+
+def orbit_pan(pan_x, pan_y, degrees):
+    """Turn the pan around the view center by the same angle as the picture.
+
+    Painter.rotate is clockwise on screen. The pan vector uses that matrix,
+    so the image point under the middle of the view stays put.
+    """
+    rad = math.radians(float(degrees))
+    cos = math.cos(rad)
+    sin = math.sin(rad)
+    return (cos * float(pan_x) - sin * float(pan_y), sin * float(pan_x) + cos * float(pan_y))
+
+
+def zoom_drag_factor(delta_y):
+    """Ctrl+Space drag. Moving the pointer up zooms in."""
+    try:
+        dy = float(delta_y)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(dy) or dy == 0:
+        return 1.0
+    return math.exp(-dy * 0.008)
 
 
 def view_to_image(vx, vy, view_w, view_h, image_w, image_h, scale, pan_x, pan_y, rotation):

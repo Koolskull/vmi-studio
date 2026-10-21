@@ -74,10 +74,23 @@ _FILTERS = ("none", "sub", "up", "average", "paeth")
 _ORDERS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
 _REFS = ("plate", "shape", "clip", "matte", "other")
 
+# These change with the live clock. A held playhead still crawls.
+LIVE_IDS = frozenset({
+    "filmic-noise",
+    "film-grain",
+    "jiggle",
+    "vhs",
+    "jpeg-glitch",
+    "png-glitch",
+})
+
 # Factory stacks. Names are ours. Each entry is effect id, then param overrides.
 STACKS = {
     "lens": (("fisheye", {"amount": 0.45, "spread": 0.06}), ("lens", {"blur": 8})),
-    "stock": (("filmic-noise", {"amount": 0.2}), ("film-grain", {"amount": 0.45})),
+    "stock": (
+        ("filmic-noise", {"amount": 0.35, "chroma": 0.55, "size": 2}),
+        ("film-grain", {"amount": 0.4, "size": 3}),
+    ),
     "tape": (("vhs", {}), ("jiggle", {"amplitude": 0.015})),
     "melt": (("datamosh", {"gain": 1.2, "block": 16}),),
     "break": (("jpeg-glitch", {"quality": 12}), ("png-glitch", {"rows": 24})),
@@ -88,6 +101,21 @@ STACKS = {
 def plate_size(later=False):
     """Working plate, or the later 4K plate."""
     return LATER_PLATE if later else PLATE
+
+
+def has_live(nodes):
+    """True when a layer or a folder carries a frame-seeded effect."""
+    for node in nodes or []:
+        for effect in getattr(node, "effects", None) or []:
+            if (
+                isinstance(effect, dict)
+                and effect.get("enabled", True)
+                and effect.get("id") in LIVE_IDS
+            ):
+                return True
+        if has_live(getattr(node, "children", None)):
+            return True
+    return False
 
 
 def effect_ids():
@@ -215,11 +243,15 @@ def clean_kosv(raw):
     }
 
 
-def apply_effects(image, effects, frame=0, maps=None):
+def apply_effects(image, effects, frame=0, maps=None, live=None):
     """Run an effect stack. The source image is not modified.
 
     maps may hold 'plate', 'shape', 'clip', 'matte', 'other' as PIL images,
     plus 'frames', 'marks', and 'index' for datamosh.
+    frame is the playhead. Keyed settings hold on that number.
+    live is the grain clock. Noise, grain, jiggle, VHS, and the glitches
+    follow it, so a held drawing still crawls. Omit live and the playhead
+    seeds them, which is what an export frame wants.
     """
     effects = [row for row in clean_effects(effects) if row.get("enabled", True)]
     if image is None or not effects:
@@ -228,12 +260,13 @@ def apply_effects(image, effects, frame=0, maps=None):
     arr = np.asarray(base).astype(np.float32)
     maps = maps or {}
     frame = int(frame or 0)
+    clock = frame if live is None else int(live)
     for effect in effects:
-        arr = _run(effect, arr, frame, maps)
+        arr = _run(effect, arr, frame, maps, clock)
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGBA")
 
 
-def _run(effect, arr, frame, maps):
+def _run(effect, arr, frame, maps, clock):
     ident = effect["id"]
     got = lambda name, default=None: _at(effect, name, frame, default)
     if ident == "fisheye":
@@ -241,9 +274,9 @@ def _run(effect, arr, frame, maps):
     if ident == "lens":
         return _lens(arr, effect, frame, maps.get("shape"))
     if ident == "filmic-noise":
-        return _noise(arr, got("amount"), got("chroma"), got("size"), got("seed"), frame, fine=True)
+        return _filmic(arr, got("amount"), got("chroma"), got("size"), got("seed"), clock)
     if ident == "film-grain":
-        return _noise(arr, got("amount"), 0.0, got("size"), got("seed"), frame, fine=False, shadow=got("shadow"))
+        return _noise(arr, got("amount"), got("size"), got("seed"), clock, shadow=got("shadow"))
     if ident == "grain-plate":
         return _grain_plate(arr, maps.get("plate"), got("amount"), got("scale"), got("mix"))
     if ident == "texture-clip":
@@ -251,17 +284,17 @@ def _run(effect, arr, frame, maps):
     if ident == "luma-transition":
         return _luma(arr, maps.get("other"), maps.get("matte"), got("softness"), got("invert") >= 0.5)
     if ident == "jiggle":
-        return _jiggle(arr, got("amplitude"), got("scanline"), got("seed"), frame)
+        return _jiggle(arr, got("amplitude"), got("scanline"), got("seed"), clock)
     if ident == "vhs":
-        return _vhs(arr, effect, frame)
+        return _vhs(arr, effect, frame, clock)
     if ident == "datamosh":
         return _datamosh(arr, maps, got("gain"), got("block"))
     if ident == "color-glow":
         return _glow(arr, effect, frame)
     if ident == "jpeg-glitch":
-        return _jpeg(arr, got("quality"), got("block"), got("cutoff"), got("order"), got("seed"), frame)
+        return _jpeg(arr, got("quality"), got("block"), got("cutoff"), got("order"), got("seed"), clock)
     if ident == "png-glitch":
-        return _png(arr, int(round(got("filter"))), got("rows"), got("seed"), frame)
+        return _png(arr, int(round(got("filter"))), got("rows"), got("seed"), clock)
     return arr
 
 
@@ -432,27 +465,104 @@ def _rng(seed, frame):
     return np.random.default_rng((int(seed) + int(frame) * 997) & 0xFFFFFFFF)
 
 
-def _noise(arr, amount, chroma, size, seed, frame, fine, shadow=0.0):
+def _box_1d(field, radius):
+    """A box along axis 0. The caller transposes for the other axis."""
+    radius = int(radius)
+    padded = np.pad(field, ((radius, radius), (0, 0)), mode="edge")
+    integral = np.empty((padded.shape[0] + 1, padded.shape[1]), np.float32)
+    integral[0] = 0
+    np.cumsum(padded, axis=0, out=integral[1:])
+    span = 2 * radius + 1
+    return (integral[span:] - integral[:-span]) / float(span)
+
+
+def _soften(small):
+    """Blur a small grain grid, then put its contrast back."""
+    if small.shape[0] < 3 or small.shape[1] < 3:
+        return small
+    soft = _box_1d(_box_1d(small, 1).T, 1).T
+    std = float(soft.std())
+    if std > 1e-5:
+        soft = soft / std
+    return soft
+
+
+def _dye_clouds(rng, height, width, cell):
+    """Color stock dye clouds. Wider than the silver, and they carry no luma."""
+    cell = max(1, int(cell))
+    gh = max(1, (height + cell - 1) // cell)
+    gw = max(1, (width + cell - 1) // cell)
+    dye = rng.standard_normal((gh, gw, 3)).astype(np.float32)
+    if cell > 1:
+        for channel in range(3):
+            dye[..., channel] = _soften(dye[..., channel])
+    dye -= dye.mean(axis=2, keepdims=True)
+    return np.repeat(np.repeat(dye, cell, axis=0), cell, axis=1)[:height, :width]
+
+
+def _cell_mean(luma, cell, rows, cols):
+    """Mean luma of each grain clump. The response curve stays on that grid."""
+    cell = max(1, int(cell))
+    height, width = luma.shape
+    hh = rows * cell
+    ww = cols * cell
+    if hh != height or ww != width:
+        luma = np.pad(
+            luma,
+            ((0, max(0, hh - height)), (0, max(0, ww - width))),
+            mode="edge",
+        )[:hh, :ww]
+    return luma.reshape(rows, cell, cols, cell).mean(axis=(1, 3))
+
+
+def _filmic(arr, amount, chroma, size, seed, frame):
+    """Fine silver grain and coarser dye clouds.
+
+    The grain is strongest through the midtones, lighter in the shadows, and
+    quiet on white. The field is built on the clump grid and scaled up, so a
+    1080p plate can keep crawling. `frame` is the live clock.
+    """
     if amount <= 0:
         return arr
     height, width = arr.shape[:2]
-    cell = max(1, int(round(size if not fine else max(1.0, size * 0.5))))
+    cell = max(1, int(round(size)))
+    rows = max(1, (height + cell - 1) // cell)
+    cols = max(1, (width + cell - 1) // cell)
     rng = _rng(seed, frame)
-    gh = max(1, (height + cell - 1) // cell)
-    gw = max(1, (width + cell - 1) // cell)
-    field = rng.standard_normal((gh, gw)).astype(np.float32)
-    field = np.repeat(np.repeat(field, cell, axis=0), cell, axis=1)[:height, :width]
-    out = arr.copy()
-    luma = _luma_of(arr) / 255.0
-    weight = (1.0 - luma) * float(shadow) + (1.0 - float(shadow))
-    if fine:
-        weight = 1.0
-    gain = float(amount) * 40.0 * weight
-    out[..., :3] += field[..., None] * gain
+    luma = np.clip(_cell_mean(_luma_of(arr), cell, rows, cols) / 255.0, 0.0, 1.0)
+    mid = np.exp(-((luma - 0.42) ** 2) / 0.10)
+    weight = (mid * 0.82 + (1.0 - luma) * 0.28 + 0.10).astype(np.float32)
+    silver = rng.standard_normal((rows, cols)).astype(np.float32)
+    if cell > 1:
+        silver = _soften(silver)
+    gain = (float(amount) * 28.0 * weight).astype(np.float32)
+    delta = np.empty((rows, cols, 3), np.float32)
+    delta[:] = silver[..., None] * gain[..., None]
     if chroma > 0:
-        tint = rng.standard_normal((gh, gw, 3)).astype(np.float32)
-        tint = np.repeat(np.repeat(tint, cell, axis=0), cell, axis=1)[:height, :width]
-        out[..., :3] += tint * (float(chroma) * 30.0)
+        step = max(1, int(round(max(cell * 3, cell + 2) / float(cell))))
+        dye = _dye_clouds(rng, rows, cols, step)
+        delta += dye * (float(amount) * float(chroma) * 16.0 * weight[..., None])
+    field = np.repeat(np.repeat(delta, cell, axis=0), cell, axis=1)[:height, :width]
+    out = arr.copy()
+    out[..., :3] += field
+    return out
+
+
+def _noise(arr, amount, size, seed, frame, shadow=0.0):
+    """Coarser shadow grain. The clumps are soft, and larger than the emulsion."""
+    if amount <= 0:
+        return arr
+    height, width = arr.shape[:2]
+    cell = max(2, int(round(size)) * 2)
+    rows = max(1, (height + cell - 1) // cell)
+    cols = max(1, (width + cell - 1) // cell)
+    small = _soften(_rng(seed, frame).standard_normal((rows, cols)).astype(np.float32))
+    luma = np.clip(_cell_mean(_luma_of(arr), cell, rows, cols) / 255.0, 0.0, 1.0)
+    weight = ((1.0 - luma) * float(shadow) + (1.0 - float(shadow))).astype(np.float32)
+    delta = small * (float(amount) * 36.0 * weight)
+    field = np.repeat(np.repeat(delta, cell, axis=0), cell, axis=1)[:height, :width]
+    out = arr.copy()
+    out[..., :3] += field[..., None]
     return out
 
 
@@ -534,14 +644,16 @@ def _jiggle(arr, amplitude, scanline, seed, frame):
     return out
 
 
-def _vhs(arr, effect, frame):
+def _vhs(arr, effect, frame, clock=None):
+    if clock is None:
+        clock = frame
     out = arr.copy()
     height, width = out.shape[:2]
     shift = int(round(_at(effect, "shift", frame) * width))
     if shift:
         out[..., 0] = np.roll(out[..., 0], shift, axis=1)
         out[..., 2] = np.roll(out[..., 2], -shift, axis=1)
-    rng = _rng(_at(effect, "seed", frame), frame)
+    rng = _rng(_at(effect, "seed", frame), clock)
     tear = _at(effect, "tear", frame)
     if tear > 0:
         band = int(rng.integers(0, height))
@@ -552,14 +664,27 @@ def _vhs(arr, effect, frame):
         out[y0:y1] = np.roll(out[y0:y1], slip, axis=1)
     bar = _at(effect, "bar", frame)
     if bar > 0:
-        y = int((frame * 17 + int(_at(effect, "seed", frame))) % max(1, height))
+        y = int((int(clock) * 17 + int(_at(effect, "seed", frame))) % max(1, height))
         out[y:y + 1, :, :3] *= 1.0 - bar
-    pitch = _at(effect, "pitch", frame)
-    angle = _at(effect, "angle", frame)
+    pitch = float(_at(effect, "pitch", frame))
+    angle = float(_at(effect, "angle", frame))
+    # Shadow-mask moiré. Pitch and angle are the keyed settings. The phase
+    # follows the live clock, so the grille crawls while the playhead is held.
+    phase = float(int(clock) % 4096) * 0.47
     xs = np.arange(width, dtype=np.float32)[None, :]
     ys = np.arange(height, dtype=np.float32)[:, None]
-    wave = np.sin((xs * pitch + ys * angle) * 0.35) * np.sin((xs * pitch * 1.13 - ys * angle) * 0.35)
-    out[..., :3] += wave[..., None] * (18.0 * max(pitch, 0.05))
+    beat = np.sin((xs * pitch + ys * angle) * 0.55 + phase) * np.sin(
+        (xs * pitch * 1.17 - ys * (angle + 0.15)) * 0.55 - phase * 0.73
+    )
+    triad = pitch * 2.4 + 0.35
+    scan = np.sin(ys * (1.6 + angle) + phase * 0.35)
+    veil = 0.65 + 0.35 * scan
+    amp = 48.0 * max(pitch, 0.08)
+    out[..., 0] += (beat * 0.55 + np.sin(xs * triad + phase) * veil) * amp * 0.5
+    out[..., 1] += (beat * 0.55 + np.sin(xs * triad + phase + 2.094395) * veil) * amp * 0.5
+    out[..., 2] += (beat * 0.55 + np.sin(xs * triad + phase + 4.188790) * veil) * amp * 0.5
+    lines = 1.0 - 0.16 * np.clip(np.sin(ys * (2.4 + angle * 2.0) + phase), 0.0, 1.0)
+    out[..., :3] *= lines[..., None]
     return out
 
 

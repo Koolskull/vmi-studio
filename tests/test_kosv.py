@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 
+import numpy as np
 from PIL import Image
 
 from vmi_studio.document import ArtFile, Ids, Node, Raster, refresh
@@ -263,6 +264,103 @@ class EffectTests(unittest.TestCase):
         again = composite_image(8, 8, refresh([group]), frame=0)
         self.assertNotEqual(early.tobytes(), later.tobytes())
         self.assertEqual(again.tobytes(), early.tobytes())
+
+    def test_filmic_noise_is_emulsion_and_dye(self):
+        image = Image.new("RGBA", (48, 24), (0, 0, 0, 255))
+        px = image.load()
+        for x in range(48):
+            tone = int(round(x * 255 / 47.0))
+            for y in range(24):
+                px[x, y] = (tone, tone, tone, 255)
+        effect = make_effect("filmic-noise", {"amount": 0.8, "chroma": 0.8, "size": 2, "seed": 11})
+        one = apply_effects(image, [effect], frame=0)
+        two = apply_effects(image, [effect], frame=0)
+        nxt = apply_effects(image, [effect], frame=1)
+        self.assertEqual(one.tobytes(), two.tobytes())
+        self.assertNotEqual(one.tobytes(), nxt.tobytes())
+        delta = np.asarray(one).astype(np.float32) - np.asarray(image).astype(np.float32)
+        mid = float(delta[:, 16:32, :3].std())
+        white = float(delta[:, 44:48, :3].std())
+        black = float(delta[:, 0:4, :3].std())
+        self.assertGreater(mid, white * 1.4)
+        self.assertGreater(mid, black)
+        red = delta[:, 16:32, 0]
+        green = delta[:, 16:32, 1]
+        self.assertFalse(np.array_equal(red, green))
+        self.assertGreater(float((red - green).std()), 0.35 * float(red.std()))
+        self.assertGreater(float(delta[8, 16:24, 0].std()), 0.5)
+        wide = _solid(140, 120, 100, w=12, h=8)
+        stock = apply_effects(wide, make_stack("stock"), frame=0, live=1)
+        tape = apply_effects(wide, make_stack("tape"), frame=0, live=2)
+        crawled = apply_effects(wide, make_stack("tape"), frame=0, live=3)
+        self.assertNotEqual(stock.tobytes(), wide.tobytes())
+        self.assertNotEqual(tape.tobytes(), wide.tobytes())
+        self.assertNotEqual(tape.tobytes(), crawled.tobytes())
+
+    def test_a_held_key_stays_while_the_grain_clock_moves(self):
+        image = _solid(128, 128, 128, w=16, h=16)
+        effect = make_effect("filmic-noise", {
+            "amount": {"keys": [{"frame": 0, "value": 0}, {"frame": 4, "value": 0.9}]},
+            "chroma": 0.8,
+            "size": 1,
+            "seed": 5,
+        })
+        held = apply_effects(image, [effect], frame=0, live=9)
+        self.assertEqual(held.tobytes(), image.tobytes())
+        first = apply_effects(image, [effect], frame=4, live=1)
+        second = apply_effects(image, [effect], frame=4, live=2)
+        again = apply_effects(image, [effect], frame=4, live=1)
+        self.assertNotEqual(first.tobytes(), image.tobytes())
+        self.assertNotEqual(first.tobytes(), second.tobytes())
+        self.assertEqual(first.tobytes(), again.tobytes())
+
+    def test_vhs_moire_crawls_and_splits_the_phosphor(self):
+        image = _solid(140, 140, 140, w=32, h=16)
+        effect = make_effect("vhs", {
+            "tear": 0, "shift": 0, "bar": 0, "pitch": 0.4, "angle": 0.5, "seed": 3,
+        })
+        first = apply_effects(image, [effect], frame=0)
+        second = apply_effects(image, [effect], frame=2)
+        self.assertNotEqual(first.tobytes(), second.tobytes())
+        arr = np.asarray(first).astype(np.int16)
+        self.assertGreater(int(np.abs(arr[..., 0] - arr[..., 2]).max()), 4)
+
+    def test_a_pass_through_folder_grains_what_is_inside(self):
+        from vmi_studio.composite import composite_image, reset_plate_cache
+
+        back = Node("b", "back", "layer", raster=_raster(200, 0, 0))
+        child = Raster(0, 0, 2, 2, bytes([0, 180, 40, 255]) * 4)
+        layer = Node("n", "paint", "layer", raster=child)
+        group = Node("g", "folder", "group", blend="pass through")
+        group.children = [layer]
+        group.effects = [make_effect("filmic-noise", {"amount": 1, "chroma": 1, "size": 1, "seed": 4})]
+        back2 = Node("b2", "back", "layer", raster=_raster(200, 0, 0))
+        plain_child = Raster(0, 0, 2, 2, bytes([0, 180, 40, 255]) * 4)
+        plain_layer = Node("n2", "paint", "layer", raster=plain_child)
+        plain = Node("g2", "plain", "group", blend="pass through")
+        plain.children = [plain_layer]
+        reset_plate_cache()
+        bare = composite_image(4, 4, refresh([back2, plain]))
+        painted = composite_image(4, 4, refresh([back, group]))
+        self.assertNotEqual(painted.tobytes(), bare.tobytes())
+        self.assertEqual(painted.getpixel((3, 3))[:3], (200, 0, 0))
+        self.assertNotEqual(painted.getpixel((0, 0))[:3], (0, 180, 40))
+        self.assertEqual(layer.raster.rgba, child.rgba)
+
+    def test_a_live_child_does_not_reuse_another_clocks_plate(self):
+        from vmi_studio.composite import composite_image, reset_plate_cache
+
+        layer = Node("n", "paint", "layer", raster=_raster(40, 140, 90, w=8, h=8))
+        layer.effects = [make_effect("filmic-noise", {"amount": 1, "chroma": 0.5, "size": 1, "seed": 2})]
+        group = Node("g", "folder", "group")
+        group.children = [layer]
+        reset_plate_cache()
+        tree = refresh([group])
+        first = composite_image(8, 8, tree, live=1)
+        second = composite_image(8, 8, tree, live=2)
+        again = composite_image(8, 8, tree, live=1)
+        self.assertNotEqual(first.tobytes(), second.tobytes())
+        self.assertEqual(first.tobytes(), again.tobytes())
 
 
 class HistoryTests(unittest.TestCase):

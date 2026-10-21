@@ -145,6 +145,16 @@ class EffectBarTests(unittest.TestCase):
         self.assertEqual(node.effects, make_stack("glow"))
         self.assertEqual(_ids(bar), tuple(effect["id"] for effect in make_stack("glow")))
 
+    def test_a_folder_is_a_target_and_load_plate_asks_the_desk(self):
+        folder = Node("g", "Shot", "group")
+        bar = EffectBar()
+        bar.bind(folder)
+        self.assertEqual(bar.bound_name.text(), "Shot  folder")
+        seen = []
+        bar.load_plate.connect(lambda: seen.append(True))
+        bar.load_button.click()
+        self.assertEqual(seen, [True])
+
     def test_the_desk_recomposites_when_a_value_changes(self):
         import vmi_studio.window as window_mod
 
@@ -155,9 +165,10 @@ class EffectBarTests(unittest.TestCase):
         win = None
         try:
             win = window_mod.MainWindow()
-            layout = win.draw_bar.parentWidget().layout()
-            self.assertGreater(layout.indexOf(win.effect_bar), layout.indexOf(win.draw_bar))
-            self.assertLess(layout.indexOf(win.effect_bar), layout.indexOf(win.cut_bar))
+            stage = win.picture.parentWidget().layout()
+            self.assertGreater(stage.indexOf(win.effect_bar), stage.indexOf(win.picture))
+            self.assertEqual(win.draw_bar.parentWidget().layout().indexOf(win.effect_bar), -1)
+            self.assertEqual(win.effect_bar.heading.text(), "EFFECTS")
             node = Node("n1", "door", "layer")
             node.effects = [make_effect("vhs", {"tear": 0.2})]
             win.art = ArtFile("room.clip", "", "clip", 4, 4, refresh([node]), "")
@@ -172,6 +183,49 @@ class EffectBarTests(unittest.TestCase):
             self.assertTrue(seen)
             win.undo()
             self.assertTrue(node.effects[0]["enabled"])
+        finally:
+            if win is not None:
+                win.close()
+            window_mod.save = real_save
+            window_mod.load = real_load
+
+    def test_live_grain_moves_and_the_stroke_stays(self):
+        from PySide6.QtGui import QImage
+
+        import vmi_studio.window as window_mod
+        from vmi_studio.document import Raster
+
+        real_save, real_load = window_mod.save, window_mod.load
+        window_mod.save = lambda _data: None
+        window_mod.load = lambda: None
+        window_mod.apply_style(self.app)
+        win = None
+        try:
+            win = window_mod.MainWindow()
+            raster = Raster(0, 0, 8, 8, bytes([90, 140, 70, 255]) * 64)
+            layer = Node("n", "Ink", "layer", raster=raster)
+            folder = Node("g", "Shot", "group")
+            folder.children = [layer]
+            folder.effects = [make_effect("filmic-noise", {"amount": 1, "chroma": 0.7, "size": 1, "seed": 3})]
+            win.art = ArtFile("room.clip", "", "clip", 8, 8, refresh([folder]), "")
+            win.model.set_layers(win.art.layers)
+            win._select_layer(folder.id)
+            self.assertEqual(_ids(win.effect_bar), ("filmic-noise",))
+            self.assertEqual(win.effect_bar.bound_name.text(), "Shot  folder")
+            win._kosv_force_live = True
+            win._kosv_live = 1
+            head = win.film.playhead
+            win.recomposite()
+            first = win._flat.tobytes()
+            ink = QImage(4, 4, QImage.Format.Format_RGBA8888)
+            ink.fill(0)
+            win._live_stroke = True
+            win.picture.set_live_ink(ink, 0, 0, "over")
+            win._kosv_live = 4
+            win.recomposite()
+            self.assertNotEqual(win._flat.tobytes(), first)
+            self.assertEqual(win.film.playhead, head)
+            self.assertIsNotNone(win.picture._ink_image)
         finally:
             if win is not None:
                 win.close()

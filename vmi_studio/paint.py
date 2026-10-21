@@ -18,22 +18,27 @@ AA_STEPS = (0.0, 0.5, 1.0, 2.0)
 
 
 class Tool(object):
-    """One picture tool. uses_brush shows the size and pressure row."""
+    """One picture tool. uses_brush shows the size and pressure row.
 
-    def __init__(self, ident, label, uses_brush=False):
+    shortcut is the plain key shown on the button. Shifted letters stay
+    with the timeline and the PNG export.
+    """
+
+    def __init__(self, ident, label, uses_brush=False, shortcut=""):
         self.id = ident
         self.label = label
         self.uses_brush = bool(uses_brush)
+        self.shortcut = shortcut or ""
 
 
 TOOLS = (
-    Tool("pen", "Pen", True),
-    Tool("paint", "Paint", True),
-    Tool("eraser", "Eraser", True),
-    Tool("vector", "Vector", True),
-    Tool("line", "Line", True),
-    Tool("warp-target", "Create warp target", False),
-    Tool("warp-mask", "Draw warp mask", True),
+    Tool("pen", "Pen", True, "P"),
+    Tool("paint", "Paint", True, "B"),
+    Tool("eraser", "Eraser", True, "E"),
+    Tool("vector", "Vector", True, "V"),
+    Tool("line", "Line", True, "L"),
+    Tool("warp-target", "Create warp target", False, "T"),
+    Tool("warp-mask", "Draw warp mask", True, "M"),
 )
 
 # Brush tools that paint a layer. The warp tools stay on their own path.
@@ -139,8 +144,8 @@ class Brush(object):
         self.size_max = 128.0
         self.softness = 0.0
         self.antialias = True
-        self.use_size_pressure = False
-        self.use_opacity_pressure = False
+        self.use_size_pressure = True
+        self.use_opacity_pressure = True
         self.size_curve = [(0.0, 0.0), (1.0, 1.0)]
         self.opacity_curve = [(0.0, 0.0), (1.0, 1.0)]
 

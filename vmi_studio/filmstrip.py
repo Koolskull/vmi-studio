@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from vmi_studio import theme
 from vmi_studio.document import animation_folders, cel_at, find_node, frame_map, spare_cels
 from vmi_studio.exposure import cel_mark
+from vmi_studio.toggles import show_toggle
 
 GUTTER = 132
 CELL = 14
@@ -197,6 +198,7 @@ class Transport(QWidget):
     play = Signal()
     loop = Signal()
     sheet = Signal()
+    onion = Signal()
 
     def __init__(self):
         super().__init__()
@@ -209,11 +211,27 @@ class Transport(QWidget):
         self.play_button = self._button("Play", "Play or stop", self.play)
         self.forward_button = self._button("Forward", "Next frame", self.forward_frame)
         self.loop_button = self._button("Loop", "Loop playback", self.loop)
+        self.onion_button = self._button(
+            "Onion",
+            "Onion skin. Past frames are purple. Future frames are green.",
+            self.onion,
+        )
         self.sheet_button = self._button("Sheet", "Vertical X-sheet", self.sheet)
-        for button in (self.back_button, self.play_button, self.forward_button, self.loop_button, self.sheet_button):
+        for button in (
+            self.back_button,
+            self.play_button,
+            self.forward_button,
+            self.loop_button,
+            self.onion_button,
+            self.sheet_button,
+        ):
             row.addWidget(button)
         row.addStretch(1)
         self.setStyleSheet(theme.transport_sheet())
+        self._mark(self.play_button, False)
+        self._mark(self.loop_button, False)
+        self._mark(self.onion_button, False)
+        self._mark(self.sheet_button, False)
 
     def _button(self, label, tip, signal):
         button = QPushButton(label)
@@ -231,10 +249,12 @@ class Transport(QWidget):
     def set_looping(self, looping):
         self._mark(self.loop_button, looping)
 
+    def set_onion(self, on):
+        self._mark(self.onion_button, on)
+
     def _mark(self, button, on):
         button.setProperty("on", True if on else False)
-        button.style().unpolish(button)
-        button.style().polish(button)
+        show_toggle(button, bool(on), compact=True)
         button.update()
 
     def paintEvent(self, _event):

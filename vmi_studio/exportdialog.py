@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from vmi_studio.toggles import watch
+
 
 def favorite_places(drawing_path=""):
     """Home, Desktop, Documents, and the folder that holds the drawing."""
@@ -79,6 +81,8 @@ class PngDialog(QDialog):
         self.bicubic = QPushButton("Bicubic")
         self.nearest.setCheckable(True)
         self.bicubic.setCheckable(True)
+        watch(self.nearest)
+        watch(self.bicubic)
         self.nearest.clicked.connect(lambda: self._set_resample("nearest"))
         self.bicubic.clicked.connect(lambda: self._set_resample("bicubic"))
         sample_row.addWidget(self.nearest)

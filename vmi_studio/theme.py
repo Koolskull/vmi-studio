@@ -118,6 +118,7 @@ QSplitter#pictureSplit::handle:pressed { background: @field; border: none; }
 QPushButton { background: @field; color: @quiet; border: 1px solid @rule; padding: 4px 8px; border-radius: 0; }
 QPushButton:hover { color: @ink; border-color: @ink; }
 QPushButton:pressed, QPushButton[current="true"] { color: @ink; border-color: @ink; }
+QPushButton:checked { color: @field; background: @ink; border-color: @ink; }
 QPushButton#export { background: @ink; color: @field; border: 1px solid @ink; }
 QPushButton#export:pressed { background: @ink; color: @field; }
 QPushButton#scenePreview { color: @ink; border: 1px solid @ink; padding: 0 6px; }

@@ -12,7 +12,7 @@ from vmi_studio.composite import (
     blend_summary, composite_image, composite_scene, ink_count, pick_layer,
     plate_stats, reset_plate_cache, resolve_mode, visible_paint,
 )
-from vmi_studio.navigate import clamp_zoom, format_zoom, gesture, view_to_image, wheel_factor
+from vmi_studio.navigate import clamp_zoom, format_zoom, gesture, orbit_pan, view_to_image, wheel_factor, zoom_drag_factor
 from vmi_studio.desk import (
     DeskObject, apply_frames, arrange_objects, frames_of, merge_animations, paint_order,
     plan_scene, read_names, reset_object_ids, slots_from_subfolders, slots_of,
@@ -2623,11 +2623,14 @@ class NavigateTests(unittest.TestCase):
 
     def test_pan_rotate_and_pick_follow_the_mouse_buttons(self):
         self.assertEqual(gesture(0, space=True), "pan")
+        self.assertEqual(gesture(0, space=True, pointer="pen"), "pan")
+        self.assertEqual(gesture(0, space=True, shift=True), "rotate")
+        self.assertEqual(gesture(0, space=True, shift=True, pointer="pen"), "rotate")
+        self.assertEqual(gesture(0, space=True, ctrl=True), "zoom")
+        self.assertEqual(gesture(0, space=True, ctrl=True, pointer="pen"), "zoom")
         self.assertEqual(gesture(1), "pan")
-        self.assertEqual(gesture(0, shift=True), "rotate")
-        self.assertEqual(gesture(0, shift=True, alt=True), "pick")
-        self.assertEqual(gesture(0, shift=True, pointer="pen"), "pick")
-        self.assertEqual(gesture(0, shift=True, ctrl=True), "none")
+        self.assertEqual(gesture(0, shift=True), "pick")
+        self.assertEqual(gesture(0, ctrl=True), "none")
         self.assertEqual(gesture(2), "none")
         self.assertEqual(gesture(0), "pick")
 
@@ -2681,6 +2684,117 @@ class NavigateTests(unittest.TestCase):
         view.zoom_by(2.0)
         self.assertEqual(view.pan_x, 0.0)
         self.assertEqual(view.pan_y, 0.0)
+        view.pan_x = 30.0
+        view.pan_y = -12.0
+        view.rotation = 15.0
+        held = view.document_point(center)
+        view.pan_x, view.pan_y = orbit_pan(view.pan_x, view.pan_y, 40.0)
+        view.rotation += 40.0
+        turned = view.document_point(center)
+        self.assertAlmostEqual(held[0], turned[0], places=4)
+        self.assertAlmostEqual(held[1], turned[1], places=4)
+        self.assertGreater(zoom_drag_factor(-20), 1.0)
+        self.assertLess(zoom_drag_factor(20), 1.0)
+        view.close()
+
+    def test_space_pan_rotate_and_zoom_work_while_a_pen_is_down(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QColor, QKeyEvent, QPixmap
+        from PySide6.QtWidgets import QApplication
+
+        from vmi_studio.window import PictureView
+
+        class _Mouse(object):
+            def __init__(self, pos, mods=Qt.NoModifier):
+                self._pos = pos
+                self._mods = mods
+
+            def button(self):
+                return Qt.LeftButton
+
+            def position(self):
+                return self._pos
+
+            def modifiers(self):
+                return self._mods
+
+            def source(self):
+                return None
+
+            def accept(self):
+                return None
+
+        class _Pen(object):
+            def __init__(self, kind, pos, mods=Qt.NoModifier):
+                self._kind = kind
+                self._pos = pos
+                self._mods = mods
+
+            def type(self):
+                return self._kind
+
+            def position(self):
+                return self._pos
+
+            def pressure(self):
+                return 0.4
+
+            def modifiers(self):
+                return self._mods
+
+            def accept(self):
+                return None
+
+            def ignore(self):
+                return None
+
+        app = QApplication.instance() or QApplication([])
+        view = PictureView()
+        view.resize(200, 120)
+        view.show()
+        app.processEvents()
+        pix = QPixmap(80, 40)
+        pix.fill(QColor("#ffffff"))
+        view.set_document(80, 40)
+        view.set_image(pix)
+        view.fit = False
+        view.draw_mode = "pen"
+        view._space = True
+        view.mousePressEvent(_Mouse(QPointF(40, 50)))
+        self.assertEqual(view._drag, "pan")
+        view.mouseMoveEvent(_Mouse(QPointF(70, 65)))
+        self.assertAlmostEqual(view.pan_x, 30, places=3)
+        self.assertAlmostEqual(view.pan_y, 15, places=3)
+        view.mouseReleaseEvent(_Mouse(QPointF(70, 65)))
+        self.assertIsNone(view._drag)
+
+        view.pan_x = 30.0
+        view.pan_y = -12.0
+        view.rotation = 0.0
+        center_point = view.document_point((view.width() / 2.0, view.height() / 2.0))
+        view.tabletEvent(_Pen(QEvent.Type.TabletPress, QPointF(150, 30), Qt.ShiftModifier))
+        self.assertEqual(view._drag, "rotate")
+        view.tabletEvent(_Pen(QEvent.Type.TabletMove, QPointF(150, 90), Qt.ShiftModifier))
+        self.assertNotEqual(view.rotation, 0.0)
+        stayed = view.document_point((view.width() / 2.0, view.height() / 2.0))
+        self.assertAlmostEqual(center_point[0], stayed[0], places=3)
+        self.assertAlmostEqual(center_point[1], stayed[1], places=3)
+        view.tabletEvent(_Pen(QEvent.Type.TabletRelease, QPointF(150, 90), Qt.ShiftModifier))
+        self.assertIsNone(view._drag)
+
+        before = view._shown_scale()
+        view.mousePressEvent(_Mouse(QPointF(40, 60), Qt.ControlModifier))
+        self.assertEqual(view._drag, "zoom")
+        view.mouseMoveEvent(_Mouse(QPointF(40, 30), Qt.ControlModifier))
+        self.assertGreater(view._shown_scale(), before)
+        view.mouseReleaseEvent(_Mouse(QPointF(40, 30), Qt.ControlModifier))
+        view.rotation = 20.0
+        view.pan_x = 12.0
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key_R, Qt.ShiftModifier))
+        self.assertEqual(view.rotation, 0.0)
+        self.assertEqual(view.pan_x, 0.0)
+        self.assertTrue(view.fit)
         view.close()
 
 
@@ -3272,6 +3386,56 @@ class ToolWindowTests(unittest.TestCase):
                 self.assertEqual(image.getpixel((0, 0)), (0, 0, 255, 255))
             self.assertEqual(win._png_percent, 50)
             self.assertIn(parent, win._png_favorites)
+        finally:
+            import shutil
+            shutil.rmtree(parent, ignore_errors=True)
+            win.close()
+
+    def test_shift_r_resets_and_a_layer_exports_without_its_folder(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        paper = Node("paper", "Paper", "layer", raster=fill(255, 0, 0))
+        ink = Node("ink", "Ink", "layer", raster=fill(0, 0, 255, w=1, h=1))
+        folder = Node("shot", "Shot", "group")
+        folder.children = [paper, ink]
+        app, win = self._open([folder], width=4, height=4)
+        win._select_layer("ink")
+        app.processEvents()
+        win.picture.pan_x = 40.0
+        win.picture.rotation = 25.0
+        QTest.keyClick(win, Qt.Key_R, Qt.ShiftModifier)
+        app.processEvents()
+        self.assertEqual(win.picture.rotation, 0.0)
+        self.assertEqual(win.picture.pan_x, 0.0)
+        self.assertTrue(win.picture.fit)
+        win.picture.fit = False
+        win.picture.zoom = 1.0
+        QTest.keyClick(win, Qt.Key_Equal, Qt.ShiftModifier)
+        app.processEvents()
+        self.assertAlmostEqual(win.picture.zoom, 1.25, places=4)
+        QTest.keyClick(win, Qt.Key_Minus, Qt.ShiftModifier)
+        app.processEvents()
+        self.assertAlmostEqual(win.picture.zoom, 1.0, places=4)
+        parent = tempfile.mkdtemp(prefix="vmi-layer-png-")
+        try:
+            path = win.push_png(
+                {"percent": 100, "resample": "nearest", "path": parent, "favorites": []},
+                ask=False,
+            )
+            self.assertTrue(path.endswith("Ink.png"))
+            with Image.open(path) as image:
+                self.assertEqual(image.getpixel((0, 0)), (0, 0, 255, 255))
+                self.assertEqual(image.getpixel((1, 0))[3], 0)
+            win._select_layer("shot")
+            app.processEvents()
+            group_path = win.push_png(
+                {"percent": 100, "resample": "nearest", "path": parent, "favorites": []},
+                ask=False,
+            )
+            self.assertTrue(group_path.endswith("Shot.png"))
+            with Image.open(group_path) as image:
+                self.assertEqual(image.getpixel((1, 0)), (255, 0, 0, 255))
         finally:
             import shutil
             shutil.rmtree(parent, ignore_errors=True)

@@ -218,12 +218,14 @@ class History:
         self._before = None
         self._depth = 0
         self._busy = False
+        self._scrub_seen = 0
 
     def clear(self):
         self.undo_stack = []
         self.redo_stack = []
         self._before = None
         self._depth = 0
+        self._scrub_seen = 0
 
     @contextmanager
     def editing(self, window, label):
@@ -248,9 +250,7 @@ class History:
         after = capture(window)
         if before.same(after):
             return
-        self.undo_stack.append(Edit(label, before, after))
-        del self.undo_stack[:-LIMIT]
-        self.redo_stack = []
+        self._push(label, before, after)
 
     def remember(self, window, label, before):
         """Record one edit that already happened, such as a finished knob drag."""
@@ -259,9 +259,26 @@ class History:
         after = capture(window)
         if before.same(after):
             return
+        self._push(label, before, after)
+
+    def _push(self, label, before, after):
+        """One drag is one undo step. A later drag with the same name stays its own step."""
+        from vmi_studio.scrub import scrub_id, scrubbing
+
+        if (
+            scrubbing()
+            and self._scrub_seen == scrub_id()
+            and self.undo_stack
+            and self.undo_stack[-1].label == label
+        ):
+            self.undo_stack[-1].after = after
+            self.redo_stack = []
+            return
         self.undo_stack.append(Edit(label, before, after))
         del self.undo_stack[:-LIMIT]
         self.redo_stack = []
+        if scrubbing():
+            self._scrub_seen = scrub_id()
 
     def undo(self, window):
         if self._busy or not self.undo_stack or getattr(window, "art", None) is None:

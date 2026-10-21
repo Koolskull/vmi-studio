@@ -4,10 +4,11 @@ The bar is the place a new illustration tool shows up. Brush controls stay
 hidden until the active tool uses a brush.
 """
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -18,12 +19,168 @@ from PySide6.QtWidgets import (
 )
 
 from vmi_studio.paint import AA_STEPS, DEFAULT_WARP_COLOR, TOOLS, Brush, aa_label, parse_hex
+from vmi_studio.scrub import take_pointer
+from vmi_studio.toggles import show_toggle, watch
 
 
 def _button(text):
     button = QPushButton(text)
     button.setCursor(Qt.PointingHandCursor)
     return button
+
+
+def _tip(label, shortcut=""):
+    """Name, then the key expression, the same gap the View menu uses."""
+    if shortcut:
+        return "%s    %s" % (label, shortcut)
+    return label
+
+
+# 16×16 pixel icons. '#' is the mark. They scale 2× nearest so the pixels stay square.
+_ICONS = {
+    "pen": (
+        "................",
+        "..............#.",
+        ".............#..",
+        "............#...",
+        "...........#....",
+        "..........#.....",
+        ".........#......",
+        "........#.......",
+        ".......#........",
+        "......#.........",
+        ".....#..........",
+        "....#...........",
+        "...#............",
+        "..##............",
+        ".##.............",
+        "................",
+    ),
+    "paint": (
+        "................",
+        "......####......",
+        "....########....",
+        "...##########...",
+        "..############..",
+        "..############..",
+        "..############..",
+        "..############..",
+        "..############..",
+        "...##########...",
+        "....########....",
+        "......####......",
+        "................",
+        "................",
+        "................",
+        "................",
+    ),
+    "eraser": (
+        "................",
+        "...##########...",
+        "...##########...",
+        "...##########...",
+        "...##########...",
+        "...##########...",
+        "...##......##...",
+        "...##......##...",
+        "...##########...",
+        "...##########...",
+        "...##########...",
+        "...##########...",
+        "................",
+        "................",
+        "................",
+        "................",
+    ),
+    "vector": (
+        "................",
+        "#...............",
+        ".#..............",
+        "..#.............",
+        "...#............",
+        "....#...........",
+        ".....#..........",
+        "......#.........",
+        ".......#......#.",
+        "........#....#..",
+        ".........#..#...",
+        "..........#.....",
+        ".........#......",
+        "........#.......",
+        "................",
+        "................",
+    ),
+    "line": (
+        "................",
+        "...............#",
+        "..............#.",
+        ".............#..",
+        "............#...",
+        "...........#....",
+        "..........#.....",
+        ".........#......",
+        "........#.......",
+        ".......#........",
+        "......#.........",
+        ".....#..........",
+        "....#...........",
+        "...#............",
+        "..#.............",
+        "#...............",
+    ),
+    "warp-target": (
+        "................",
+        ".......##.......",
+        "......#..#......",
+        ".....#....#.....",
+        "....#......#....",
+        "...#........#...",
+        "...#........#...",
+        "..#....##....#..",
+        "..#....##....#..",
+        "...#........#...",
+        "...#........#...",
+        "....#......#....",
+        ".....#....#.....",
+        "......#..#......",
+        ".......##.......",
+        "................",
+    ),
+    "warp-mask": (
+        "................",
+        ".##############.",
+        ".#............#.",
+        ".#............#.",
+        ".#............#.",
+        ".#............#.",
+        ".#....####....#.",
+        ".#....####....#.",
+        ".#....####....#.",
+        ".#............#.",
+        ".#............#.",
+        ".#............#.",
+        ".#............#.",
+        ".##############.",
+        "................",
+        "................",
+    ),
+}
+
+
+def _tool_icon(ident, ink):
+    """A 32×32 icon from the 16×16 mark. Nearest scale keeps each pixel square."""
+    rows = _ICONS.get(ident) or _ICONS["pen"]
+    image = QImage(16, 16, QImage.Format.Format_ARGB32)
+    image.fill(QColor(0, 0, 0, 0))
+    color = QColor(ink)
+    for y, row in enumerate(rows):
+        for x, mark in enumerate(row):
+            if mark == "#":
+                image.setPixelColor(x, y, color)
+    pixmap = QPixmap.fromImage(image).scaled(
+        32, 32, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.FastTransformation
+    )
+    return QIcon(pixmap)
 
 
 class SoftKnob(QWidget):
@@ -37,7 +194,14 @@ class SoftKnob(QWidget):
         self._y = None
         self.setFixedSize(22, 22)
         self.setCursor(Qt.SizeVerCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
         self.setToolTip("Softness. Drag up to soften the edge.")
+
+    def event(self, event):
+        if take_pointer(self, event):
+            event.accept()
+            return True
+        return super().event(event)
 
     def set_value(self, value):
         self.value = max(0.0, min(1.0, float(value)))
@@ -82,6 +246,13 @@ class CurvePlot(QWidget):
         self._drag = None
         self.setMinimumSize(180, 100)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_AcceptTouchEvents, True)
+
+    def event(self, event):
+        if take_pointer(self, event):
+            event.accept()
+            return True
+        return super().event(event)
 
     def _box(self):
         return QRectF(12, 12, self.width() - 24, self.height() - 24)
@@ -211,6 +382,8 @@ class DrawBar(QWidget):
         self.brush = Brush()
         self._mode = ""
         self._color = DEFAULT_WARP_COLOR
+        self._back = "#000000"
+        self._clear = False
         self._aa_index = 1
         self.brush.antialias = AA_STEPS[self._aa_index]
         self._curve = None
@@ -221,25 +394,53 @@ class DrawBar(QWidget):
         tools = QHBoxLayout()
         tools.setSpacing(4)
         self.buttons = {}
-        for tool in TOOLS:
-            button = _button(tool.label)
+        self.tool_column = QWidget()
+        self.tool_column.setObjectName("toolColumn")
+        self.tool_column.setFixedWidth(78)
+        grid = QGridLayout(self.tool_column)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(2)
+        for index, tool in enumerate(TOOLS):
+            button = _button("")
+            button.setToolTip(_tip(tool.label, tool.shortcut))
+            button.setFixedSize(36, 36)
+            button.setIconSize(QSize(32, 32))
             button.clicked.connect(lambda _checked=False, ident=tool.id: self._click(ident))
             self.buttons[tool.id] = button
-            tools.addWidget(button)
+            grid.addWidget(button, index // 2, index % 2)
+        self.fore_swatch = _button("")
+        self.back_swatch = _button("")
+        self.fore_swatch.setFixedSize(36, 36)
+        self.back_swatch.setFixedSize(36, 36)
+        self.fore_swatch.setToolTip(_tip("Ink", "X"))
+        self.back_swatch.setToolTip(_tip("Other color", "X"))
+        self.back_swatch.clicked.connect(self.swap_colors)
+        colors = QHBoxLayout()
+        colors.setSpacing(2)
+        colors.addWidget(self.fore_swatch)
+        colors.addWidget(self.back_swatch)
+        grid.addLayout(colors, (len(TOOLS) + 1) // 2, 0, 1, 2)
+        grid.setRowStretch((len(TOOLS) + 1) // 2 + 1, 1)
         self.hex_edit = QLineEdit(self._color)
         self.hex_edit.setFixedWidth(84)
-        self.hex_edit.setToolTip("Ink color. A warp tool uses the same hex.")
+        self.hex_edit.setToolTip(_tip("Ink color", "X"))
         self.hex_edit.editingFinished.connect(self._commit_color)
         tools.addWidget(self.hex_edit)
         self.white_swatch = _button("")
         self.black_swatch = _button("")
-        for swatch, tip in ((self.white_swatch, "White ink"), (self.black_swatch, "Black ink")):
+        for swatch, tip in ((self.white_swatch, _tip("White ink")), (self.black_swatch, _tip("Black ink"))):
             swatch.setFixedSize(18, 18)
             swatch.setToolTip(tip)
         self.white_swatch.clicked.connect(lambda: self.set_color("#FFFFFF"))
         self.black_swatch.clicked.connect(lambda: self.set_color("#000000"))
         tools.addWidget(self.white_swatch)
         tools.addWidget(self.black_swatch)
+        self.clear_button = _button("Clear")
+        self.clear_button.setCheckable(True)
+        self.clear_button.setToolTip(_tip("Clear", "C"))
+        self.clear_button.toggled.connect(self._clear_toggled)
+        watch(self.clear_button)
+        tools.addWidget(self.clear_button)
         self._mark_swatches()
         tools.addStretch(1)
         root.addLayout(tools)
@@ -251,6 +452,7 @@ class DrawBar(QWidget):
         brush_layout.setContentsMargins(0, 0, 0, 0)
         brush_layout.setSpacing(4)
         self.size_box = self._spin(1, 512, int(self.brush.size))
+        self.size_box.setToolTip(_tip("Size", "[ ]"))
         self.min_box = self._spin(1, 512, int(self.brush.size_min))
         self.max_box = self._spin(1, 512, int(self.brush.size_max))
         self.soft = SoftKnob()
@@ -260,6 +462,8 @@ class DrawBar(QWidget):
         self.opacity_pressure = _button("Pressure opacity")
         for button in (self.size_pressure, self.opacity_pressure):
             button.setCheckable(True)
+            button.setChecked(True)
+            watch(button)
         self.curve_button = _button("Curve")
         self.curve_button.setToolTip("Pressure curves for size and opacity")
         for label, widget in (
@@ -285,6 +489,8 @@ class DrawBar(QWidget):
         self.size_pressure.toggled.connect(self._apply_brush)
         self.opacity_pressure.toggled.connect(self._apply_brush)
         self.curve_button.clicked.connect(self._open_curve)
+        self._apply_brush()
+        self._mark_aa()
         self._style_tools()
 
     def _spin(self, low, high, value):
@@ -296,6 +502,29 @@ class DrawBar(QWidget):
 
     def color(self):
         return self._color
+
+    def clears(self):
+        """True while the current tool should stamp empty pixels."""
+        return bool(self._clear)
+
+    def swap_colors(self):
+        """X. The two inks trade places. The tool stays put."""
+        self._color, self._back = self._back, self._color
+        self.hex_edit.setText(self._color)
+        self._mark_swatches()
+        self.color_changed.emit(self._color)
+
+    def toggle_clear(self):
+        """C. Empty pixels, not a switch over to the eraser tool."""
+        self.clear_button.setChecked(not self.clear_button.isChecked())
+
+    def nudge_size(self, step):
+        """[ and ]. The spin stays inside its range."""
+        self.size_box.setValue(int(self.size_box.value()) + int(step))
+
+    def _clear_toggled(self, on):
+        self._clear = bool(on)
+        self._mark_swatches()
 
     def set_color(self, text):
         parsed = parse_hex(text)
@@ -334,11 +563,28 @@ class DrawBar(QWidget):
                 "QPushButton { background: %s; color: %s; border: 1px solid %s; border-radius: 0; }"
                 % (color, color, border)
             )
+        fore = "#000000" if self._clear else self._color
+        fore_ink = "#ffffff" if self._clear else fore
+        self.fore_swatch.setText("A" if self._clear else "")
+        self.fore_swatch.setStyleSheet(
+            "QPushButton { background: %s; color: %s; border: 1px solid #ffffff; border-radius: 0; }"
+            % (fore, fore_ink)
+        )
+        self.back_swatch.setStyleSheet(
+            "QPushButton { background: %s; color: %s; border: 1px solid #3a3a3a; border-radius: 0; }"
+            % (self._back, self._back)
+        )
+        show_toggle(self.clear_button, self._clear)
 
     def _cycle_aa(self):
         self._aa_index = (self._aa_index + 1) % len(AA_STEPS)
         self.aa_button.setText(aa_label(AA_STEPS[self._aa_index]))
+        self._mark_aa()
         self._apply_brush()
+
+    def _mark_aa(self):
+        """Filled when antialiasing is on. Hollow when it is off."""
+        show_toggle(self.aa_button, AA_STEPS[self._aa_index] != 0)
 
     def _soft_changed(self, value):
         self.brush.softness = float(value)
@@ -371,7 +617,8 @@ class DrawBar(QWidget):
     def _style_tools(self):
         for ident, button in self.buttons.items():
             on = ident == self._mode
+            button.setIcon(_tool_icon(ident, "#000000" if on else "#ffffff"))
             button.setStyleSheet(
-                "QPushButton { background: %s; color: %s; border: 1px solid %s; border-radius: 0; padding: 4px 8px; }"
-                % (("#ffffff", "#000000", "#ffffff") if on else ("#000000", "#3a3a3a", "#2a2a2a"))
+                "QPushButton { background: %s; color: %s; border: 1px solid %s; border-radius: 0; padding: 0; }"
+                % (("#ffffff", "#000000", "#ffffff") if on else ("#000000", "#ffffff", "#2a2a2a"))
             )

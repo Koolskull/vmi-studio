@@ -276,30 +276,35 @@ def ink_count(image):
     return sum(hist[1:])
 
 
-def composite_image(width, height, layers, max_edge=None, frame=0):
+def composite_image(width, height, layers, max_edge=None, frame=0, live=None):
     """Full-canvas RGBA of this list, back to front. None when nothing has paint.
 
     max_edge shrinks the long side before the paint. Export leaves it unset.
     frame is the KOSV timeline index for keyed effects.
+    live is the grain clock. Omit it and the grain is seeded by frame.
     """
-    return _composite(width, height, layers, gated=False, focus_id=None, max_edge=max_edge, frame=frame)
+    return _composite(
+        width, height, layers, gated=False, focus_id=None,
+        max_edge=max_edge, frame=frame, live=live,
+    )
 
 
-def composite_scene(width, height, nodes, focus_id=None, max_edge=None, flags=None, frame=0):
+def composite_scene(width, height, nodes, focus_id=None, max_edge=None, flags=None, frame=0, live=None):
     """The picture. Hides, mute, solo, and animation cels follow the tree.
 
     Clipping masks and blend modes stay with the folders they were drawn in.
     max_edge is the fit view: the long side of the document is shrunk to it.
     flags is a capture_flags snapshot. The build uses that copy, not later clicks.
     frame is the KOSV timeline index for keyed effects.
+    live is the grain clock. Omit it and the grain is seeded by frame.
     """
     return _composite(
         width, height, nodes, gated=True, focus_id=focus_id,
-        max_edge=max_edge, flags=flags, frame=frame,
+        max_edge=max_edge, flags=flags, frame=frame, live=live,
     )
 
 
-def _composite(width, height, nodes, gated, focus_id, max_edge, flags=None, frame=0):
+def _composite(width, height, nodes, gated, focus_id, max_edge, flags=None, frame=0, live=None):
     if width <= 0 or height <= 0:
         return None
     scale = 1.0
@@ -317,6 +322,7 @@ def _composite(width, height, nodes, gated, focus_id, max_edge, flags=None, fram
     ctx.scale = scale
     ctx.flags = flags
     ctx.frame = int(frame or 0)
+    ctx.live = None if live is None else int(live)
     scale_key = int(round(scale * 100000))
     ctx.plates = _Plates(_take_store(scale_key))
     try:
@@ -347,6 +353,7 @@ class _Ctx:
         self.solo = solo
         self.nodes = nodes
         self.frame = 0
+        self.live = None
 
     def child(self, node):
         _visible, _mute, solo = _trio(node, self)
@@ -357,6 +364,7 @@ class _Ctx:
         nxt.flags = getattr(self, "flags", None)
         nxt.plates = getattr(self, "plates", None)
         nxt.frame = getattr(self, "frame", 0)
+        nxt.live = getattr(self, "live", None)
         nxt.kosv_hold = getattr(self, "kosv_hold", 0)
         return nxt
 
@@ -611,6 +619,9 @@ def _keep_store(scale_key, plates):
         extra = image.size[0] * image.size[1] * 4
         if size + extra > _PLATE_BUDGET:
             continue
+        # A crawling grain plate is only good for the clock that built it.
+        if _stale_live(key):
+            continue
         kept[key] = found
         size += extra
     with _PLATE_LOCK:
@@ -686,6 +697,34 @@ def _focus_key(node, focus):
     return ""
 
 
+def _stale_live(key):
+    """A plate key stamped with a live clock. The next clock must not keep it."""
+    return (
+        isinstance(key, tuple)
+        and bool(key)
+        and isinstance(key[-1], tuple)
+        and len(key[-1]) == 2
+        and key[-1][0] == "live"
+    )
+
+
+def _live_below(node):
+    """True when a descendant bakes a frame-seeded effect into this plate."""
+    from vmi_studio.kosv import LIVE_IDS
+
+    for child in getattr(node, "children", []) or []:
+        for effect in getattr(child, "effects", None) or []:
+            if (
+                isinstance(effect, dict)
+                and effect.get("enabled", True)
+                and effect.get("id") in LIVE_IDS
+            ):
+                return True
+        if getattr(child, "kind", "") == "group" and _live_below(child):
+            return True
+    return False
+
+
 def _kosv_sig(node):
     """Cache identity of this node's effect stack and cel marks."""
     effects = getattr(node, "effects", None) or None
@@ -754,6 +793,9 @@ def _plate_key(node, ctx, canvas, scale, outlined=True):
     # still folder is not rebuilt on every playback tick.
     if _effects_below(node):
         key = key + (int(getattr(ctx, "frame", 0) or 0),)
+    live = getattr(ctx, "live", None)
+    if live is not None and _live_below(node):
+        key = key + (("live", int(live)),)
     return key
 
 
@@ -790,7 +832,17 @@ def _paint_list(dest, nodes, ctx):
                 clips.append(clipped)
             nxt += 1
         opacity = int(getattr(item, "opacity", 255) or 0)
-        direct = item.kind == "group" and _is_pass(item) and not clips and opacity >= 255
+        # A folder with a stack is flattened first. Pass-through would paint
+        # the children raw and skip the folder look. The stack then covers
+        # everything that was inside.
+        folder_fx = item.kind == "group" and bool(getattr(item, "effects", None))
+        direct = (
+            item.kind == "group"
+            and _is_pass(item)
+            and not clips
+            and opacity >= 255
+            and not folder_fx
+        )
         if direct:
             _paint_pass(dest, item, ctx)
         elif item.kind != "group" and not clips:
@@ -950,7 +1002,12 @@ def _kosv_paint(image, node, ctx):
         return image
     from vmi_studio.kosv import apply_effects
 
-    return apply_effects(image, effects, frame=getattr(ctx, "frame", 0), maps=_kosv_maps(node, effects, ctx, image))
+    return apply_effects(
+        image, effects,
+        frame=getattr(ctx, "frame", 0),
+        live=getattr(ctx, "live", None),
+        maps=_kosv_maps(node, effects, ctx, image),
+    )
 
 
 def _stamp(dest, node, ctx, clip_to_dest):

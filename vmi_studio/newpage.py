@@ -2,13 +2,19 @@
 
 The working plate is 1920 by 1080. Larger presets are in the list. Each side
 stops at 8192 pixels, which is the largest plate the composite will hold.
+
+Every new picture has a Paper layer under an empty Ink layer. The 2kool grid
+preset adds the cyan template from the Clip Studio file, on top of Ink.
 """
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -16,8 +22,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from vmi_studio.document import ArtFile, Node, refresh
+from vmi_studio.document import ArtFile, Node, Raster, refresh
+from vmi_studio.koolgrid import PLATE, grid_raster
+from vmi_studio.paint import hex_rgb, parse_hex
 from vmi_studio import theme
+from vmi_studio.toggles import watch
+
+import numpy as np
+from PIL import Image
 
 # Name, width, height. The first row is the working plate.
 PRESETS = (
@@ -29,6 +41,17 @@ PRESETS = (
     ("Portrait", 1080, 1920),
     ("Story", 720, 1280),
     ("Square 2K", 2048, 2048),
+    ("2kool grid", 3840, 3840),
+)
+
+GRID_PRESET = "2kool grid"
+PAPER_WHITE = "#FFFFFF"
+PAPER_GREY = "#808080"
+PAPER_BLACK = "#000000"
+PAPER_CHOICES = (
+    ("White", PAPER_WHITE),
+    ("Grey", PAPER_GREY),
+    ("Black", PAPER_BLACK),
 )
 
 MIN_EDGE = 1
@@ -55,26 +78,65 @@ def match_preset(width, height):
     return ""
 
 
-def blank_picture(width, height, name=""):
-    """An unsaved picture with one empty Ink layer. Save writes the blueprint."""
+def _paper_raster(width, height, color):
+    red, green, blue = hex_rgb(color or PAPER_WHITE)
+    arr = np.empty((int(height), int(width), 4), dtype=np.uint8)
+    arr[..., 0] = red
+    arr[..., 1] = green
+    arr[..., 2] = blue
+    arr[..., 3] = 255
+    return Raster(0, 0, int(width), int(height), np.ascontiguousarray(arr).tobytes())
+
+
+def _texture_raster(width, height, path):
+    try:
+        image = Image.open(path).convert("RGBA")
+    except (OSError, ValueError) as exc:
+        raise ValueError("That texture could not be read.") from exc
+    if image.size != (int(width), int(height)):
+        image = image.resize((int(width), int(height)), Image.Resampling.LANCZOS)
+    return Raster(0, 0, int(width), int(height), image.tobytes())
+
+
+def blank_picture(width, height, name="", background=PAPER_WHITE, texture=None, grid=False):
+    """An unsaved picture. Paper is the back. Ink is the empty draw layer.
+
+    grid adds the 2kool template, and only on the 3840 plate that template
+    was measured from. Save writes the blueprint.
+    """
     wide, high = parse_plate(width, height)
     title = (name or "").strip() or "Untitled %d×%d" % (wide, high)
-    layer = Node("n0", "Ink", "layer")
-    return ArtFile(title, "", "vmib", wide, high, refresh([layer]), "")
+    color = parse_hex(background) or PAPER_WHITE
+    if texture:
+        paper_raster = _texture_raster(wide, high, texture)
+    else:
+        paper_raster = _paper_raster(wide, high, color)
+    paper = Node("n0", "Paper", "layer", raster=paper_raster)
+    paper.color = color
+    ink = Node("n1", "Ink", "layer")
+    layers = [paper, ink]
+    if grid and wide == PLATE and high == PLATE:
+        layers.append(Node("n2", "2Kool Grid", "layer", raster=grid_raster()))
+    return ArtFile(title, "", "vmib", wide, high, refresh(layers), "")
 
 
 class NewPicture(QDialog):
-    """Preset list on the left. Width and height stay editable."""
+    """Preset list on the left. Width, height, and the paper color stay editable."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("New picture")
         self.setModal(True)
         self._guard = False
+        self._texture = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(8)
-        note = QLabel("A preset fills the size. Type any width and height. Each side is 1 to 8192 pixels.")
+        note = QLabel(
+            "A preset fills the size. Type any width and height. "
+            "Paper is the back layer. Draw on Ink. "
+            "2kool grid is the 3840 template."
+        )
         note.setWordWrap(True)
         root.addWidget(note)
         row = QHBoxLayout()
@@ -95,6 +157,43 @@ class NewPicture(QDialog):
         fields.addWidget(QLabel("HEIGHT"))
         self.height_box = self._spin()
         fields.addWidget(self.height_box)
+        fields.addWidget(QLabel("PAPER"))
+        paper_row = QHBoxLayout()
+        paper_row.setSpacing(4)
+        self._paper_group = QButtonGroup(self)
+        self._paper_group.setExclusive(True)
+        self.paper_buttons = {}
+        for label, color in PAPER_CHOICES:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setToolTip(color)
+            self._paper_group.addButton(button)
+            self.paper_buttons[color] = button
+            paper_row.addWidget(button)
+        self.paper_buttons[PAPER_WHITE].setChecked(True)
+        for button in self.paper_buttons.values():
+            watch(button)
+        self._paper_group.buttonClicked.connect(self._paper_clicked)
+        fields.addLayout(paper_row)
+        self.paper_hex = QLineEdit(PAPER_WHITE)
+        self.paper_hex.setFixedWidth(84)
+        self.paper_hex.setToolTip("Paper color. White, grey, black, or any hex.")
+        self.paper_hex.editingFinished.connect(self._paper_typed)
+        fields.addWidget(self.paper_hex)
+        texture_row = QHBoxLayout()
+        texture_row.setSpacing(4)
+        self.texture_button = QPushButton("Texture")
+        self.texture_button.setToolTip("A picture fills Paper instead of the flat color.")
+        self.texture_button.clicked.connect(self._pick_texture)
+        self.texture_clear = QPushButton("Clear")
+        self.texture_clear.clicked.connect(self._clear_texture)
+        texture_row.addWidget(self.texture_button)
+        texture_row.addWidget(self.texture_clear)
+        texture_row.addStretch(1)
+        fields.addLayout(texture_row)
+        self.texture_label = QLabel("Flat color")
+        self.texture_label.setWordWrap(True)
+        fields.addWidget(self.texture_label)
         self.count_label = QLabel("")
         fields.addWidget(self.count_label)
         fields.addStretch(1)
@@ -124,6 +223,17 @@ class NewPicture(QDialog):
     def plate(self):
         return parse_plate(self.width_box.value(), self.height_box.value())
 
+    def background(self):
+        """The paper hex. A texture, when set, fills Paper instead."""
+        return parse_hex(self.paper_hex.text()) or PAPER_WHITE
+
+    def texture_path(self):
+        return self._texture or ""
+
+    def wants_grid(self):
+        """True only for the 3840 2kool template."""
+        return match_preset(self.width_box.value(), self.height_box.value()) == GRID_PRESET
+
     def _preset(self, row):
         if row < 0 or row >= len(PRESETS):
             return
@@ -152,6 +262,37 @@ class NewPicture(QDialog):
         self._guard = False
         self._sync_count()
 
+    def _paper_clicked(self, button):
+        for color, item in self.paper_buttons.items():
+            if item is button:
+                self.paper_hex.setText(color)
+                return
+
+    def _paper_typed(self):
+        parsed = parse_hex(self.paper_hex.text())
+        if parsed is None:
+            self.paper_hex.setText(self.background() if parse_hex(self.paper_hex.text()) else PAPER_WHITE)
+            parsed = parse_hex(self.paper_hex.text()) or PAPER_WHITE
+        self.paper_hex.setText(parsed)
+        for color, button in self.paper_buttons.items():
+            button.setChecked(color == parsed)
+
+    def _pick_texture(self):
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Paper texture",
+            "",
+            "Pictures (*.png *.jpg *.jpeg *.tif *.tiff *.webp *.bmp)",
+        )
+        if not path:
+            return
+        self._texture = path
+        self.texture_label.setText(path)
+
+    def _clear_texture(self):
+        self._texture = ""
+        self.texture_label.setText("Flat color")
+
     def _sync_count(self):
         wide, high = self.width_box.value(), self.height_box.value()
         name = match_preset(wide, high)
@@ -160,6 +301,8 @@ class NewPicture(QDialog):
             label = "%s    %s" % (name, label)
         else:
             label = "Custom    %s" % label
+        if name == GRID_PRESET:
+            label = "%s    grid on top" % label
         self.count_label.setText(label)
 
 
@@ -168,7 +311,7 @@ def _sheet():
     return theme.dialog_sheet(ui) + (
         "QListWidget { background: %s; color: %s; border: 1px solid %s; }"
         "QListWidget::item:selected { background: %s; color: %s; }"
-        "QSpinBox { background: %s; color: %s; border: 1px solid %s; border-radius: 0; padding: 2px 4px; }"
+        "QSpinBox, QLineEdit { background: %s; color: %s; border: 1px solid %s; border-radius: 0; padding: 2px 4px; }"
         "QLabel { color: %s; }"
     ) % (
         ui.field, ui.quiet, ui.rule,

@@ -276,25 +276,30 @@ def ink_count(image):
     return sum(hist[1:])
 
 
-def composite_image(width, height, layers, max_edge=None):
+def composite_image(width, height, layers, max_edge=None, frame=0):
     """Full-canvas RGBA of this list, back to front. None when nothing has paint.
 
     max_edge shrinks the long side before the paint. Export leaves it unset.
+    frame is the KOSV timeline index for keyed effects.
     """
-    return _composite(width, height, layers, gated=False, focus_id=None, max_edge=max_edge)
+    return _composite(width, height, layers, gated=False, focus_id=None, max_edge=max_edge, frame=frame)
 
 
-def composite_scene(width, height, nodes, focus_id=None, max_edge=None, flags=None):
+def composite_scene(width, height, nodes, focus_id=None, max_edge=None, flags=None, frame=0):
     """The picture. Hides, mute, solo, and animation cels follow the tree.
 
     Clipping masks and blend modes stay with the folders they were drawn in.
     max_edge is the fit view: the long side of the document is shrunk to it.
     flags is a capture_flags snapshot. The build uses that copy, not later clicks.
+    frame is the KOSV timeline index for keyed effects.
     """
-    return _composite(width, height, nodes, gated=True, focus_id=focus_id, max_edge=max_edge, flags=flags)
+    return _composite(
+        width, height, nodes, gated=True, focus_id=focus_id,
+        max_edge=max_edge, flags=flags, frame=frame,
+    )
 
 
-def _composite(width, height, nodes, gated, focus_id, max_edge, flags=None):
+def _composite(width, height, nodes, gated, focus_id, max_edge, flags=None, frame=0):
     if width <= 0 or height <= 0:
         return None
     scale = 1.0
@@ -311,6 +316,7 @@ def _composite(width, height, nodes, gated, focus_id, max_edge, flags=None):
     ctx = _Ctx(gated, solo, nodes, focus_id)
     ctx.scale = scale
     ctx.flags = flags
+    ctx.frame = int(frame or 0)
     scale_key = int(round(scale * 100000))
     ctx.plates = _Plates(_take_store(scale_key))
     try:
@@ -339,14 +345,19 @@ class _Ctx:
         self.hidden = hidden
         self.muted = muted
         self.solo = solo
+        self.nodes = nodes
+        self.frame = 0
 
     def child(self, node):
         _visible, _mute, solo = _trio(node, self)
         nxt = _Ctx(self.gated, self.solo_on, [], self.focus, False, False, self.solo or solo)
         nxt.roots = self.roots
+        nxt.nodes = self.nodes
         nxt.scale = getattr(self, "scale", 1)
         nxt.flags = getattr(self, "flags", None)
         nxt.plates = getattr(self, "plates", None)
+        nxt.frame = getattr(self, "frame", 0)
+        nxt.kosv_hold = getattr(self, "kosv_hold", 0)
         return nxt
 
 
@@ -367,6 +378,9 @@ class _View:
         self.solo = False
         self.animation = False
         self.omit = ""
+        self.effects = list(getattr(node, "effects", None) or [])
+        self.cel_marks = {}
+        self.kosv_source = None
 
 
 def _trio(node, ctx):
@@ -410,6 +424,11 @@ def _slot(node, ctx):
         _cel_visible, _cel_mute, cel_solo = _trio(cel, ctx)
         view = _View(cel, node.clip or cel.clip)
         view.solo = bool(ctx.solo or solo or cel_solo)
+        folder_effects = list(getattr(node, "effects", None) or [])
+        if folder_effects:
+            view.effects = folder_effects + view.effects
+        view.cel_marks = getattr(node, "cel_marks", None) or {}
+        view.kosv_source = node
         return view
     if gate == "seek" and node.kind != "group":
         return None
@@ -667,6 +686,25 @@ def _focus_key(node, focus):
     return ""
 
 
+def _kosv_sig(node):
+    """Cache identity of this node's effect stack and cel marks."""
+    effects = getattr(node, "effects", None) or None
+    marks = getattr(node, "cel_marks", None) or None
+    if not effects and not marks:
+        return ()
+    return (repr(effects), repr(marks))
+
+
+def _effects_below(node):
+    """True when a descendant bakes an effect into this folder plate."""
+    for child in getattr(node, "children", []) or []:
+        if getattr(child, "effects", None):
+            return True
+        if getattr(child, "kind", "") == "group" and _effects_below(child):
+            return True
+    return False
+
+
 def _tree_sig(nodes, ctx):
     rows = []
     for node in nodes:
@@ -684,6 +722,7 @@ def _tree_sig(nodes, ctx):
             bool(getattr(node, "animation", False)),
             outline_key(node),
             _raster_sig(getattr(node, "raster", None)),
+            _kosv_sig(node),
         )
         if getattr(node, "kind", "") == "group":
             row = row + (_tree_sig(node.children, ctx.child(node)),)
@@ -697,7 +736,7 @@ def _plate_key(node, ctx, canvas, scale, outlined=True):
     # stays in the signature either way, so the gate has to be part of the key.
     # A pass-through folder asks for the bare plate, then draws the outline under
     # the children. That plate must not share a cache entry with the outlined one.
-    return (
+    key = (
         int(round(float(scale) * 100000)),
         canvas[0],
         canvas[1],
@@ -710,6 +749,12 @@ def _plate_key(node, ctx, canvas, scale, outlined=True):
         outline_key(node) if outlined else ("bare",),
         _tree_sig(node.children, child),
     )
+    # A keyed or seeded effect inside the folder changes the baked plate.
+    # The frame stays out of the key when nothing below is effected, so a
+    # still folder is not rebuilt on every playback tick.
+    if _effects_below(node):
+        key = key + (int(getattr(ctx, "frame", 0) or 0),)
+    return key
 
 
 class _Surface:
@@ -753,12 +798,21 @@ def _paint_list(dest, nodes, ctx):
         else:
             plate = _appearance(dest.canvas, item, ctx)
             if plate is not None:
-                # Clips draw onto the plate. A cached folder plate stays untouched.
+                # A folder's own stack is not inside the cached plate. Layers
+                # already ran theirs in _appearance, so only groups do here.
+                image = plate.image
+                if item.kind == "group" and getattr(item, "effects", None):
+                    painted = _kosv_paint(image, item, ctx)
+                    if painted is not image:
+                        image = painted
                 if clips:
-                    plate = _Surface(plate.image.copy(), plate.ox, plate.oy, dest.canvas)
-                for clipped in clips:
-                    _stamp(plate, clipped, ctx, clip_to_dest=True)
-                _blend(dest, plate.image, (plate.ox, plate.oy), item, clip_to_dest=False)
+                    if image is plate.image:
+                        image = image.copy()
+                    working = _Surface(image, plate.ox, plate.oy, dest.canvas)
+                    for clipped in clips:
+                        _stamp(working, clipped, ctx, clip_to_dest=True)
+                    image = working.image
+                _blend(dest, image, (plate.ox, plate.oy), item, clip_to_dest=False)
         index = nxt
 
 
@@ -797,18 +851,121 @@ def _outline_plate(plate, node, scale):
     return _Surface(image, plate.ox + dx, plate.oy + dy, plate.canvas)
 
 
+def _layer_image(nodes, ident):
+    """RGBA picture of one layer, for a KOSV map slot."""
+    node = find_node(nodes, ident)
+    raster = getattr(node, "raster", None) if node is not None else None
+    if raster is None or raster.w < 1 or raster.h < 1:
+        return None
+    if len(raster.rgba) != raster.w * raster.h * 4:
+        return None
+    return Image.frombytes("RGBA", (raster.w, raster.h), raster.rgba)
+
+
+def _kosv_maps(node, effects, ctx, image=None):
+    maps = {}
+    nodes = getattr(ctx, "nodes", None) or []
+    for effect in effects:
+        params = effect.get("params") if isinstance(effect.get("params"), dict) else {}
+        for name in ("plate", "shape", "clip", "matte", "other"):
+            ident = params.get(name)
+            if isinstance(ident, str) and ident:
+                found = _layer_image(nodes, ident)
+                if found is not None:
+                    maps[name] = found
+    if any(effect.get("id") == "datamosh" for effect in effects):
+        source = getattr(node, "kosv_source", None) or node
+        current = getattr(node, "id", None)
+        frames, marks, ids = _datamosh_cels(source, ctx, current, image)
+        maps["frames"] = frames
+        maps["marks"] = marks
+        maps["ids"] = ids
+        # The index is this cel, not the clock. The clock still drives keyed knobs.
+        maps["index"] = ids.index(current) if current in ids else 0
+    return maps
+
+
+def _datamosh_cels(source, ctx, current_id, image):
+    frames = []
+    marks = []
+    ids = []
+    table = getattr(source, "cel_marks", None) or {}
+    if not isinstance(table, dict):
+        table = {}
+    for cel in timeline_cels(source):
+        shot = _cel_shot(cel, ctx, current_id, image)
+        if shot is None:
+            continue
+        frames.append(shot)
+        mark = table.get(cel.id)
+        marks.append(mark if isinstance(mark, dict) else {"type": "I"})
+        ids.append(cel.id)
+    return frames, marks, ids
+
+
+def _cel_shot(cel, ctx, current_id, image):
+    """One cel's picture. The cel being painted is the incoming image."""
+    if image is not None and getattr(cel, "id", None) == current_id:
+        return image
+    raster = getattr(cel, "raster", None)
+    if raster is not None and raster.w >= 1 and raster.h >= 1 and len(raster.rgba) == raster.w * raster.h * 4:
+        return Image.frombytes("RGBA", (raster.w, raster.h), raster.rgba)
+    if getattr(cel, "kind", "") != "group" or int(getattr(ctx, "kosv_hold", 0) or 0):
+        return _blank_like(image)
+    return _group_shot(cel, ctx, image)
+
+
+def _blank_like(image):
+    if image is None:
+        return None
+    return Image.new("RGBA", image.size, (0, 0, 0, 0))
+
+
+def _group_shot(cel, ctx, image):
+    """Composite a folder cel once. Do not walk back into the cel being painted."""
+    canvas = image.size if image is not None else (1, 1)
+    depth = int(getattr(ctx, "kosv_hold", 0) or 0)
+    ctx.kosv_hold = depth + 1
+    try:
+        plate = _appearance(canvas, cel, ctx)
+    finally:
+        ctx.kosv_hold = depth
+    if plate is None or plate.image is None:
+        return _blank_like(image)
+    if image is None:
+        return plate.image
+    if int(plate.ox) == 0 and int(plate.oy) == 0 and plate.image.size == image.size:
+        return plate.image
+    base = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    base.paste(plate.image, (int(plate.ox), int(plate.oy)))
+    if base.getbbox() is None:
+        return plate.image
+    return base
+
+
+def _kosv_paint(image, node, ctx):
+    """Effects on this node. An empty stack returns the same image."""
+    effects = getattr(node, "effects", None)
+    if image is None or not effects:
+        return image
+    from vmi_studio.kosv import apply_effects
+
+    return apply_effects(image, effects, frame=getattr(ctx, "frame", 0), maps=_kosv_maps(node, effects, ctx, image))
+
+
 def _stamp(dest, node, ctx, clip_to_dest):
     """Paint one node onto dest. A group is flattened first, then blended."""
     if node.kind == "group":
         nested = _appearance(dest.canvas, node, ctx)
         if nested is not None:
-            _blend(dest, nested.image, (nested.ox, nested.oy), node, clip_to_dest)
+            painted = _kosv_paint(nested.image, node, ctx)
+            _blend(dest, painted, (nested.ox, nested.oy), node, clip_to_dest)
         return
     placed = _raster_view(_paint_raster(node), getattr(ctx, "scale", 1), dest.canvas)
     if placed is None:
         return
     src, origin = placed
-    _blend(dest, src, origin, node, clip_to_dest)
+    _blend(dest, _kosv_paint(src, node, ctx), origin, node, clip_to_dest)
 
 
 def _appearance(canvas, node, ctx, outlined=True):
@@ -823,7 +980,7 @@ def _appearance(canvas, node, ctx, outlined=True):
         if placed is None:
             return None
         src, origin = placed
-        return _Surface(src, origin[0], origin[1], canvas)
+        return _Surface(_kosv_paint(src, node, ctx), origin[0], origin[1], canvas)
     plates = getattr(ctx, "plates", None)
     key = _plate_key(node, ctx, canvas, scale, outlined) if plates is not None else None
     if plates is not None:

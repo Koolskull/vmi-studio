@@ -4,7 +4,7 @@ VMI STUDIO is the Beetle Labs desktop app for turning a layered drawing into gam
 
 You keep painting in Clip Studio, Photoshop, Krita, or GIMP. The studio opens that file, shows the visible stack, and writes one folder per object in the VMI layout the game reads. It does not replace the drawing program, and it does not change the drawing file.
 
-Version 0.01.
+Version 0.02. KOSV production lives in this app. The working plate is 1920×1080. You can draw on the plate, start a picture from a pixel size, and store composite effects in the `.vmib`, in the same slot layout the scene export already writes. The packaged downloads below are still the 0.01 builds.
 
 ## Install the executable
 
@@ -208,13 +208,13 @@ The program is `dist/VMI STUDIO.app`. Open that bundle. Check the build from a t
 "dist/VMI STUDIO.app/Contents/MacOS/vmi-studio" --version
 ```
 
-It prints `VMI STUDIO 0.01`. A drawing dropped on the icon, or chosen with Open With, opens in the studio. The first time a downloaded copy is opened, macOS shows “VMI STUDIO” Not Opened, with Move to Trash and Done. Click Done. Then open System Settings, go to Privacy & Security, and click Open Anyway next to the VMI STUDIO note. Open the app again and confirm Open.
+It prints `VMI STUDIO 0.02`. A drawing dropped on the icon, or chosen with Open With, opens in the studio. The first time a downloaded copy is opened, macOS shows “VMI STUDIO” Not Opened, with Move to Trash and Done. Click Done. Then open System Settings, go to Privacy & Security, and click Open Anyway next to the VMI STUDIO note. Open the app again and confirm Open.
 
 An optional font catalog can live in `~/Documents/work/Github/bgcardbuilder`, or in the directory named by `BGCARDBUILDER`. Without it, the header font list is the system monospace. That is the default face either way.
 
-## What 0.01 does not do
+## What 0.02 does not do
 
-The app does not write `.clip`, `.psd`, `.kra`, or `.blend`. It does not upload to 2kool.tv. GIMP files that are not 8-bit stay as names without pixels. Photoshop placed layers and smart objects are not read. The earlier `v1.0.0` download does not include the timeline, warp drawing, image-material previews, or this header. Use 0.01.
+The app does not write `.clip`, `.psd`, `.kra`, or `.blend`. It does not upload to 2kool.tv. GIMP files that are not 8-bit stay as names without pixels. Photoshop placed layers and smart objects are not read. The earlier `v1.0.0` download does not include the timeline, warp drawing, image-material previews, or this header. A build from this source is 0.02. The files on the v0.01 release are the last packaged builds.
 
 ## License
 

@@ -1,4 +1,4 @@
-"""The picture tools for a warp target and its mask.
+"""The picture tools. Pen, paint, eraser, and vector share this bar with the warp tools.
 
 The bar is the place a new illustration tool shows up. Brush controls stay
 hidden until the active tool uses a brush.
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from vmi_studio.paint import DEFAULT_WARP_COLOR, TOOLS, Brush, parse_hex
+from vmi_studio.paint import AA_STEPS, DEFAULT_WARP_COLOR, TOOLS, Brush, aa_label, parse_hex
 
 
 def _button(text):
@@ -201,7 +201,7 @@ class CurveDialog(QDialog):
 
 
 class DrawBar(QWidget):
-    """Create warp target, draw warp mask, and the brush for the mask."""
+    """Pen, paint, eraser, vector, and the warp tools. The brush row follows the tool."""
 
     mode_requested = Signal(str)
     color_changed = Signal(str)
@@ -211,6 +211,8 @@ class DrawBar(QWidget):
         self.brush = Brush()
         self._mode = ""
         self._color = DEFAULT_WARP_COLOR
+        self._aa_index = 1
+        self.brush.antialias = AA_STEPS[self._aa_index]
         self._curve = None
         self._guard = False
         root = QVBoxLayout(self)
@@ -226,9 +228,19 @@ class DrawBar(QWidget):
             tools.addWidget(button)
         self.hex_edit = QLineEdit(self._color)
         self.hex_edit.setFixedWidth(84)
-        self.hex_edit.setToolTip("Warp color. Any hex is treated as a warp target.")
+        self.hex_edit.setToolTip("Ink color. A warp tool uses the same hex.")
         self.hex_edit.editingFinished.connect(self._commit_color)
         tools.addWidget(self.hex_edit)
+        self.white_swatch = _button("")
+        self.black_swatch = _button("")
+        for swatch, tip in ((self.white_swatch, "White ink"), (self.black_swatch, "Black ink")):
+            swatch.setFixedSize(18, 18)
+            swatch.setToolTip(tip)
+        self.white_swatch.clicked.connect(lambda: self.set_color("#FFFFFF"))
+        self.black_swatch.clicked.connect(lambda: self.set_color("#000000"))
+        tools.addWidget(self.white_swatch)
+        tools.addWidget(self.black_swatch)
+        self._mark_swatches()
         tools.addStretch(1)
         root.addLayout(tools)
 
@@ -242,10 +254,8 @@ class DrawBar(QWidget):
         self.min_box = self._spin(1, 512, int(self.brush.size_min))
         self.max_box = self._spin(1, 512, int(self.brush.size_max))
         self.soft = SoftKnob()
-        self.aa_button = _button("AA")
-        self.aa_button.setCheckable(True)
-        self.aa_button.setChecked(True)
-        self.aa_button.setToolTip("Antialiasing")
+        self.aa_button = _button(aa_label(AA_STEPS[self._aa_index]))
+        self.aa_button.setToolTip("Antialiasing. Click to cycle off, .5, 1, and 2.")
         self.size_pressure = _button("Pressure size")
         self.opacity_pressure = _button("Pressure opacity")
         for button in (self.size_pressure, self.opacity_pressure):
@@ -271,7 +281,7 @@ class DrawBar(QWidget):
         self.min_box.valueChanged.connect(self._apply_brush)
         self.max_box.valueChanged.connect(self._apply_brush)
         self.soft.changed.connect(self._soft_changed)
-        self.aa_button.toggled.connect(self._apply_brush)
+        self.aa_button.clicked.connect(self._cycle_aa)
         self.size_pressure.toggled.connect(self._apply_brush)
         self.opacity_pressure.toggled.connect(self._apply_brush)
         self.curve_button.clicked.connect(self._open_curve)
@@ -286,6 +296,17 @@ class DrawBar(QWidget):
 
     def color(self):
         return self._color
+
+    def set_color(self, text):
+        parsed = parse_hex(text)
+        if parsed is None:
+            return
+        changed = parsed != self._color
+        self._color = parsed
+        self.hex_edit.setText(parsed)
+        self._mark_swatches()
+        if changed:
+            self.color_changed.emit(parsed)
 
     def set_mode(self, mode):
         self._mode = mode or ""
@@ -304,9 +325,20 @@ class DrawBar(QWidget):
         if parsed is None:
             self.hex_edit.setText(self._color)
             return
-        self._color = parsed
-        self.hex_edit.setText(parsed)
-        self.color_changed.emit(parsed)
+        self.set_color(parsed)
+
+    def _mark_swatches(self):
+        for button, color in ((self.white_swatch, "#FFFFFF"), (self.black_swatch, "#000000")):
+            border = "#ffffff" if self._color == color else "#3a3a3a"
+            button.setStyleSheet(
+                "QPushButton { background: %s; color: %s; border: 1px solid %s; border-radius: 0; }"
+                % (color, color, border)
+            )
+
+    def _cycle_aa(self):
+        self._aa_index = (self._aa_index + 1) % len(AA_STEPS)
+        self.aa_button.setText(aa_label(AA_STEPS[self._aa_index]))
+        self._apply_brush()
 
     def _soft_changed(self, value):
         self.brush.softness = float(value)
@@ -326,7 +358,7 @@ class DrawBar(QWidget):
         self.brush.size = float(size)
         self.brush.size_min = float(low)
         self.brush.size_max = float(high)
-        self.brush.antialias = self.aa_button.isChecked()
+        self.brush.antialias = AA_STEPS[self._aa_index]
         self.brush.use_size_pressure = self.size_pressure.isChecked()
         self.brush.use_opacity_pressure = self.opacity_pressure.isChecked()
 

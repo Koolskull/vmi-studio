@@ -91,8 +91,8 @@ if darwin:
         info_plist={
             "CFBundleName": "VMI STUDIO",
             "CFBundleDisplayName": "VMI STUDIO",
-            "CFBundleShortVersionString": "0.01",
-            "CFBundleVersion": "0.01",
+            "CFBundleShortVersionString": "0.02",
+            "CFBundleVersion": "0.02",
             "NSHighResolutionCapable": True,
             "LSMinimumSystemVersion": "11.0",
             "CFBundleDocumentTypes": [

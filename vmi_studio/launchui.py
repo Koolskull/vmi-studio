@@ -365,6 +365,7 @@ class Launcher(QWidget):
     """Projects, tasks, recent files, and a folder browser. Open is the load."""
 
     open_requested = Signal(str)
+    new_requested = Signal()
     leave_app = Signal()
 
     def __init__(self, book_path=None, seed_path="", dev=False):
@@ -449,6 +450,10 @@ class Launcher(QWidget):
             button.clicked.connect(lambda _checked=False, name=key: self.show_mode(name))
             self.mode_buttons[key] = button
             modes.addWidget(button)
+        self.new_picture_button = QPushButton("New picture")
+        self.new_picture_button.setObjectName("export")
+        self.new_picture_button.clicked.connect(self.new_requested.emit)
+        modes.addWidget(self.new_picture_button)
         modes.addStretch(1)
         leave = QPushButton("Exit")
         leave.clicked.connect(self.leave_app.emit)

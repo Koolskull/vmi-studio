@@ -42,6 +42,14 @@ class Node:
         self.outline = False
         self.outline_px = 0.0
         self.outline_rgb = (0, 0, 0)
+        # KOSV composite stack. Empty leaves the paint alone.
+        self.effects = []
+        # Cel id -> {type, reference, gain, block}. I and P live on the animation folder.
+        self.cel_marks = {}
+        # Exposure sheet for this layer's cels. None when the layer has no sheet.
+        self.exposure = None
+        # Vector pen spines. The picture is the raster. These are the strokes.
+        self.strokes = []
 
 
 class ArtFile:

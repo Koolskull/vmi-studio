@@ -23,6 +23,9 @@ from vmi_studio.desk import (
     clean_warp_layer,
 )
 from vmi_studio.document import ArtFile, Node, Raster, refresh
+from vmi_studio.exposure import ExposureSheet
+from vmi_studio.kosv import clean_effects, clean_kosv, clean_marks
+from vmi_studio.paint import clean_strokes
 from vmi_studio.tasks import pack_colors, pack_tasks
 
 
@@ -87,6 +90,20 @@ def _layer_row(node, used, blobs):
         "raster": None,
         "children": [_layer_row(child, used, blobs) for child in node.children],
     }
+    effects = clean_effects(getattr(node, "effects", None))
+    if effects:
+        row["effects"] = effects
+    marks = clean_marks(getattr(node, "cel_marks", None))
+    if marks:
+        row["cel_marks"] = marks
+    # The exposure row only. A layer with no sheet omits the key.
+    sheet = getattr(node, "exposure", None)
+    if isinstance(sheet, ExposureSheet):
+        row["exposure"] = sheet.to_row()
+    # The vector record. The raster is the picture, so an empty list is omitted.
+    strokes = clean_strokes(getattr(node, "strokes", None))
+    if strokes:
+        row["strokes"] = strokes
     raster = node.raster
     if node.kind == "layer" and raster is not None and raster.w > 0 and raster.h > 0:
         if isinstance(raster.rgba, bytes):
@@ -148,6 +165,9 @@ def prepare_blueprint(art, objects, playlist="", arrange_locked=True, tasks=None
         "tasks": pack_tasks(tasks),
         "task_colors": pack_colors(task_colors),
     }
+    kosv = getattr(art, "kosv", None)
+    if isinstance(kosv, dict):
+        document["kosv"] = clean_kosv(kosv)
     clip_time = getattr(art, "clip_time", None)
     if isinstance(clip_time, dict) and clip_time.get("name"):
         document["clip_time"] = {
@@ -230,6 +250,13 @@ def _raster_from(archive, row):
     return Raster(int(raster.get("x") or 0), int(raster.get("y") or 0), width, height, data)
 
 
+def load_sheet(row):
+    """None when a layer has no exposure row. A row is rebuilt, not allocated."""
+    if not isinstance(row, dict) or not row:
+        return None
+    return ExposureSheet.from_row(row)
+
+
 def _node_from(row, archive, seen):
     if not isinstance(row, dict):
         raise RuntimeError("This blueprint has a broken layer.")
@@ -288,9 +315,13 @@ def _node_from(row, archive, seen):
         node.outline_rgb = tuple(channels)
     else:
         node.outline_rgb = (0, 0, 0)
+    node.effects = clean_effects(row.get("effects"))
     node.children = [_node_from(child, archive, seen) for child in row.get("children") or []]
     kids = {child.id for child in node.children}
     node.timeline = [ident for ident in row.get("timeline") or [] if ident in kids]
+    node.cel_marks = clean_marks(row.get("cel_marks"), kids)
+    node.exposure = load_sheet(row.get("exposure"))
+    node.strokes = clean_strokes(row.get("strokes"))
     return node
 
 
@@ -372,6 +403,7 @@ def load_blueprint(path, progress=None):
         "tasks": pack_tasks(document.get("tasks")),
         "task_colors": pack_colors(document.get("task_colors")),
     }
+    art.kosv = clean_kosv(document.get("kosv"))
     clip_time = document.get("clip_time")
     if isinstance(clip_time, dict):
         art.clip_time = {

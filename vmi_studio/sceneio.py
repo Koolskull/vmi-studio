@@ -5,6 +5,7 @@ import os
 
 from vmi_studio.composite import composite_image
 from vmi_studio.desk import plan_scene
+from vmi_studio.kosv import clean_effects, clean_kosv, clean_marks
 from vmi_studio.pngout import scale_image
 
 
@@ -110,6 +111,49 @@ def _safe_folder(name):
     return clean
 
 
+def _presets(art):
+    """Saved stacks from the blueprint. Factory looks are copied in when used."""
+    block = getattr(art, "kosv", None)
+    if not isinstance(block, dict):
+        return []
+    return clean_kosv(block)["presets"]
+
+
+def _owners(art, layer_ids):
+    """Paint layers in the object, and every folder above them, in tree order."""
+    wanted = set(layer_ids or [])
+    found = []
+    seen = set()
+
+    def walk(nodes, chain):
+        for node in nodes:
+            nxt = chain + [node]
+            if node.id in wanted:
+                for item in nxt:
+                    if item.id not in seen:
+                        seen.add(item.id)
+                        found.append(item)
+            if node.children:
+                walk(node.children, nxt)
+
+    walk(getattr(art, "layers", None) or [], [])
+    return found
+
+
+def _object_kosv(art, layer_ids):
+    """Effect stacks and I/P marks that travel with this object's slots."""
+    effects = []
+    marks = {}
+    for node in _owners(art, layer_ids):
+        stack = clean_effects(getattr(node, "effects", None))
+        if stack:
+            effects.append({"layer": node.name, "id": node.id, "stack": stack})
+        row = clean_marks(getattr(node, "cel_marks", None))
+        if row:
+            marks[node.id] = row
+    return effects, marks
+
+
 def write_scene(parent, art, objects, playlist="", percent=100, resample="nearest"):
     """Write <parent>/<scene>/ with HOW.txt, scene.json, layers.tsx, and objects/.
 
@@ -135,6 +179,7 @@ def write_scene(parent, art, objects, playlist="", percent=100, resample="neares
     pictures = 0
     missing = 0
     scene_objects = []
+    presets = _presets(art)
     for obj in plan["objects"]:
         obj["folder"] = _safe_folder(obj["folder"])
         base = os.path.join(root, "objects", obj["folder"])
@@ -166,19 +211,27 @@ def write_scene(parent, art, objects, playlist="", percent=100, resample="neares
                 "layers": slot["layers"],
                 "png": png,
             }
+        effects, marks = _object_kosv(art, [node.id for slot in obj["slots"] for node in slot["nodes"]])
+        document = {
+            "name": obj["folder"],
+            "type": obj["type"],
+            "zIndex": obj["zIndex"],
+            "parent": obj.get("parent") or "",
+            "view": obj["view"],
+            "animation": bool(obj.get("animation")),
+            "warpLayer": obj.get("warpLayer") or "",
+            "sound": obj.get("sound") or "",
+            "labels": obj.get("labels") or {},
+            "slots": slot_json,
+        }
+        if presets:
+            document["presets"] = presets
+        if effects:
+            document["effects"] = effects
+        if marks:
+            document["celMarks"] = marks
         with open(os.path.join(base, "object.json"), "w", encoding="utf-8") as handle:
-            json.dump({
-                "name": obj["folder"],
-                "type": obj["type"],
-                "zIndex": obj["zIndex"],
-                "parent": obj.get("parent") or "",
-                "view": obj["view"],
-                "animation": bool(obj.get("animation")),
-                "warpLayer": obj.get("warpLayer") or "",
-                "sound": obj.get("sound") or "",
-                "labels": obj.get("labels") or {},
-                "slots": slot_json,
-            }, handle, indent=2)
+            json.dump(document, handle, indent=2)
             handle.write("\n")
         entry = {
             "id": obj["folder"],
@@ -190,6 +243,10 @@ def write_scene(parent, art, objects, playlist="", percent=100, resample="neares
             "sound": obj.get("sound") or "",
             "slots": slot_map,
         }
+        if effects:
+            entry["effects"] = effects
+        if marks:
+            entry["celMarks"] = marks
         if obj["view"]:
             entry["view"] = obj["view"]
         if obj.get("animation"):
@@ -213,6 +270,8 @@ def write_scene(parent, art, objects, playlist="", percent=100, resample="neares
         }
         if percent != 100:
             payload["exportScale"] = {"percent": percent, "resample": resample}
+        if presets:
+            payload["kosv"] = {"product": "KOSV", "presets": presets}
         json.dump(payload, handle, indent=2)
         handle.write("\n")
     return {"root": root, "pictures": pictures, "missing": missing, "scene": plan["scene"]}

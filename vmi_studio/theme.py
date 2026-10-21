@@ -235,6 +235,11 @@ def bind_modules(ui=None):
     filmstrip.GRID = ui.grid
     filmstrip.FRAME_LINE = ui.frame_line
     filmstrip.NUMBER = ui.number
+    import vmi_studio.xsheet as xsheet
+    xsheet.INK = ui.ink
+    xsheet.QUIET = ui.quiet
+    xsheet.RULE = ui.rule
+    xsheet.FIELD = ui.field
     filmstrip.TimelineGutter.REST = ui.gutter
     filmstrip.TimelineGutter.HOVER = ui.quiet
     filmstrip.TimelineGutter.HELD = ui.ink

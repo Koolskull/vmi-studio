@@ -3,13 +3,15 @@
 import faulthandler
 import math
 import os
+
+import numpy as np
 import shutil
 import sys
 import tempfile
 import time
 import traceback
 
-from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
 
@@ -155,6 +157,7 @@ from vmi_studio.naming import parse_sf, sanitize, slot_key, state_label
 from vmi_studio.openers import open_drawing
 from vmi_studio import theme
 from vmi_studio.launchui import ImagePick, Launcher
+from vmi_studio.newpage import NewPicture, blank_picture
 from vmi_studio.settingsui import SettingsBar
 from vmi_studio.loadgate import EditorShade, LoadGate
 from vmi_studio.sceneio import _safe_folder, plan_scene, write_scene
@@ -163,13 +166,22 @@ from vmi_studio.tasks import TaskBoard
 from vmi_studio import cloud as cloudstore
 from vmi_studio.vmib import prepare_blueprint, write_parts
 from vmi_studio.drawbar import DrawBar
+from vmi_studio.effectbar import EffectBar
 from vmi_studio.exportdialog import PngDialog, favorite_places
+from vmi_studio.exposure import ExposureSheet, project_slots, sheet_from_slots
 from vmi_studio.filmstrip import Filmstrip, TimelineGutter, Transport
+from vmi_studio.xsheet import XSheet, run_command as _run_xsheet
 from vmi_studio.paint import (
+    INK_MODES,
     MaskCanvas,
     fill_polygon,
     fresh_name,
+    ink_spacing,
+    paint_softness,
+    raster_over,
     recolor_raster,
+    sample_stroke,
+    stroke_row,
     stroke_steps,
 )
 from vmi_studio.pngout import scale_image
@@ -1237,6 +1249,7 @@ class Outliner(QTreeView):
             menu.addSeparator()
         rename = menu.addAction("Rename")
         hide = menu.addAction("Show" if not node.visible else "Hide")
+        fresh = menu.addAction("New layer")
         grouping = len(self.model().picked) > 1
         folder = menu.addAction("Create folder and insert layer" if grouping else "New folder")
         image = menu.addAction("Insert image")
@@ -1246,7 +1259,14 @@ class Outliner(QTreeView):
         move = menu.addAction("Move picked here")
         move.setEnabled(node.kind == "group" and bool(self.model().picked))
         delete = menu.addAction("Delete")
-        return warp_prepare, static_export, subfolders, rename, hide, folder, image, anim, move, delete
+        kosv_menu = menu.addMenu("KOSV")
+        kosv_actions = {}
+        for name in ("lens", "stock", "tape", "melt", "break", "glow"):
+            action = kosv_menu.addAction(name)
+            kosv_actions[action] = name
+        clear = kosv_menu.addAction("Clear effects")
+        kosv_actions[clear] = ""
+        return warp_prepare, static_export, subfolders, rename, hide, fresh, folder, image, anim, move, delete, kosv_actions
 
     def _menu(self, pos):
         index = self.indexAt(pos)
@@ -1255,7 +1275,7 @@ class Outliner(QTreeView):
         self.setCurrentIndex(index)
         node = self.model().node_of(index)
         menu = QMenu(self)
-        warp_prepare, static_export, subfolders, rename, hide, folder, image, anim, move, delete = self._fill_menu(menu, node)
+        warp_prepare, static_export, subfolders, rename, hide, fresh, folder, image, anim, move, delete, kosv_actions = self._fill_menu(menu, node)
         grouping = len(self.model().picked) > 1
         picked = menu.exec(self.viewport().mapToGlobal(pos))
         chosen = menu._chosen if menu._chosen is not None else picked
@@ -1269,6 +1289,8 @@ class Outliner(QTreeView):
             self._begin_rename(index)
         elif chosen == hide:
             self.host.toggle_visible(node)
+        elif chosen == fresh:
+            self.host.new_layer()
         elif chosen == folder:
             if grouping:
                 self.host.group_selection()
@@ -1282,6 +1304,8 @@ class Outliner(QTreeView):
             self.host.move_picked(node)
         elif chosen == delete:
             self.host.delete_layers()
+        elif chosen in kosv_actions:
+            self.host.apply_kosv_preset(node, kosv_actions[chosen])
 
 
 class TabClose(QToolButton):
@@ -1487,6 +1511,11 @@ class PictureView(QWidget):
         self._poly = []
         self._dabs = []
         self._brush_radius = 12.0
+        self._ink_image = None
+        self._ink_origin = (0, 0)
+        self._ink_mode = ""
+        self._under = None
+        self._spine = []
         self._tablet_at = 0.0
         self._space = False
         self._drag = None
@@ -1591,9 +1620,17 @@ class PictureView(QWidget):
         self.pan_x *= ratio
         self.pan_y *= ratio
 
+    def _shown_plate(self):
+        if self._under is not None and not self._under.isNull():
+            return self._under
+        return self._image
+
     def _base_scale(self):
-        image = self._image
+        image = self._shown_plate()
         if image is None or image.isNull() or image.width() < 1 or image.height() < 1:
+            dw, dh = self._doc
+            if self.fit and dw > 0 and dh > 0 and self.width() > 8 and self.height() > 8:
+                return min(self.width() / float(dw), self.height() / float(dh))
             return 1.0
         if not self.fit:
             return 1.0
@@ -1680,16 +1717,23 @@ class PictureView(QWidget):
         painter.fillRect(self.rect(), QColor(FIELD))
         painter.setRenderHint(QPainter.Antialiasing, False)
         image = self._image
-        if image is None or image.isNull():
+        plate = self._under if self._under is not None and not self._under.isNull() else image
+        live = self._ink_image is not None or bool(self._spine)
+        if (plate is None or plate.isNull()) and not live:
             painter.setPen(QColor(QUIET))
             painter.drawText(self.rect(), Qt.AlignCenter | Qt.TextWordWrap, self._message or "Open a drawing.")
         else:
             scale = self._shown_scale()
+            if plate is not None and not plate.isNull():
+                iw, ih = plate.width(), plate.height()
+            else:
+                iw, ih = self._doc if self._doc[0] > 0 and self._doc[1] > 0 else (1, 1)
             painter.translate(self.width() / 2.0 + self.pan_x, self.height() / 2.0 + self.pan_y)
             painter.rotate(self.rotation)
             painter.scale(scale, scale)
-            painter.translate(-image.width() / 2.0, -image.height() / 2.0)
-            painter.drawPixmap(0, 0, image)
+            painter.translate(-iw / 2.0, -ih / 2.0)
+            if plate is not None and not plate.isNull():
+                painter.drawPixmap(0, 0, plate)
             self._paint_selection(painter)
             self._paint_draw(painter)
             painter.resetTransform()
@@ -1698,6 +1742,12 @@ class PictureView(QWidget):
                 text = "CLICK CORNERS  ·  ENTER CLOSES  ·  ESC CANCELS"
             elif self.draw_mode == "warp-mask":
                 text = "DRAW THE WARP MASK  ·  ESC LEAVES THE BRUSH"
+            elif self.draw_mode == "vector":
+                text = "VECTOR PEN  ·  THE SPINE STAYS  ·  ESC LEAVES THE PEN"
+            elif self.draw_mode == "line":
+                text = "LINE  ·  ONE STRAIGHT STROKE  ·  ESC LEAVES THE PEN"
+            elif self.draw_mode in INK_MODES:
+                text = "DRAW ON THE LAYER  ·  ESC LEAVES THE BRUSH"
             elif self.cut_active:
                 text = "SHIFT+X DONE   ·   DRAG A SELECTION   ·   CUT TO FOLDER OR DELETE"
             else:
@@ -1729,10 +1779,34 @@ class PictureView(QWidget):
         self._poly = []
         self._dabs = []
         self._hover = None
+        self.clear_live()
         if self.draw_mode and self.cut_active:
             self.cut_active = False
             self.clear_selection()
         self._cursor()
+        self.update()
+
+    def _draws_brush(self):
+        return self.draw_mode == "warp-mask" or self.draw_mode in INK_MODES
+
+    def clear_live(self):
+        """Drop the in-progress stroke preview. The committed picture stays."""
+        self._ink_image = None
+        self._ink_origin = (0, 0)
+        self._ink_mode = ""
+        self._under = None
+        self._spine = []
+        self.update()
+
+    def set_live_ink(self, image, origin_x, origin_y, mode):
+        """A document-space preview. over draws on the picture. layer draws on the under plate."""
+        self._ink_image = image
+        self._ink_origin = (int(origin_x), int(origin_y))
+        self._ink_mode = mode or "over"
+        self.update()
+
+    def set_under(self, pixmap):
+        self._under = pixmap
         self.update()
 
     def close_warp_polygon(self):
@@ -1800,7 +1874,7 @@ class PictureView(QWidget):
         return points
 
     def _doc_to_preview(self, x, y):
-        image = self._image
+        image = self._shown_plate()
         dw, dh = self._doc
         if image is None or image.isNull() or dw <= 0 or dh <= 0:
             return float(x), float(y)
@@ -1823,6 +1897,13 @@ class PictureView(QWidget):
         else:
             painter.drawPolyline(polygon)
 
+    def _preview_factor(self):
+        dw = self._doc[0] if self._doc[0] > 0 else 1
+        plate = self._under if self._under is not None and not self._under.isNull() else self._image
+        if plate is None or plate.isNull() or plate.width() < 1:
+            return 1.0
+        return float(plate.width()) / float(dw)
+
     def _paint_draw(self, painter):
         if self.draw_mode == "warp-target" and (self._poly or self._hover):
             points = list(self._poly)
@@ -1835,28 +1916,55 @@ class PictureView(QWidget):
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPolyline(QPolygonF([QPointF(x, y) for x, y in mapped]))
-        if self.draw_mode != "warp-mask":
+        self._paint_live(painter)
+        if not self._draws_brush():
             return
         color = QColor(self.draw_color or "#FF3EB8")
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(color)
-        dw, dh = self._doc
-        image = self._image
-        scale = 1.0
-        if image is not None and not image.isNull() and dw > 0:
-            scale = float(image.width()) / float(dw)
-        for x, y, radius in self._dabs:
-            px, py = self._doc_to_preview(x, y)
-            reach = max(0.5, float(radius) * scale)
-            painter.drawEllipse(QPointF(px, py), reach, reach)
+        factor = self._preview_factor()
+        if self.draw_mode == "warp-mask":
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            for x, y, radius in self._dabs:
+                px, py = self._doc_to_preview(x, y)
+                reach = max(0.5, float(radius) * factor)
+                painter.drawEllipse(QPointF(px, py), reach, reach)
         if self._hover is not None and self._drag != "mask":
             px, py = self._doc_to_preview(self._hover[0], self._hover[1])
-            reach = max(0.5, float(self._brush_radius) * scale)
+            reach = max(0.5, float(self._brush_radius) * factor)
             painter.setBrush(Qt.NoBrush)
             pen = QPen(color)
             pen.setCosmetic(True)
             painter.setPen(pen)
             painter.drawEllipse(QPointF(px, py), reach, reach)
+
+    def _paint_live(self, painter):
+        """The stroke in progress. One image blit, or the vector spine. No plate rebuild."""
+        image = self._ink_image
+        factor = self._preview_factor()
+        if image is not None and not image.isNull() and self._ink_mode != "hide":
+            px, py = self._doc_to_preview(self._ink_origin[0], self._ink_origin[1])
+            target = QRectF(px, py, image.width() * factor, image.height() * factor)
+            painter.drawImage(target, image)
+        if len(self._spine) < 1:
+            return
+        color = QColor(self.draw_color or "#FFFFFF")
+        painter.setBrush(Qt.NoBrush)
+        previous = None
+        for x, y, radius in self._spine:
+            px, py = self._doc_to_preview(x, y)
+            if previous is not None:
+                pen = QPen(color)
+                pen.setWidthF(max(1.0, float(radius) * 2.0 * factor))
+                pen.setCapStyle(Qt.RoundCap)
+                painter.setPen(pen)
+                painter.drawLine(previous, QPointF(px, py))
+            previous = QPointF(px, py)
+        if previous is not None and self._spine:
+            radius = self._spine[-1][2]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            reach = max(0.5, float(radius) * factor)
+            painter.drawEllipse(previous, reach, reach)
 
     def _draw_press(self, event):
         if not self.draw_mode or event.button() != Qt.LeftButton or self._space:
@@ -1873,7 +1981,7 @@ class PictureView(QWidget):
             self.update()
             event.accept()
             return True
-        if self.draw_mode == "warp-mask":
+        if self._draws_brush():
             self._drag = "mask"
             if self.on_draw:
                 self.on_draw("press", (doc[0], doc[1], pressure))
@@ -1975,7 +2083,7 @@ class PictureView(QWidget):
         if self.draw_mode == "warp-target" and self._drag not in ("pan", "rotate", "cut"):
             self._hover = self.document_point(event.position())
             self.update()
-        elif self.draw_mode == "warp-mask" and self._drag != "mask":
+        elif self._draws_brush() and self._drag != "mask":
             self._hover = self.document_point(event.position())
             self.update()
         if self._drag == "mask":
@@ -2068,7 +2176,7 @@ class PictureView(QWidget):
             fake.points = lambda: []
             if self._gesture(fake) == "pick" and not self._space:
                 doc = self.document_point(pos)
-                if doc is not None and self.draw_mode == "warp-mask":
+                if doc is not None and self._draws_brush():
                     self._drag = "mask"
                     if self.on_draw:
                         self.on_draw("press", (doc[0], doc[1], pressure))
@@ -2743,7 +2851,7 @@ class _PictureJob(QThread):
 
     ready = Signal(int, object, str)
 
-    def __init__(self, generation, width, height, layers, focus, edge, flags, showing):
+    def __init__(self, generation, width, height, layers, focus, edge, flags, showing, frame=0):
         super().__init__()
         self.generation = int(generation)
         self.width = width
@@ -2754,6 +2862,7 @@ class _PictureJob(QThread):
         # Copied on the interface thread. The build must not read a later click.
         self.flags = flags
         self.showing = showing
+        self.frame = int(frame or 0)
 
     def run(self):
         image = None
@@ -2762,7 +2871,7 @@ class _PictureJob(QThread):
             if self.showing:
                 image = composite_scene(
                     self.width, self.height, self.layers, self.focus,
-                    max_edge=self.edge, flags=self.flags,
+                    max_edge=self.edge, flags=self.flags, frame=self.frame,
                 )
         except Exception:
             error = traceback.format_exc()
@@ -2790,11 +2899,18 @@ def raster_from_image(path):
 
 
 class OpenTab:
-    """One drawing in the editor. Its export folder is not shared."""
+    """One drawing in the editor. Its export folder is not shared.
+
+    An empty path is a picture that has not been saved yet.
+    """
 
     def __init__(self, path):
-        self.path = os.path.abspath(path)
-        self.export_dir = default_export_parent(self.path)
+        if path:
+            self.path = os.path.abspath(path)
+            self.export_dir = default_export_parent(self.path)
+        else:
+            self.path = ""
+            self.export_dir = os.path.expanduser("~")
         self.loaded = False
         self.art = None
         self.objects = []
@@ -2882,6 +2998,14 @@ class MainWindow(QMainWindow):
         self._mask = None
         self._mask_id = None
         self._mask_last = None
+        self._ink = None
+        self._ink_id = None
+        self._ink_last = None
+        self._ink_qimage = None
+        self._ink_gen = -1
+        self._ink_hold = False
+        self._live_stroke = False
+        self._spine = []
         self._filling_objects = False
         self._export_side = "layers"
         self._png_percent = 100
@@ -2983,9 +3107,14 @@ class MainWindow(QMainWindow):
         self.draw_bar.mode_requested.connect(self.set_draw_mode)
         self.draw_bar.color_changed.connect(self._warp_recolor)
         self.draw_bar.setEnabled(False)
+        self.effect_bar = EffectBar()
+        self._effect_before = None
+        self.effect_bar.editing.connect(self._effect_bar_edit)
+        self.effect_bar.changed.connect(self._effect_bar_changed)
         self._cut_target = None
         self.cut_bar = self._cut_bar()
         top_layout.addWidget(self.draw_bar)
+        top_layout.addWidget(self.effect_bar)
         top_layout.addWidget(self.cut_bar)
         picture_top.setMinimumHeight(80)
         self.film = Filmstrip()
@@ -3001,12 +3130,27 @@ class MainWindow(QMainWindow):
         self.transport.forward_frame.connect(lambda: self._step_frame(1))
         self.transport.play.connect(self._toggle_play)
         self.transport.loop.connect(self._toggle_loop)
+        self.transport.sheet.connect(self._toggle_xsheet)
+        self._xsheet_open = False
+        self.xsheet = XSheet()
+        self.xsheet.command.connect(self._xsheet_command)
+        self.xsheet_scroll = QScrollArea()
+        self.xsheet_scroll.setWidget(self.xsheet)
+        self.xsheet_scroll.setWidgetResizable(False)
+        self.xsheet_scroll.setFrameShape(QFrame.NoFrame)
+        self.xsheet_scroll.setVisible(False)
         picture_bottom = QWidget()
         bottom_layout = QVBoxLayout(picture_bottom)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(4)
         bottom_layout.addWidget(self.transport)
-        bottom_layout.addWidget(self.film, 1)
+        timing = QWidget()
+        timing_row = QHBoxLayout(timing)
+        timing_row.setContentsMargins(0, 0, 0, 0)
+        timing_row.setSpacing(4)
+        timing_row.addWidget(self.film, 1)
+        timing_row.addWidget(self.xsheet_scroll, 0)
+        bottom_layout.addWidget(timing, 1)
         self.picture_split.addWidget(picture_top)
         self.picture_split.addWidget(picture_bottom)
         self.picture_split.setStretchFactor(0, 1)
@@ -3233,6 +3377,9 @@ class MainWindow(QMainWindow):
 
     def _menu_bar(self):
         file_menu = self.menuBar().addMenu("File")
+        new_action = QAction("New picture", self)
+        new_action.setShortcut(QKeySequence.New)
+        new_action.triggered.connect(self.new_picture)
         open_action = QAction("Open", self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.choose_file)
@@ -3253,6 +3400,7 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Quit", self)
         quit_action.setShortcut(QKeySequence.Quit)
         quit_action.triggered.connect(self._quit)
+        file_menu.addAction(new_action)
         file_menu.addAction(open_action)
         file_menu.addAction(save_action)
         file_menu.addAction(save_as_action)
@@ -3296,6 +3444,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(pan_hint)
         view_menu.addAction(rotate_hint)
         layer_menu = self.menuBar().addMenu("Layer")
+        fresh_action = QAction("New layer", self)
+        fresh_action.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        fresh_action.triggered.connect(self.new_layer)
         image_action = QAction("Insert image", self)
         image_action.triggered.connect(self.pick_image)
         group_action = QAction("Create folder and insert layer", self)
@@ -3308,9 +3459,25 @@ class MainWindow(QMainWindow):
         target_action.triggered.connect(lambda: self.set_draw_mode("warp-target"))
         mask_action = QAction("Draw warp mask", self)
         mask_action.triggered.connect(lambda: self.set_draw_mode("warp-mask"))
+        pen_action = QAction("Pen", self)
+        pen_action.triggered.connect(lambda: self.set_draw_mode("pen"))
+        paint_action = QAction("Paint", self)
+        paint_action.triggered.connect(lambda: self.set_draw_mode("paint"))
+        eraser_action = QAction("Eraser", self)
+        eraser_action.triggered.connect(lambda: self.set_draw_mode("eraser"))
+        vector_action = QAction("Vector pen", self)
+        vector_action.triggered.connect(lambda: self.set_draw_mode("vector"))
+        line_action = QAction("Line", self)
+        line_action.triggered.connect(lambda: self.set_draw_mode("line"))
+        layer_menu.addAction(fresh_action)
         layer_menu.addAction(image_action)
         layer_menu.addAction(group_action)
         layer_menu.addAction(anim_action)
+        layer_menu.addAction(pen_action)
+        layer_menu.addAction(paint_action)
+        layer_menu.addAction(eraser_action)
+        layer_menu.addAction(vector_action)
+        layer_menu.addAction(line_action)
         layer_menu.addAction(target_action)
         layer_menu.addAction(mask_action)
         self._settings_header()
@@ -3422,6 +3589,77 @@ class MainWindow(QMainWindow):
         """File → Open. Project files are chosen from the browser tab."""
         self.show_browser()
 
+    def new_picture(self):
+        """File → New picture, and the launcher button. A preset or a typed size."""
+        if getattr(self, "_loading", False):
+            self.status.showMessage("Still reading.")
+            return
+        dialog = NewPicture(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        wide, high = dialog.plate()
+        self.open_blank(wide, high)
+
+    def open_blank(self, width, height):
+        """Open an unsaved plate. Fit view keeps a large preset on this screen."""
+        art = blank_picture(width, height, self._fresh_title(width, height))
+        self._stash(self._shown_index)
+        index = self._begin_blank(art)
+        project = self._projects[index]
+        self.history = project.history
+        self.picked = project.picked
+        self.model.picked = self.picked
+        self.objects = project.objects
+        self._loading_index = index
+        self.show_file(art, restore=False)
+        self._loading_index = -1
+        self._finish_tab(index)
+        if art.layers:
+            self.picked.add(art.layers[0].id)
+            self._select_layer(art.layers[0].id)
+        if getattr(self, "draw_bar", None) is not None:
+            self.draw_bar.set_color("#FFFFFF")
+        self.status.showMessage(
+            "New picture %d×%d. Draw on Ink. Save blueprint writes the file."
+            % (art.width, art.height)
+        )
+
+    def _fresh_title(self, width, height):
+        base = "Untitled %d×%d" % (int(width), int(height))
+        names = set()
+        for project in self._projects:
+            if project.art is not None and project.art.file_name:
+                names.add(project.art.file_name)
+        if self.art is not None and self.art.file_name:
+            names.add(self.art.file_name)
+        if base not in names:
+            return base
+        number = 2
+        while "%s %d" % (base, number) in names:
+            number += 1
+        return "%s %d" % (base, number)
+
+    def _begin_blank(self, art):
+        """A tab with no path. Save blueprint asks where the file goes."""
+        project = OpenTab("")
+        project.low_res = True
+        self._projects.append(project)
+        project_index = len(self._projects) - 1
+        self._tab_guard = True
+        tab_index = self.tabs.addTab(art.file_name)
+        self.tabs.setTabButton(
+            tab_index, QTabBar.ButtonPosition.RightSide, self._tab_close_button()
+        )
+        self.tabs.setTabToolTip(tab_index, project.export_dir)
+        self.tabs.setCurrentIndex(tab_index)
+        self._tab_guard = False
+        self._on_browser = False
+        self._shown_index = project_index
+        self._show_editor_page()
+        self._tab_bar.setVisible(True)
+        self._show_export_label()
+        return project_index
+
     def save_blueprint(self):
         """Ctrl+S. An open blueprint is overwritten. A drawing is saved beside it."""
         if not self.art:
@@ -3487,6 +3725,14 @@ class MainWindow(QMainWindow):
         self.art.path = os.path.abspath(path)
         self.art.file_name = os.path.basename(path)
         self.art.kind = "vmib"
+        index = self._shown_index
+        if 0 <= index < len(self._projects):
+            project = self._projects[index]
+            project.path = self.art.path
+            project.art = self.art
+            tab = self._project_tab(index)
+            self.tabs.setTabText(tab, self.art.file_name)
+            self.tabs.setTabToolTip(tab, project.export_dir)
         self.art.project = {
             "objects": list(self.objects),
             "playlist": self.playlist,
@@ -3548,6 +3794,7 @@ class MainWindow(QMainWindow):
                 seed = session.get("path") or ""
         self.browser_page = Launcher(book_path=book_path, seed_path=seed, dev=False)
         self.browser_page.open_requested.connect(self.open_path)
+        self.browser_page.new_requested.connect(self.new_picture)
         self.browser_page.leave_app.connect(self._quit)
 
     def _project_tab(self, project_index):
@@ -3675,6 +3922,7 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
         self.setWindowTitle("VMI STUDIO — %s" % self.art.file_name)
         self._show_export_label()
+        self._sync_effect_bar()
         self._save_session()
 
     def _show_export_label(self):
@@ -3823,6 +4071,8 @@ class MainWindow(QMainWindow):
     def _clear_editor(self):
         self._stop_play()
         self.art = None
+        self._effect_before = None
+        self._sync_effect_bar()
         self.objects = []
         self.picked = set()
         self.model.picked = self.picked
@@ -4349,6 +4599,7 @@ class MainWindow(QMainWindow):
         self._show_editor_page()
         if same and session.get("selected"):
             self._select_layer(session["selected"])
+        self._sync_effect_bar()
         self._save_session()
 
     def _objects_from(self, rows):
@@ -4483,15 +4734,22 @@ class MainWindow(QMainWindow):
         self._preview_edge = edge
         flags = capture_flags(self.art.layers)
         showing = bool(preview_paint(self.art.layers, focus))
-        return focus, edge, flags, showing
+        return focus, edge, flags, showing, self._kosv_frame()
+
+    def _kosv_frame(self):
+        clip = getattr(self.art, "clip_time", None) or {}
+        try:
+            return int(clip.get("current") or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def _build_picture(self):
-        focus, edge, flags, showing = self._picture_request()
+        focus, edge, flags, showing, frame = self._picture_request()
         if not showing:
             return None
         return composite_scene(
             self.art.width, self.art.height, self.art.layers, focus,
-            max_edge=edge, flags=flags,
+            max_edge=edge, flags=flags, frame=frame,
         )
 
     def _start_picture_job(self):
@@ -4503,10 +4761,10 @@ class MainWindow(QMainWindow):
             return
         self._picture_pending = False
         generation = self._picture_generation
-        focus, edge, flags, showing = self._picture_request()
+        focus, edge, flags, showing, frame = self._picture_request()
         job = _PictureJob(
             generation, self.art.width, self.art.height, self.art.layers,
-            focus, edge, flags, showing,
+            focus, edge, flags, showing, frame,
         )
         job.ready.connect(self._finish_picture)
         job.finished.connect(lambda job=job: self._drop_picture_job(job))
@@ -4526,11 +4784,17 @@ class MainWindow(QMainWindow):
             print(error, file=sys.stderr)
             self.status.showMessage("The picture could not be built.")
         elif current:
+            if self._ink_hold and not self._live_stroke:
+                self._ink_hold = False
+                self._drop_ink()
+                self.picture.clear_live()
             showing = preview_paint(self.art.layers, self._focus_id())
             self._flat = image
             self.ink = ink_count(self._flat)
             if self._flat is None:
-                if showing and not loaded_paint(self.art.layers):
+                if self.art.width > 1 and self.art.height > 1:
+                    self.picture.set_image(self._empty_plate())
+                elif showing and not loaded_paint(self.art.layers):
                     self.picture.clear_message("This file has no layer pictures.")
                 else:
                     self.picture.clear_message("Nothing visible.")
@@ -4551,6 +4815,22 @@ class MainWindow(QMainWindow):
                 self.picture.repaint()
                 self._release_gate()
 
+    def _empty_plate(self):
+        """A framed plate at the fit size, before the first stroke has pixels."""
+        width, height = int(self.art.width), int(self.art.height)
+        edge = self._picture_edge()
+        if edge and max(width, height) > edge:
+            scale = float(edge) / float(max(width, height))
+            width = max(1, int(round(width * scale)))
+            height = max(1, int(round(height * scale)))
+        image = QImage(width, height, QImage.Format.Format_RGBA8888)
+        image.fill(QColor("#111111"))
+        painter = QPainter(image)
+        painter.setPen(QColor("#2a2a2a"))
+        painter.drawRect(0, 0, width - 1, height - 1)
+        painter.end()
+        return QPixmap.fromImage(image)
+
     def _caption(self):
         if not self.art:
             self.caption.setText("")
@@ -4561,6 +4841,9 @@ class MainWindow(QMainWindow):
             self.caption.setText("%s is hidden." % node.name)
             return
         folder = owning_animation(self.art.layers, node.id) if node else None
+        if node is not None and folder is None and getattr(node, "raster", None) is None:
+            self.caption.setText("%s  %d×%d" % (node.name, self.art.width, self.art.height))
+            return
         if folder is not None and getattr(folder, "frames", None):
             play = self.film.playhead if getattr(self, "film", None) is not None else getattr(folder, "show_frame", 0)
             held = cel_at(folder, play)
@@ -4592,6 +4875,7 @@ class MainWindow(QMainWindow):
         self._export_side = "layers"
         self._sync_playhead_to_selection()
         self._sync_outline_controls()
+        self._sync_effect_bar()
         self._caption()
         self._refresh_timeline()
         if self.art and animation_folders(self.art.layers):
@@ -4759,6 +5043,22 @@ class MainWindow(QMainWindow):
         self._hide_image_pick()
         self.insert_image(path)
 
+    def new_layer(self):
+        """An empty paint layer in front of the current row. A folder receives it inside."""
+        if not self.art:
+            self.status.showMessage("Open a drawing first.")
+            return None
+        name = fresh_name(list(walk(self.art.layers)), "Layer")
+        node = Node(_next_id(self.art.layers), name, "layer")
+        with self._edit("the layer"):
+            self._place_in_front(node)
+            refresh(self.art.layers)
+            self.model.set_layers(self.art.layers)
+        reset_plate_cache()
+        self.select_only(node)
+        self.status.showMessage("New layer %s." % name)
+        return node
+
     def insert_image(self, path):
         """Read one picture and put it in front of the current layer."""
         if not self.art:
@@ -4855,6 +5155,7 @@ class MainWindow(QMainWindow):
         self._mask = None
         self._mask_id = None
         self._mask_last = None
+        self._drop_ink()
         picture = getattr(self, "picture", None)
         if picture is not None:
             picture.set_draw_mode("")
@@ -4873,7 +5174,7 @@ class MainWindow(QMainWindow):
             was = current
             self._clear_draw()
             if was:
-                self.status.showMessage("Warp tool off.")
+                self.status.showMessage("Tool off.")
             return
         if not self.art:
             self.status.showMessage("Open a drawing first.")
@@ -4884,11 +5185,12 @@ class MainWindow(QMainWindow):
         self._cut_target = None
         self._mask = None
         self._mask_last = None
+        self._drop_ink()
         if mode == "warp-mask":
             self._ensure_mask_layer()
         color = self.draw_bar.color() if getattr(self, "draw_bar", None) is not None else "#FF3EB8"
         picture.set_draw_mode(mode, color)
-        if mode == "warp-mask":
+        if mode == "warp-mask" or mode in INK_MODES:
             picture._brush_radius = self.draw_bar.brush.diameter_for(1.0) / 2.0
         if getattr(self, "draw_bar", None) is not None:
             self.draw_bar.set_mode(mode)
@@ -4896,6 +5198,16 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Click the corners of the warp target. Enter closes the polygon.")
         elif mode == "warp-mask":
             self.status.showMessage("Draw the warp mask.")
+        elif mode == "vector":
+            self.status.showMessage("Vector pen. The spine is kept, and the picture updates when you release.")
+        elif mode == "line":
+            self.status.showMessage("Line. Release writes one straight stroke.")
+        elif mode == "eraser":
+            self.status.showMessage("Eraser. Release writes the layer.")
+        elif mode == "paint":
+            self.status.showMessage("Paint. Release writes the layer.")
+        elif mode == "pen":
+            self.status.showMessage("Pen. Release writes the layer.")
 
     def _ensure_mask_layer(self):
         """Reuse a warp mask in this folder, or make one. The empty layer is one undo step."""
@@ -4929,11 +5241,20 @@ class MainWindow(QMainWindow):
         if phase == "close":
             self._close_warp_target(payload or [])
         elif phase == "press":
-            self._mask_press(*payload)
+            if self.picture.draw_mode in INK_MODES:
+                self._ink_press(*payload)
+            else:
+                self._mask_press(*payload)
         elif phase == "move":
-            self._mask_move(*payload)
+            if self.picture.draw_mode in INK_MODES:
+                self._ink_move(*payload)
+            else:
+                self._mask_move(*payload)
         elif phase == "release":
-            self._mask_release()
+            if self.picture.draw_mode in INK_MODES:
+                self._ink_release()
+            else:
+                self._mask_release()
 
     def _close_warp_target(self, points):
         """The polygon becomes a layer only when it closes. Escape leaves nothing."""
@@ -4964,6 +5285,264 @@ class MainWindow(QMainWindow):
         if node is None or getattr(node, "marker", "") != "mask":
             return None
         return node
+
+    def _fresh_canvas(self):
+        """A plate-sized buffer at 1080p, so a stroke does not recopy itself as it grows."""
+        canvas = MaskCanvas(self.art.width, self.art.height, None)
+        if self.art.width * self.art.height <= 1920 * 1080:
+            canvas.arr = np.zeros((self.art.height, self.art.width, 4), dtype=np.uint8)
+            canvas.x = 0
+            canvas.y = 0
+            canvas.generation = 1
+        return canvas
+
+    def _drop_ink(self):
+        self._ink = None
+        self._ink_last = None
+        self._ink_qimage = None
+        self._ink_gen = -1
+        self._spine = []
+        self._live_stroke = False
+
+    def _ink_layer(self):
+        """The selected layer, or a new Ink layer in front. A warp layer is left alone."""
+        current = self._current_node()
+        if current is not None and current.kind == "layer" and getattr(current, "marker", "") not in ("target", "mask"):
+            return current
+        if not self.art:
+            return None
+        name = fresh_name(list(walk(self.art.layers)), "Ink")
+        node = Node(_next_id(self.art.layers), name, "layer")
+        with self._edit("the ink layer"):
+            if current is not None and current.kind == "group":
+                current.children.append(node)
+            else:
+                self._draw_home().append(node)
+            refresh(self.art.layers)
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.select_only(node)
+        self._save_session()
+        return node
+
+    def _is_front_layer(self, node):
+        visible = [
+            item for item in paint_layers(self.art.layers)
+            if item.visible and not getattr(item, "omit", "")
+        ]
+        return bool(visible) and visible[-1] is node
+
+    def _copy_tile(self, image, arr, x0, y0, x1, y1):
+        x0 = max(0, int(x0))
+        y0 = max(0, int(y0))
+        x1 = min(int(arr.shape[1]), int(x1))
+        y1 = min(int(arr.shape[0]), int(y1))
+        if x1 <= x0 or y1 <= y0:
+            return
+        tile = np.ascontiguousarray(arr[y0:y1, x0:x1])
+        height, width = tile.shape[:2]
+        source = QImage(tile.data, width, height, width * 4, QImage.Format.Format_RGBA8888)
+        painter = QPainter(image)
+        painter.drawImage(QPoint(x0, y0), source)
+        painter.end()
+
+    def _publish_ink(self, mode):
+        canvas = self._ink
+        if canvas is None or canvas.arr is None or self.picture is None:
+            return
+        rebuild = self._ink_qimage is None or self._ink_gen != canvas.generation
+        if rebuild:
+            height, width = canvas.arr.shape[:2]
+            image = QImage(width, height, QImage.Format.Format_RGBA8888)
+            image.fill(0)
+            self._copy_tile(image, canvas.arr, 0, 0, width, height)
+            self._ink_qimage = image
+            self._ink_gen = canvas.generation
+            canvas.take_dirty()
+        else:
+            box = canvas.take_dirty()
+            if box is not None:
+                self._copy_tile(self._ink_qimage, canvas.arr, box[0], box[1], box[2], box[3])
+        self.picture.set_live_ink(self._ink_qimage, canvas.x, canvas.y, mode)
+
+    def _erase_under(self, node):
+        """One plate of everything except this layer, so the eraser can preview on top of it."""
+        if not self._is_front_layer(node):
+            self.picture.set_under(None)
+            return
+        focus, edge, flags, showing, frame = self._picture_request()
+        row = flags.get(node.id)
+        if row is not None:
+            flags[node.id] = (False, row[1], row[2])
+        image = None
+        if showing:
+            image = composite_scene(
+                self.art.width, self.art.height, self.art.layers, focus,
+                max_edge=edge, flags=flags, frame=frame,
+            )
+        if image is None:
+            width, height = self.picture._doc
+            plate = self.picture._image
+            if plate is not None and not plate.isNull():
+                width, height = plate.width(), plate.height()
+            blank = QImage(max(1, int(width)), max(1, int(height)), QImage.Format.Format_RGBA8888)
+            blank.fill(0)
+            self.picture.set_under(QPixmap.fromImage(blank))
+            return
+        self.picture.set_under(_pixmap(present(image).convert("RGBA")))
+
+    def _ink_press(self, x, y, pressure):
+        if not self.art:
+            return
+        mode = self.picture.draw_mode
+        node = self._ink_layer()
+        if node is None:
+            return
+        self._live_stroke = True
+        self._ink_hold = False
+        self._ink_id = node.id
+        brush = self.draw_bar.brush
+        color = self.draw_bar.color()
+        radius = brush.diameter_for(pressure) / 2.0
+        self.picture._brush_radius = radius
+        self.picture.draw_color = color
+        if mode in ("vector", "line"):
+            self._spine = [(float(x), float(y), float(pressure))]
+            self.picture._spine = [(float(x), float(y), radius)]
+            self.picture.update()
+            return
+        if mode == "eraser":
+            self._ink = MaskCanvas(self.art.width, self.art.height, node.raster)
+            self._erase_under(node)
+            preview = "layer" if self.picture._under is not None else "hide"
+        else:
+            self._ink = self._fresh_canvas()
+            self.picture.set_under(None)
+            preview = "over"
+        soft = paint_softness(mode, brush.softness)
+        self._ink.stamp(x, y, brush, pressure, color, erase=(mode == "eraser"), softness=soft)
+        self._ink_last = (float(x), float(y), float(pressure))
+        self._publish_ink(preview)
+
+    def _ink_move(self, x, y, pressure):
+        if not self.art or not self._live_stroke:
+            return
+        mode = self.picture.draw_mode
+        brush = self.draw_bar.brush
+        color = self.draw_bar.color()
+        self.picture.draw_color = color
+        self.picture._brush_radius = brush.diameter_for(pressure) / 2.0
+        if mode == "vector":
+            if self._spine:
+                last = self._spine[-1]
+                if abs(float(x) - last[0]) + abs(float(y) - last[1]) < 1.25:
+                    return
+            self._spine.append((float(x), float(y), float(pressure)))
+            self.picture._spine.append((float(x), float(y), brush.diameter_for(pressure) / 2.0))
+            self.picture.update()
+            return
+        if mode == "line":
+            if not self._spine:
+                return
+            start = self._spine[0]
+            radius = brush.diameter_for(pressure) / 2.0
+            self._spine = [start, (float(x), float(y), float(pressure))]
+            self.picture._spine = [
+                (start[0], start[1], brush.diameter_for(start[2]) / 2.0),
+                (float(x), float(y), radius),
+            ]
+            self.picture._brush_radius = radius
+            self.picture.update()
+            return
+        if self._ink is None or self._ink_last is None:
+            return
+        x0, y0, p0 = self._ink_last
+        spacing = ink_spacing(brush.diameter_for(max(p0, pressure)), mode)
+        steps = list(stroke_steps(x0, y0, p0, x, y, pressure, spacing))
+        if not steps or abs(steps[-1][0] - float(x)) > 0.01 or abs(steps[-1][1] - float(y)) > 0.01:
+            steps.append((float(x), float(y), float(pressure)))
+        soft = paint_softness(mode, brush.softness)
+        erase = mode == "eraser"
+        for sx, sy, sp in steps:
+            self._ink.stamp(sx, sy, brush, sp, color, erase=erase, softness=soft)
+        self._ink_last = (float(x), float(y), float(pressure))
+        preview = "layer" if erase and self.picture._under is not None else ("hide" if erase else "over")
+        self._publish_ink(preview)
+
+    def _ink_release(self):
+        mode = self.picture.draw_mode if self.picture is not None else ""
+        self._live_stroke = False
+        node = find_node(self.art.layers, self._ink_id) if self.art and self._ink_id else None
+        if mode == "vector":
+            self._commit_vector(node, list(self._spine))
+            return
+        if mode == "line":
+            self._commit_vector(node, list(self._spine), keep_spine=False)
+            return
+        canvas = self._ink
+        self._ink_last = None
+        if canvas is None or not canvas.changed or node is None or not self.art:
+            self._drop_ink()
+            if self.picture is not None:
+                self.picture.clear_live()
+            return
+        soft = paint_softness(mode, self.draw_bar.brush.softness)
+        if mode == "eraser":
+            painted = canvas.raster()
+            if painted is None and node.raster is None:
+                self._drop_ink()
+                self.picture.clear_live()
+                return
+        else:
+            painted = raster_over(node.raster, canvas.raster())
+            if painted is node.raster:
+                self._drop_ink()
+                self.picture.clear_live()
+                return
+        with self._edit("the stroke"):
+            node.raster = painted
+            if mode != "eraser":
+                node.color = node.color or self.draw_bar.color()
+        self._ink = None
+        self._ink_hold = True
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.recomposite()
+        self._save_session()
+
+    def _commit_vector(self, node, points, keep_spine=True):
+        if node is None or not self.art or len(points) < 1:
+            self._drop_ink()
+            if self.picture is not None:
+                self.picture.clear_live()
+            return
+        brush = self.draw_bar.brush
+        color = self.draw_bar.color()
+        mode = "vector" if keep_spine else "line"
+        soft = paint_softness(mode, brush.softness)
+        canvas = self._fresh_canvas()
+
+        def spacing_at(pressure):
+            return ink_spacing(brush.diameter_for(pressure), mode)
+
+        for x, y, pressure in sample_stroke(points, spacing_at):
+            canvas.stamp(x, y, brush, pressure, color, softness=soft)
+        if not canvas.changed:
+            self._drop_ink()
+            self.picture.clear_live()
+            return
+        row = stroke_row(color, points, brush, soft)
+        with self._edit("the vector stroke" if keep_spine else "the line"):
+            node.raster = raster_over(node.raster, canvas.raster())
+            if keep_spine:
+                node.strokes = list(getattr(node, "strokes", None) or []) + [row]
+            node.color = node.color or color
+        self._drop_ink()
+        self._ink_hold = True
+        reset_plate_cache()
+        self.model.set_layers(self.art.layers)
+        self.recomposite()
+        self._save_session()
 
     def _mask_press(self, x, y, pressure):
         if not self.art:
@@ -5067,7 +5646,7 @@ class MainWindow(QMainWindow):
                 self.status.showMessage("Warp target cancelled.")
                 return True
             self._clear_draw()
-            self.status.showMessage("Warp tool off.")
+            self.status.showMessage("Tool off.")
             return True
         if key == Qt.Key_Backspace and picture.draw_mode == "warp-target" and picture._poly:
             picture._poly.pop()
@@ -5163,7 +5742,15 @@ class MainWindow(QMainWindow):
         if film is None:
             return
         node = self._current_node()
+        folder = owning_animation(self.art.layers, node.id) if self.art is not None and node is not None else None
+        if folder is None and self.art is not None:
+            for item in animation_folders(self.art.layers):
+                if getattr(item, "exposure", None) is not None:
+                    folder = item
+                    break
+        film.sheet = getattr(folder, "exposure", None) if folder is not None else None
         film.set_project(self.art, selected=node.id if node is not None else "")
+        self._sync_xsheet()
         if not self._timeline_dragged and self._timeline_open:
             self._seed_timeline_split()
 
@@ -5182,7 +5769,59 @@ class MainWindow(QMainWindow):
     def _film_scrubbed(self, frame):
         """The ruler or the line moved. The picture follows. This is not an edit."""
         self._stamp_playhead(frame)
+        sheet = getattr(self, "xsheet", None)
+        if sheet is not None:
+            sheet.set_playhead(frame)
         self._caption()
+        self.recomposite()
+
+    def _toggle_xsheet(self):
+        self._xsheet_open = not getattr(self, "_xsheet_open", False)
+        scroll = getattr(self, "xsheet_scroll", None)
+        if scroll is None:
+            return
+        scroll.setVisible(self._xsheet_open)
+        self.transport._mark(self.transport.sheet_button, self._xsheet_open)
+        if self._xsheet_open:
+            self._sync_xsheet()
+            scroll.setFixedWidth(min(360, max(140, self.xsheet.sizeHint().width() + 8)))
+
+    def _sync_xsheet(self):
+        """Show each animation folder as a column. A missing sheet is only a preview."""
+        widget = getattr(self, "xsheet", None)
+        if widget is None:
+            return
+        columns = []
+        if self.art is not None:
+            for folder in animation_folders(self.art.layers):
+                sheet = getattr(folder, "exposure", None)
+                if isinstance(sheet, ExposureSheet):
+                    columns.append((folder.name, sheet.slots))
+                else:
+                    columns.append((folder.name, project_slots(frame_map(folder))))
+        widget.set_columns(columns)
+        film = getattr(self, "film", None)
+        if film is not None:
+            widget.set_playhead(film.playhead)
+
+    def _xsheet_command(self, col, start, count, name, arg):
+        """Run one OpenToonz cell command on that level. The first edit stores the sheet."""
+        if self.art is None:
+            return
+        folders = animation_folders(self.art.layers)
+        if col < 0 or col >= len(folders):
+            return
+        folder = folders[col]
+        failed = False
+        with self._edit("the xsheet"):
+            sheet = getattr(folder, "exposure", None)
+            if not isinstance(sheet, ExposureSheet):
+                sheet = sheet_from_slots(project_slots(frame_map(folder)))
+                folder.exposure = sheet
+            failed = not _run_xsheet(sheet, name, start, count, arg)
+        if failed and name == "autoexpose":
+            self.status.showMessage("Autoexpose needs increasing drawing numbers.")
+        self._sync_film()
         self.recomposite()
 
     def _sync_playhead_to_selection(self):
@@ -5545,6 +6184,42 @@ class MainWindow(QMainWindow):
         self.recomposite()
         self._save_session()
 
+    def apply_kosv_preset(self, node, name):
+        """Put a factory KOSV stack on this layer, or clear it. Undo restores the previous stack."""
+        if not self.art or node is None:
+            return
+        from vmi_studio.kosv import make_stack
+
+        with self._edit("the KOSV preset"):
+            node.effects = make_stack(name) if name else []
+        if name:
+            self.status.showMessage("%s uses the %s preset." % (node.name, name))
+        else:
+            self.status.showMessage("%s has no KOSV effects." % node.name)
+        self.tree.viewport().update()
+        self._sync_effect_bar()
+        self.recomposite()
+        self._save_session()
+
+    def _sync_effect_bar(self):
+        bar = getattr(self, "effect_bar", None)
+        if bar is None:
+            return
+        bar.bind(self._current_layer() if self.art else None)
+
+    def _effect_bar_edit(self):
+        if self._effect_before is None and self.art:
+            self._effect_before = capture(self)
+
+    def _effect_bar_changed(self):
+        before = self._effect_before
+        self._effect_before = None
+        if not self.art:
+            return
+        if before is not None:
+            self.history.remember(self, "the KOSV effects", before)
+        self.recomposite()
+
     def toggle_pick(self, node):
         if node is None:
             return
@@ -5795,6 +6470,7 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
         self.tree.viewport().update()
         self.recomposite()
+        self._sync_effect_bar()
         self._save_session()
 
     def _cut_key(self, event):

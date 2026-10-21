@@ -6,9 +6,28 @@ is what Undo puts back. Twenty steps is the limit, so a big cut does not
 keep every earlier copy.
 """
 
+import json
 from contextlib import contextmanager
 
 from vmi_studio.document import refresh
+from vmi_studio.exposure import ExposureSheet
+from vmi_studio.kosv import clean_effects, clean_marks
+from vmi_studio.paint import clean_strokes
+
+
+def _exposure_text(node):
+    sheet = getattr(node, "exposure", None)
+    if not isinstance(sheet, ExposureSheet):
+        return ""
+    return json.dumps(sheet.to_row(), sort_keys=True, separators=(",", ":"))
+
+
+def _kosv_text(raw, clean):
+    return json.dumps(clean(raw), sort_keys=True, separators=(",", ":"))
+
+
+def _strokes_text(node):
+    return json.dumps(clean_strokes(getattr(node, "strokes", None)), sort_keys=True, separators=(",", ":"))
 
 
 LIMIT = 20
@@ -41,6 +60,10 @@ def _layer_props(node):
         bool(getattr(node, "outline", False)),
         float(getattr(node, "outline_px", 0) or 0),
         tuple(int(channel) for channel in (getattr(node, "outline_rgb", None) or (0, 0, 0))[:3]),
+        _kosv_text(getattr(node, "effects", None), clean_effects),
+        _kosv_text(getattr(node, "cel_marks", None), clean_marks),
+        _exposure_text(node),
+        _strokes_text(node),
     )
 
 
@@ -127,6 +150,7 @@ def apply_snap(window, snap):
             name, kind, visible, opacity, blend, clip, shapes,
             mute, solo, animation, timeline, warp, raster,
             marker, color, vectors, frames, outline, outline_px, outline_rgb,
+            effects, cel_marks, exposure, strokes,
         ) = props
         node.name = name
         node.kind = kind
@@ -148,6 +172,10 @@ def apply_snap(window, snap):
         node.outline = bool(outline)
         node.outline_px = float(outline_px or 0)
         node.outline_rgb = tuple(int(channel) for channel in outline_rgb)
+        node.effects = json.loads(effects)
+        node.cel_marks = json.loads(cel_marks)
+        node.exposure = ExposureSheet.from_row(json.loads(exposure)) if exposure else None
+        node.strokes = clean_strokes(json.loads(strokes))
         if hasattr(node, "_outline_cache"):
             del node._outline_cache
     window.art.layers = _build(snap.skeleton, snap.nodes)

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from vmi_studio import theme
 from vmi_studio.document import animation_folders, cel_at, find_node, frame_map, spare_cels
+from vmi_studio.exposure import cel_mark
 
 GUTTER = 132
 CELL = 14
@@ -195,6 +196,7 @@ class Transport(QWidget):
     forward_frame = Signal()
     play = Signal()
     loop = Signal()
+    sheet = Signal()
 
     def __init__(self):
         super().__init__()
@@ -207,7 +209,8 @@ class Transport(QWidget):
         self.play_button = self._button("Play", "Play or stop", self.play)
         self.forward_button = self._button("Forward", "Next frame", self.forward_frame)
         self.loop_button = self._button("Loop", "Loop playback", self.loop)
-        for button in (self.back_button, self.play_button, self.forward_button, self.loop_button):
+        self.sheet_button = self._button("Sheet", "Vertical X-sheet", self.sheet)
+        for button in (self.back_button, self.play_button, self.forward_button, self.loop_button, self.sheet_button):
             row.addWidget(button)
         row.addStretch(1)
         self.setStyleSheet(theme.transport_sheet())
@@ -259,10 +262,17 @@ class Filmstrip(QWidget):
         self._drag = None
         self._scrub = False
         self._hover = None
+        self.sheet = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.ClickFocus)
         self.setMinimumHeight(HEAD + ROW + 6)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def sheet_for(self, folder=None):
+        """The exposure for one row. A folder sheet wins. No folder uses the widget sheet."""
+        if folder is not None:
+            return getattr(folder, "exposure", None)
+        return self.sheet
 
     def set_project(self, art, selected=""):
         changed = art is not self.art
@@ -588,7 +598,7 @@ class Filmstrip(QWidget):
         painter.save()
         painter.setClipRect(QRect(GUTTER, top, max(0, self.width() - GUTTER), ROW))
         column = QColor(GRID)
-        for frame, length, cel in self.blocks(folder):
+        for index, (frame, length, cel) in enumerate(self.blocks(folder)):
             left = self._x_of(int(frame))
             span = int(length) * CELL
             if span <= 0 or left + span < GUTTER or left > self.width():
@@ -600,6 +610,7 @@ class Filmstrip(QWidget):
             ink = INK if cel.id == self.selected else CELL_EDGE
             self._paint_frame_numbers(painter, folder, int(frame), int(length), top, INK)
             self._stroke_cell(painter, QRect(left, top, span, ROW), ink)
+            self._show_exposure(painter, left, top, span, index, folder)
         painter.restore()
         if not frame_map(folder):
             painter.setPen(QColor(RULE))
@@ -638,6 +649,19 @@ class Filmstrip(QWidget):
             str(marks[0]),
         )
         painter.restore()
+
+    def _show_exposure(self, painter, left, top, span, slot, folder=None):
+        """Hold or reuse on this cel. The cel's timeline order is the slot.
+
+        A loaded folder carries its own sheet. No sheet leaves the cel alone.
+        """
+        mark = cel_mark(self.sheet_for(folder), slot)
+        if not mark:
+            return
+        if mark == "hold":
+            painter.fillRect(left + span - BORDER - 5, top + BORDER, 4, 1, QColor(INK))
+            return
+        painter.fillRect(left + span - BORDER - 3, top + BORDER, 2, 2, QColor(INK))
 
     def _stroke_cell(self, painter, cell, color):
         """A 2px edge, lighter than the grid. White when the cel is selected."""

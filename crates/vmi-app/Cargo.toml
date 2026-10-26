@@ -1,0 +1,21 @@
+[package]
+name = "vmi-app"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "KOOL SKULL STUDIO desk"
+
+[features]
+default = ["window"]
+window = ["dep:eframe"]
+
+[[bin]]
+name = "vmi-studio"
+path = "src/main.rs"
+required-features = ["window"]
+
+[dependencies]
+eframe = { version = "0.29", optional = true }
+vmi-core = { path = "../vmi-core" }
+vmi-paint = { path = "../vmi-paint" }

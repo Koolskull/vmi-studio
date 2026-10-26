@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/vmi-core", "crates/vmi-paint", "crates/vmi-app", "crates/vmi-audit"]
+exclude = ["tools/vmi-clip-vector"]
+resolver = "2"

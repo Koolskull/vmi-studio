@@ -9,3 +9,4 @@ build/
 *.egg-info
 .cache/
 tools/vmi-clip-vector/target/
+/target/

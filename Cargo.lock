@@ -3146,8 +3146,12 @@ dependencies = [
  "block2",
  "eframe",
  "objc2-app-kit 0.2.2",
+ "raw-window-handle",
  "vmi-core",
  "vmi-paint",
+ "wayland-client",
+ "wayland-protocols",
+ "x11rb",
 ]
 
 [[package]]

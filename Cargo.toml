@@ -2,3 +2,11 @@
 members = ["crates/vmi-core", "crates/vmi-paint", "crates/vmi-app", "crates/vmi-audit"]
 exclude = ["tools/vmi-clip-vector"]
 resolver = "2"
+
+# The desk paints 1280x720 per pen move. An unoptimized build is unusable,
+# so `cargo run` optimizes the studio crates and fully optimizes dependencies.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -6,11 +6,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::coverage::{curve_value, Edge};
+use crate::tip::Tip;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tool {
     Pen,
     Pencil,
+    Charcoal,
     Paint,
     Air,
     Eraser,
@@ -118,6 +120,8 @@ pub enum Field {
     Min,
     Max,
     Softness,
+    Tip,
+    Texture,
     Edge,
     Fringe,
     Chunk,
@@ -145,6 +149,8 @@ impl Field {
             Self::Min => "Min",
             Self::Max => "Max",
             Self::Softness => "Softness",
+            Self::Tip => "Tip",
+            Self::Texture => "Texture",
             Self::Edge => "Edge",
             Self::Fringe => "Fringe",
             Self::Chunk => "Chunk",
@@ -172,6 +178,8 @@ const SHAPE: &[Field] = &[
     Field::Min,
     Field::Max,
     Field::Softness,
+    Field::Tip,
+    Field::Texture,
     Field::Edge,
     Field::Fringe,
     Field::PressureSize,
@@ -187,6 +195,8 @@ const NO_COLOR: &[Field] = &[
     Field::Min,
     Field::Max,
     Field::Softness,
+    Field::Tip,
+    Field::Texture,
     Field::Edge,
     Field::Fringe,
     Field::PressureSize,
@@ -203,6 +213,8 @@ const DITHER: &[Field] = &[
     Field::Min,
     Field::Max,
     Field::Softness,
+    Field::Tip,
+    Field::Texture,
     Field::Edge,
     Field::Fringe,
     Field::Chunk,
@@ -247,6 +259,7 @@ impl Tool {
     pub const PALETTE: &'static [Self] = &[
         Self::Pen,
         Self::Pencil,
+        Self::Charcoal,
         Self::Paint,
         Self::Air,
         Self::Eraser,
@@ -271,6 +284,7 @@ impl Tool {
         match self {
             Self::Pen => "Pen",
             Self::Pencil => "Pencil",
+            Self::Charcoal => "Charcoal",
             Self::Paint => "Paint",
             Self::Air => "Air",
             Self::Eraser => "Eraser",
@@ -295,12 +309,13 @@ impl Tool {
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Pen => "P",
-            Self::Pencil => "",
+            Self::Pencil => "N",
+            Self::Charcoal => "C",
             Self::Paint => "B",
-            Self::Air => "",
+            Self::Air => "A",
             Self::Eraser => "E",
-            Self::Smudge => "",
-            Self::Blend => "",
+            Self::Smudge => "S",
+            Self::Blend => "D",
             Self::Fill => "F",
             Self::Dither => "",
             Self::Line => "L",
@@ -320,11 +335,12 @@ impl Tool {
     pub fn usage(self) -> &'static str {
         match self {
             Self::Pen => "Hard freehand ink. Release writes pixels.",
-            Self::Pencil => "A small hard stroke with pressure off.",
-            Self::Paint => "Soft ink. Release writes pixels.",
-            Self::Air => "A thin spray. Release writes pixels.",
+            Self::Pencil => "Graphite on paper tooth. Pressure sets the width.",
+            Self::Charcoal => "A rough stick. Grain breaks the edge. Release writes pixels.",
+            Self::Paint => "Bristle streaks of soft paint. Release writes pixels.",
+            Self::Air => "Spray paint. Speckle piles up while the can stays.",
             Self::Eraser => "Lifts alpha. Release writes pixels.",
-            Self::Smudge => "Pushes color along the stroke.",
+            Self::Smudge => "Drags paint in bristle streaks. Each hair carries its own color.",
             Self::Blend => "Mixes the color already on the layer.",
             Self::Fill => "Fills a flat area on click.",
             Self::Dither => "KOOLDRAW chunks. Ink or a tone, never a gray edge.",
@@ -397,6 +413,11 @@ pub struct ToolSettings {
     pub size_min: f32,
     pub size_max: f32,
     pub softness: f32,
+    #[serde(default)]
+    pub tip: Tip,
+    /// 0 is a plain disc, 1 is the full generated texture.
+    #[serde(default)]
+    pub texture: f32,
     pub fringe: f32,
     pub edge: Edge,
     pub chunk: u32,
@@ -424,6 +445,8 @@ impl ToolSettings {
             size_min: 1.0,
             size_max: 128.0,
             softness: 0.0,
+            tip: Tip::Round,
+            texture: 0.0,
             fringe: 0.5,
             edge: Edge::Smooth,
             chunk: 1,
@@ -443,23 +466,37 @@ impl ToolSettings {
         };
         match tool {
             Tool::Pencil => {
-                settings.size = 4.0;
-                settings.fringe = 0.0;
-                settings.edge = Edge::Hard;
-                settings.size_pressure = false;
-                settings.opacity_pressure = false;
+                settings.size = 5.0;
+                settings.fringe = 0.5;
+                settings.tip = Tip::Pencil;
+                settings.texture = 0.85;
+            }
+            Tool::Charcoal => {
+                settings.size = 18.0;
+                settings.softness = 0.25;
+                settings.tip = Tip::Charcoal;
+                settings.texture = 0.9;
+                settings.color = [0x11, 0x11, 0x11];
             }
             Tool::Paint => {
                 settings.size = 24.0;
                 settings.softness = 0.55;
+                settings.tip = Tip::Bristle;
+                settings.texture = 0.7;
             }
             Tool::Air => {
                 settings.size = 48.0;
                 settings.softness = 1.0;
-                settings.opacity = 48.0 / 255.0;
+                settings.opacity = 0.5;
+                settings.tip = Tip::Spray;
+                settings.texture = 1.0;
             }
             Tool::Eraser => settings.size = 16.0,
-            Tool::Smudge => settings.size = 20.0,
+            Tool::Smudge => {
+                settings.size = 20.0;
+                settings.tip = Tip::Bristle;
+                settings.texture = 0.8;
+            }
             Tool::Blend => {
                 settings.size = 24.0;
                 settings.softness = 0.35;
@@ -539,7 +576,9 @@ impl ToolSettings {
 pub fn ink_spacing(diameter: f32, tool: Tool) -> f32 {
     let width = diameter.max(1.0);
     match tool {
-        Tool::Paint => (width * 0.18).max(1.0),
+        Tool::Paint | Tool::Smudge => (width * 0.12).max(1.0),
+        Tool::Charcoal | Tool::Pencil => (width * 0.1).max(0.75),
+        Tool::Air => (width * 0.08).max(0.75),
         Tool::Vector | Tool::Curve | Tool::Grain => (width * 0.22).max(1.0),
         Tool::WarpMask => (width * 0.35).max(0.5),
         _ => (width * 0.15).max(0.75),
@@ -627,7 +666,25 @@ mod tests {
         assert!((pen.diameter_for(1.0) - pen.size).abs() < 1e-4);
         assert!(pen.diameter_for(0.0) < pen.diameter_for(1.0));
         let pencil = ToolSettings::default_for(Tool::Pencil);
-        assert!(!pencil.size_pressure);
-        assert!((pencil.diameter_for(0.2) - pencil.size).abs() < 1e-4);
+        assert!(pencil.size_pressure, "pressure is on by default for every tool");
+        assert!(pencil.diameter_for(0.2) < pencil.size);
+        for tool in Tool::PALETTE {
+            let settings = ToolSettings::default_for(*tool);
+            assert!(settings.size_pressure && settings.opacity_pressure, "{tool:?}");
+        }
+    }
+
+    #[test]
+    fn the_drawing_tools_carry_a_generated_tip() {
+        assert_eq!(ToolSettings::default_for(Tool::Pencil).tip, Tip::Pencil);
+        assert_eq!(ToolSettings::default_for(Tool::Charcoal).tip, Tip::Charcoal);
+        assert_eq!(ToolSettings::default_for(Tool::Paint).tip, Tip::Bristle);
+        assert_eq!(ToolSettings::default_for(Tool::Air).tip, Tip::Spray);
+        assert_eq!(ToolSettings::default_for(Tool::Smudge).tip, Tip::Bristle);
+        assert_eq!(ToolSettings::default_for(Tool::Pen).tip, Tip::Round);
+        assert!(Tool::Pen.fields().contains(&Field::Tip));
+        assert!(Tool::Smudge.fields().contains(&Field::Texture));
+        assert_eq!(Tool::Charcoal.release(), Release::Pixels);
+        assert_eq!(Tool::by_shortcut("c"), Some(Tool::Charcoal));
     }
 }

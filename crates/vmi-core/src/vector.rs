@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::Rgba;
 use crate::coverage::{liquid_level, stamp, Stamp, StampMode, TONE};
+use crate::tip::Grain;
 use crate::tool::{CurveKind, GrainKind, Tool, ToolSettings};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -296,6 +297,7 @@ pub fn bake(stroke: &VectorStroke, width: u32, height: u32) -> Option<Raster> {
             chunk: stroke.chunk,
             tones: stroke.tones && stroke.grain != GrainKind::Liquid,
             mode: StampMode::Over,
+            grain: Grain::plain(),
         });
     }
     apply_grain(&mut canvas, width, height, stroke);
@@ -359,6 +361,7 @@ fn apply_grain(canvas: &mut [u8], width: u32, height: u32, stroke: &VectorStroke
                     chunk: 1,
                     tones: false,
                     mode: StampMode::Over,
+                    grain: Grain::plain(),
                 });
             }
             for index in (0..canvas.len()).step_by(4) {

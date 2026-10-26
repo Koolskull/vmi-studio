@@ -240,13 +240,47 @@ fn branch_solo(node: &Node) -> bool {
 pub fn present(art: &mut Art) -> Vec<u8> {
     let width = art.width;
     let height = art.height;
-    let mut dst = vec![0u8; (width as usize).saturating_mul(height as usize).saturating_mul(4)];
+    present_region(art, [0, 0, width as i32, height as i32])
+}
+
+/// Composite only `x0, y0, x1, y1` (end exclusive). The buffer is region sized;
+/// its first pixel is the document pixel at `(x0, y0)`. A pen move only needs
+/// the pixels it touched.
+pub fn present_region(art: &mut Art, rect: [i32; 4]) -> Vec<u8> {
+    let [x0, y0, x1, y1] = clamp_rect(rect, art.width, art.height);
+    let rw = (x1 - x0).max(0) as u32;
+    let rh = (y1 - y0).max(0) as u32;
+    let mut dst = vec![0u8; (rw as usize).saturating_mul(rh as usize).saturating_mul(4)];
+    if rw == 0 || rh == 0 {
+        return dst;
+    }
     let solo = any_solo(&art.layers);
-    paint_nodes(&mut art.layers, &mut dst, width, height, 255, solo);
+    let (width, height) = (art.width, art.height);
+    let target = Target { buf: &mut dst, w: rw, h: rh, ox: x0, oy: y0 };
+    paint_nodes(&mut art.layers, target, width, height, 255, solo);
     dst
 }
 
-fn paint_nodes(nodes: &mut [Node], dst: &mut [u8], width: u32, height: u32, opacity: u8, solo: bool) {
+pub fn clamp_rect(rect: [i32; 4], width: u32, height: u32) -> [i32; 4] {
+    [
+        rect[0].clamp(0, width as i32),
+        rect[1].clamp(0, height as i32),
+        rect[2].clamp(0, width as i32),
+        rect[3].clamp(0, height as i32),
+    ]
+}
+
+/// A destination buffer whose first pixel sits at document `(ox, oy)`.
+struct Target<'a> {
+    buf: &'a mut [u8],
+    w: u32,
+    h: u32,
+    ox: i32,
+    oy: i32,
+}
+
+fn paint_nodes(nodes: &mut [Node], target: Target<'_>, width: u32, height: u32, opacity: u8, solo: bool) {
+    let Target { buf: dst, w: rw, h: rh, ox, oy } = target;
     for node in nodes {
         if !node.visible || node.mute {
             continue;
@@ -257,12 +291,12 @@ fn paint_nodes(nodes: &mut [Node], dst: &mut [u8], width: u32, height: u32, opac
         let next = mul_opacity(opacity, node.opacity);
         if node.kind == NodeKind::Group {
             let mut plate = vec![0u8; dst.len()];
-            paint_nodes(&mut node.children, &mut plate, width, height, 255, solo);
-            blit_buffer(dst, width, height, &plate, width, height, 0, 0, next, node.clip, &node.blend);
+            paint_nodes(&mut node.children, Target { buf: &mut plate, w: rw, h: rh, ox, oy }, width, height, 255, solo);
+            blit_into(dst, rw, rh, ox, oy, &plate, rw, rh, ox, oy, next, node.clip, &node.blend);
             continue;
         }
         node.pixels.resize((width as usize) * (height as usize) * 4, 0);
-        blit_buffer(dst, width, height, &node.pixels, width, height, 0, 0, next, node.clip, &node.blend);
+        blit_into(dst, rw, rh, ox, oy, &node.pixels, width, height, 0, 0, next, node.clip, &node.blend);
         if !node.embedded {
             let strokes = node.strokes.len();
             for index in 0..strokes {
@@ -271,7 +305,7 @@ fn paint_nodes(nodes: &mut [Node], dst: &mut [u8], width: u32, height: u32, opac
                     stroke.ensure_cache(width, height).cloned()
                 };
                 if let Some(raster) = raster {
-                    blit_buffer(dst, width, height, &raster.rgba, raster.w, raster.h, raster.x, raster.y, next, node.clip, &node.blend);
+                    blit_into(dst, rw, rh, ox, oy, &raster.rgba, raster.w, raster.h, raster.x, raster.y, next, node.clip, &node.blend);
                 }
             }
         }
@@ -295,16 +329,44 @@ pub fn blit_buffer(
     clip: bool,
     blend: &str,
 ) {
-    if sw == 0 || sh == 0 || opacity == 0 || src.len() < (sw as usize) * (sh as usize) * 4 {
+    blit_into(dst, dw, dh, 0, 0, src, sw, sh, ox, oy, opacity, clip, blend);
+}
+
+/// Blit `src` (whose first pixel is document `(ox, oy)`) onto `dst` (whose
+/// first pixel is document `(dst_ox, dst_oy)`). Only the overlap is visited.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_into(
+    dst: &mut [u8],
+    dw: u32,
+    dh: u32,
+    dst_ox: i32,
+    dst_oy: i32,
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    ox: i32,
+    oy: i32,
+    opacity: u8,
+    clip: bool,
+    blend: &str,
+) {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || opacity == 0 || src.len() < (sw as usize) * (sh as usize) * 4 {
         return;
     }
-    for y in 0..sh as i32 {
-        for x in 0..sw as i32 {
-            let dx = ox + x;
-            let dy = oy + y;
-            if dx < 0 || dy < 0 || dx as u32 >= dw || dy as u32 >= dh {
-                continue;
-            }
+    // Document-space overlap of the two rectangles.
+    let left = ox.max(dst_ox);
+    let top = oy.max(dst_oy);
+    let right = (ox + sw as i32).min(dst_ox + dw as i32);
+    let bottom = (oy + sh as i32).min(dst_oy + dh as i32);
+    if right <= left || bottom <= top {
+        return;
+    }
+    for doc_y in top..bottom {
+        for doc_x in left..right {
+            let x = doc_x - ox;
+            let y = doc_y - oy;
+            let dx = doc_x - dst_ox;
+            let dy = doc_y - dst_oy;
             let si = ((y as u32 * sw + x as u32) * 4) as usize;
             let di = ((dy as u32 * dw + dx as u32) * 4) as usize;
             let src_px = Rgba::new(src[si], src[si + 1], src[si + 2], src[si + 3]);
@@ -421,6 +483,39 @@ mod tests {
         find_mut(&mut art.layers, &id).unwrap().visible = true;
         let plate = present(&mut art);
         assert_eq!(plate[3], 255);
+    }
+
+    #[test]
+    fn a_region_matches_the_same_pixels_of_the_full_plate() {
+        let mut art = Art::blank(8, 6);
+        let under = art.add_layer(None, "Under");
+        let over = art.add_layer(None, "Over");
+        for x in 0..8u32 {
+            let i = ((2 * 8 + x) * 4) as usize;
+            let node = find_mut(&mut art.layers, &under).unwrap();
+            node.pixels[i] = 200;
+            node.pixels[i + 3] = 255;
+        }
+        let node = find_mut(&mut art.layers, &over).unwrap();
+        node.opacity = 128;
+        node.blend = "multiply".into();
+        for y in 0..6u32 {
+            let i = ((y * 8 + 5) * 4) as usize;
+            node.pixels[i + 2] = 255;
+            node.pixels[i + 3] = 255;
+        }
+        let full = present(&mut art);
+        let rect = [3, 1, 7, 5];
+        let part = present_region(&mut art, rect);
+        assert_eq!(part.len(), 4 * 4 * 4);
+        for y in 1..5 {
+            for x in 3..7 {
+                let fi = ((y * 8 + x) * 4) as usize;
+                let pi = (((y - 1) * 4 + (x - 3)) * 4) as usize;
+                assert_eq!(&full[fi..fi + 4], &part[pi..pi + 4], "{x},{y}");
+            }
+        }
+        assert_eq!(clamp_rect([-3, 2, 40, 9], 8, 6), [0, 2, 8, 6]);
     }
 
     #[test]

@@ -34,10 +34,10 @@ mod tests {
     use vmi_app::desk::{Button, Desk};
     use vmi_app::gpu::PictureFilter;
     use vmi_core::{
-        load_vmib, present, save_vmib, scale_nearest, session_path, stamp, theme_or_studio, Art, Edge, History, Rgba,
-        Session, Stamp, StampMode, Theme, Tool, ToolSettings, VectorStroke, THEMES,
+        load_vmib, present, save_vmib, scale_nearest, session_path, stamp, theme_or_studio, Art, Edge, Grain, History,
+        Rgba, Session, Stamp, StampMode, Theme, Tool, ToolSettings, VectorStroke, THEMES,
     };
-    use vmi_paint::paint_samples;
+    use vmi_paint::{paint_samples, Carry};
 
     #[test]
     fn gap_rows_are_the_only_ones_without_a_proof_name() {
@@ -62,6 +62,7 @@ mod tests {
             chunk: 1,
             tones: false,
             mode: StampMode::Over,
+            grain: Grain::plain(),
         });
         let row: Vec<u8> = (0..24).map(|x| hard[((12 * 24 + x) * 4 + 3) as usize]).collect();
         assert_eq!(row, vec![0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -74,7 +75,7 @@ mod tests {
         settings.size = 16.0;
         settings.size_pressure = false;
         settings.opacity_pressure = false;
-        let mut carry = None;
+        let mut carry = Carry::default();
         paint_samples(&mut buf, 32, 32, &[(16.0, 16.0, 1.0)], Tool::Dither, &settings, &mut carry);
         assert!(buf.chunks(4).any(|pixel| pixel[3] == 255));
         for pixel in buf.chunks(4) {
@@ -153,10 +154,10 @@ mod tests {
         settings.size_pressure = false;
         settings.opacity_pressure = false;
         settings.opacity = 1.0;
-        let mut carry = None;
+        let mut carry = Carry::default();
         paint_samples(&mut buf, 24, 8, &[(4.0, 4.0, 1.0)], Tool::Smudge, &settings, &mut carry);
         paint_samples(&mut buf, 24, 8, &[(4.0, 4.0, 1.0), (16.0, 4.0, 1.0)], Tool::Smudge, &settings, &mut carry);
-        assert!(carry.unwrap().r > 0);
+        assert!(carry.color.unwrap().r > 0);
         assert!(buf[(4 * 24 + 12) * 4] > 0);
     }
 

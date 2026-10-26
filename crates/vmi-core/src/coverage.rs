@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::color::{rint_u8, Rgba};
+use crate::tip::{tip_sample, Grain};
 
 pub const TONE: [[u8; 3]; 3] = [[0, 0, 0], [0x44, 0x44, 0x44], [0xCC, 0xCC, 0xCC]];
 
@@ -154,6 +155,8 @@ pub struct Stamp {
     pub chunk: u32,
     pub tones: bool,
     pub mode: StampMode,
+    /// The generating engine. `Grain::plain()` is a bare disc.
+    pub grain: Grain,
 }
 
 impl Stamp {
@@ -187,6 +190,16 @@ pub fn stamp(buf: &mut [u8], width: u32, height: u32, dab: Stamp) -> bool {
                 continue;
             }
             let mut color = dab.color;
+            if !dab.grain.is_plain() {
+                let sample = tip_sample(dab.grain, x, y, dab.cx, dab.cy, dab.radius, dist);
+                cover *= sample.mask;
+                if cover <= 0.001 {
+                    continue;
+                }
+                if sample.shade != 0.0 && dab.mode == StampMode::Over {
+                    color = shade(color, sample.shade);
+                }
+            }
             if dab.edge == Edge::Dither {
                 if dab.tones {
                     let level = tone_level(cover, x, y, dab.chunk);
@@ -206,6 +219,13 @@ pub fn stamp(buf: &mut [u8], width: u32, height: u32, dab: Stamp) -> bool {
         }
     }
     changed
+}
+
+/// Push every channel by `amount` of full range. Streaks shade the paint.
+pub fn shade(color: Rgba, amount: f32) -> Rgba {
+    let shift = amount.clamp(-1.0, 1.0) * 255.0;
+    let ch = |value: u8| rint_u8((f32::from(value) + shift).clamp(0.0, 255.0));
+    Rgba { r: ch(color.r), g: ch(color.g), b: ch(color.b), a: color.a }
 }
 
 fn write_pixel(pixel: &mut [u8], color: Rgba, cover: f32, mode: StampMode) -> bool {
@@ -287,7 +307,7 @@ fn fade(value: f32) -> f32 {
     value * value * (3.0 - 2.0 * value)
 }
 
-fn hash_cell(ix: i32, iy: i32, iz: i32) -> f32 {
+pub(crate) fn hash_cell(ix: i32, iy: i32, iz: i32) -> f32 {
     let mut n = (i64::from(ix).wrapping_mul(374761393)
         + i64::from(iy).wrapping_mul(668265263)
         + i64::from(iz).wrapping_mul(1440673973)) as u32;
@@ -355,6 +375,7 @@ mod tests {
             chunk: 1,
             tones: false,
             mode: StampMode::Over,
+            grain: Grain::plain(),
         });
         stamp(&mut soft, 24, 24, Stamp {
             cx: 12.0,
@@ -368,6 +389,7 @@ mod tests {
             chunk: 1,
             tones: false,
             mode: StampMode::Over,
+            grain: Grain::plain(),
         });
         assert_eq!(
             row(&hard, 24, 12),
@@ -394,6 +416,7 @@ mod tests {
             chunk: 2,
             tones: false,
             mode: StampMode::Over,
+            grain: Grain::plain(),
         });
         for pixel in buf.chunks(4) {
             assert!(pixel[3] == 0 || pixel[3] == 255, "{pixel:?}");

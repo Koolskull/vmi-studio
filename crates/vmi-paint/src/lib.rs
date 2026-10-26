@@ -136,9 +136,11 @@ fn dab_at(
     };
     let mut color = Rgba::rgb(settings.color[0], settings.color[1], settings.color[2]);
     if tool == Tool::Smudge {
-        let under = pixel(buf, width, height, x.round() as i32, y.round() as i32);
+        // Pick up what is under the whole disc, keep most of what the pen already
+        // carries, and lay that down. The trail fades as the carry thins out.
+        let under = disc_average(buf, width, height, x, y, radius);
         let mixed = match *carry {
-            Some(held) => vmi_core::coverage::mix_half(held, under),
+            Some(held) => mix_toward(held, under, 0.3),
             None => under,
         };
         *carry = Some(mixed);
@@ -146,6 +148,12 @@ fn dab_at(
             return false;
         }
         color = mixed;
+    } else if tool == Tool::Blend {
+        let under = disc_average(buf, width, height, x, y, radius);
+        if under.a == 0 {
+            return false;
+        }
+        color = under;
     }
     stamp(buf, width, height, Stamp {
         cx: x,
@@ -160,6 +168,56 @@ fn dab_at(
         tones: settings.tones || tool == Tool::Dither,
         mode,
     })
+}
+
+/// Alpha-weighted average of the pixels inside a disc. Clear pixels thin the alpha
+/// but do not pull the color toward black.
+pub fn disc_average(buf: &[u8], width: u32, height: u32, cx: f32, cy: f32, radius: f32) -> Rgba {
+    let reach = radius.max(0.5);
+    let x0 = (cx - reach).floor().max(0.0) as i32;
+    let y0 = (cy - reach).floor().max(0.0) as i32;
+    let x1 = ((cx + reach).ceil() as i32 + 1).min(width as i32);
+    let y1 = ((cy + reach).ceil() as i32 + 1).min(height as i32);
+    let mut sum = [0.0f32; 4];
+    let mut count = 0.0f32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dist = ((x as f32 + 0.5) - cx).hypot((y as f32 + 0.5) - cy);
+            if dist > reach {
+                continue;
+            }
+            let p = pixel(buf, width, height, x, y);
+            let a = f32::from(p.a);
+            sum[0] += f32::from(p.r) * a;
+            sum[1] += f32::from(p.g) * a;
+            sum[2] += f32::from(p.b) * a;
+            sum[3] += a;
+            count += 1.0;
+        }
+    }
+    if count <= 0.0 || sum[3] <= 0.0 {
+        return Rgba::CLEAR;
+    }
+    Rgba::new(
+        (sum[0] / sum[3]).round() as u8,
+        (sum[1] / sum[3]).round() as u8,
+        (sum[2] / sum[3]).round() as u8,
+        (sum[3] / count).round() as u8,
+    )
+}
+
+/// Move `held` toward `under` by `amount`. Color follows alpha weight so a clear
+/// patch thins the carry without darkening it.
+fn mix_toward(held: Rgba, under: Rgba, amount: f32) -> Rgba {
+    let t = amount.clamp(0.0, 1.0);
+    let ha = f32::from(held.a) * (1.0 - t);
+    let ua = f32::from(under.a) * t;
+    let total = ha + ua;
+    if total <= 0.0 {
+        return Rgba::CLEAR;
+    }
+    let ch = |h: u8, u: u8| ((f32::from(h) * ha + f32::from(u) * ua) / total).round() as u8;
+    Rgba::new(ch(held.r, under.r), ch(held.g, under.g), ch(held.b, under.b), total.round() as u8)
 }
 
 pub fn flood_fill(buf: &mut [u8], width: u32, height: u32, x: i32, y: i32, settings: &ToolSettings) -> bool {

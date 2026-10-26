@@ -216,9 +216,12 @@ fn write_pixel(pixel: &mut [u8], color: Rgba, cover: f32, mode: StampMode) -> bo
             pixel[3] = alpha;
         }
         StampMode::Blend => {
+            // `color` is the average already under the disc. Every pixel moves toward it.
             let dst = Rgba::new(before[0], before[1], before[2], before[3]);
-            let mixed = mix_half(dst, color);
-            let out = lerp_rgba(dst, mixed, cover);
+            if dst.a == 0 && color.a == 0 {
+                return false;
+            }
+            let out = lerp_rgba(dst, color, cover * 0.5);
             pixel.copy_from_slice(&out.channels());
         }
         StampMode::Over => {

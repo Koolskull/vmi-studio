@@ -8,7 +8,7 @@
 //! cell. A rest is `---`. A red needle marks the exact frame.
 
 use eframe::egui;
-use vmi_core::anim::{timeline_cels, xsheet_columns, XColumn};
+use vmi_core::anim::{frame_map, timeline_cels, xsheet_columns, XColumn};
 use vmi_core::{find, Theme};
 
 use crate::desk::Desk;
@@ -89,16 +89,76 @@ pub enum Act {
     AnimateSelected,
 }
 
+/// One row of one column, in KoolDraw's grammar: a key that prints its
+/// drawing number, a held cell, or a rest.
+#[derive(Clone, Debug, Default)]
+struct Row {
+    /// The cel the level shows here, when the row stands for one.
+    cel: Option<String>,
+    /// A drawing is on this frame (key or hold). False is a rest.
+    filled: bool,
+    /// This frame starts the drawing.
+    key: bool,
+    /// The drawing number a key prints, from 1.
+    number: Option<usize>,
+}
+
 /// A cell of the sheet, resolved for drawing.
 struct CellInfo<'a> {
     column: &'a XColumn,
     frame: u32,
-    /// The cel the level shows at this frame.
     cel: Option<&'a str>,
-    /// This frame starts the cel.
+    filled: bool,
     key: bool,
-    /// The cel's place in the timeline, from 1.
     number: Option<usize>,
+}
+
+/// The rows of one column. A folder without a stored exposure sheet reads
+/// its keys: the cel holds until the next key. A folder with one reads the
+/// sheet, the way Python's X-sheet did: a slot that repeats the slot above
+/// is a hold, a changed slot is a key, a blank is a rest. Slot `n` is the
+/// `n`th drawing in frame order, which is also its printed number.
+fn rows_of(column: &XColumn, folder: Option<&vmi_core::Node>, rows: u32) -> Vec<Row> {
+    let mut out = Vec::with_capacity(rows as usize);
+    if column.stored {
+        let mut order: Vec<String> = Vec::new();
+        if let Some(folder) = folder {
+            for (_, cel) in frame_map(folder) {
+                if !order.contains(&cel.id) {
+                    order.push(cel.id.clone());
+                }
+            }
+        }
+        for frame in 0..rows as usize {
+            let slot = column.labels.get(frame).map(String::as_str).unwrap_or("");
+            if slot.is_empty() {
+                out.push(Row::default());
+                continue;
+            }
+            let index = usize::from_str_radix(slot, 16).ok();
+            let key = frame == 0 || column.labels.get(frame - 1).map(String::as_str) != Some(slot);
+            out.push(Row {
+                cel: index.and_then(|index| order.get(index).cloned()),
+                filled: true,
+                key,
+                number: index.map(|index| index + 1),
+            });
+        }
+        return out;
+    }
+    let numbers: std::collections::HashMap<String, usize> = folder
+        .map(|folder| timeline_cels(folder).iter().enumerate().map(|(index, cel)| (cel.id.clone(), index + 1)).collect())
+        .unwrap_or_default();
+    for frame in 0..rows as usize {
+        let cel = column.cells.get(frame).cloned().flatten();
+        out.push(Row {
+            number: cel.as_deref().and_then(|id| numbers.get(id).copied()),
+            filled: cel.is_some(),
+            key: column.keys.get(frame).copied().unwrap_or(false),
+            cel,
+        });
+    }
+    out
 }
 
 /// Draw the sheet in `mode` and hand back what the pointer asked for.
@@ -112,20 +172,21 @@ pub fn show(ui: &mut egui::Ui, desk: &Desk, state: &mut SheetState, mode: Mode, 
         empty_sheet(ui, desk, theme, &mut acts);
         return acts;
     }
-    let numbers: Vec<std::collections::HashMap<String, usize>> = columns
+    // A stored sheet may run past the cut; the grid shows all of it.
+    let rows = columns
         .iter()
-        .map(|column| {
-            find(&desk.art.layers, &column.folder_id)
-                .map(|folder| {
-                    timeline_cels(folder).iter().enumerate().map(|(index, cel)| (cel.id.clone(), index + 1)).collect()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
+        .filter(|column| column.stored)
+        .map(|column| column.labels.len() as u32)
+        .max()
+        .unwrap_or(0)
+        .max(end)
+        .max(1);
+    let grid: Vec<Vec<Row>> =
+        columns.iter().map(|column| rows_of(column, find(&desk.art.layers, &column.folder_id), rows)).collect();
     let drawn = mode.resolve(ui.ctx().screen_rect().size());
     match drawn {
-        Mode::Film => film(ui, desk, state, theme, &columns, &numbers, end, &mut acts),
-        _ => xsheet(ui, desk, state, theme, &columns, &numbers, end, &mut acts),
+        Mode::Film => film(ui, desk, state, theme, &columns, &grid, rows, &mut acts),
+        _ => xsheet(ui, desk, state, theme, &columns, &grid, rows, &mut acts),
     }
     acts
 }
@@ -159,12 +220,11 @@ fn empty_sheet(ui: &mut egui::Ui, desk: &Desk, theme: &Theme, acts: &mut Vec<Act
     );
 }
 
-fn cell_info<'a>(column: &'a XColumn, numbers: &std::collections::HashMap<String, usize>, frame: u32) -> CellInfo<'a> {
-    let at = frame as usize;
-    let cel = column.cells.get(at).and_then(|cell| cell.as_deref());
-    let key = column.keys.get(at).copied().unwrap_or(false);
-    let number = cel.and_then(|id| numbers.get(id).copied());
-    CellInfo { column, frame, cel, key, number }
+fn cell_info<'a>(column: &'a XColumn, grid: &'a [Row], frame: u32) -> CellInfo<'a> {
+    match grid.get(frame as usize) {
+        Some(row) => CellInfo { column, frame, cel: row.cel.as_deref(), filled: row.filled, key: row.key, number: row.number },
+        None => CellInfo { column, frame, cel: None, filled: false, key: false, number: None },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -174,12 +234,11 @@ fn xsheet(
     state: &mut SheetState,
     theme: &Theme,
     columns: &[XColumn],
-    numbers: &[std::collections::HashMap<String, usize>],
-    end: u32,
+    grid: &[Vec<Row>],
+    rows: u32,
     acts: &mut Vec<Act>,
 ) {
     let playhead = desk.art.playhead;
-    let rows = end.max(1);
     let width = FRAME_W + columns.len() as f32 * CELL_W;
     let height = HEAD + rows as f32 * CELL_H;
     let scroll = egui::ScrollArea::both().id_salt("xsheet").auto_shrink([false, false]);
@@ -265,7 +324,7 @@ fn xsheet(
             for frame in 0..rows {
                 let y = rect.min.y + HEAD + frame as f32 * CELL_H;
                 let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CELL_W, CELL_H));
-                let info = cell_info(column, &numbers[index], frame);
+                let info = cell_info(column, &grid[index], frame);
                 cell_interact(ui, desk, state, theme, &painter, cell, &info, true, acts);
             }
         }
@@ -292,12 +351,12 @@ fn film(
     state: &mut SheetState,
     theme: &Theme,
     columns: &[XColumn],
-    numbers: &[std::collections::HashMap<String, usize>],
-    end: u32,
+    grid: &[Vec<Row>],
+    rows: u32,
     acts: &mut Vec<Act>,
 ) {
     let playhead = desk.art.playhead;
-    let frames = end.max(1);
+    let frames = rows;
     let width = LANE_NAME_W + frames as f32 * FILM_W;
     let height = HEAD + columns.len() as f32 * CELL_H;
     let scroll = egui::ScrollArea::both().id_salt("film").auto_shrink([false, false]);
@@ -368,7 +427,7 @@ fn film(
             for frame in 0..frames {
                 let x = rect.min.x + LANE_NAME_W + frame as f32 * FILM_W;
                 let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(FILM_W, CELL_H));
-                let info = cell_info(column, &numbers[index], frame);
+                let info = cell_info(column, &grid[index], frame);
                 cell_interact(ui, desk, state, theme, &painter, cell, &info, false, acts);
             }
         }
@@ -419,13 +478,13 @@ fn cell_interact(
         painter.rect_filled(cell.shrink(0.5), 0.0, rgb(theme.row));
     }
     let font = egui::FontId::monospace(10.0);
-    match (info.cel, info.key) {
-        (Some(_), true) => {
+    match (info.filled, info.key) {
+        (true, true) => {
             let text = info.number.map(|n| format!("{n:02}")).unwrap_or_else(|| "??".into());
             let color = if moving { RED } else { rgb(theme.ink) };
             painter.text(cell.center(), egui::Align2::CENTER_CENTER, text, font, color);
         }
-        (Some(_), false) => {
+        (true, false) => {
             // A hold. Dotted down the sheet, dashes along the film.
             let color = rgb(theme.soft);
             if vertical {
@@ -444,7 +503,7 @@ fn cell_interact(
                 }
             }
         }
-        (None, _) => {
+        (false, _) => {
             painter.text(cell.center(), egui::Align2::CENTER_CENTER, "---", font, rgb(theme.quiet));
         }
     }
@@ -472,7 +531,8 @@ fn cell_interact(
         }
     }
     if response.drag_started() {
-        if info.key && info.cel.is_some() && !shift {
+        // A stored sheet's rows are exposures, not keys; the film moves keys.
+        if info.key && info.cel.is_some() && !info.column.stored && !shift {
             state.drag = Some(Drag::Key {
                 folder: folder.to_string(),
                 cel: info.cel.unwrap_or_default().to_string(),
@@ -592,5 +652,48 @@ mod tests {
         assert_eq!(Mode::XSheet.label(), "X-SHEET");
         assert_eq!(clip_name("Background", 6), "Backg…");
         assert_eq!(clip_name("Cut", 6), "Cut");
+    }
+
+    #[test]
+    fn a_stored_sheet_reads_in_the_same_grammar_as_the_keys() {
+        let mut folder = vmi_core::Node::group("f", "Shot");
+        folder.animation = true;
+        folder.children = vec![vmi_core::Node::layer("a", "1", 2, 2), vmi_core::Node::layer("b", "2", 2, 2)];
+        folder.timeline = vec!["a".into(), "b".into()];
+        folder.frames = vec![0, 2];
+        let column = XColumn {
+            folder_id: "f".into(),
+            name: "Shot".into(),
+            cells: vec![Some("a".into()), Some("a".into()), Some("b".into()), Some("b".into())],
+            keys: vec![true, false, true, false],
+            labels: vec![],
+            stored: false,
+        };
+        let keyed = rows_of(&column, Some(&folder), 4);
+        assert_eq!(keyed.iter().map(|row| (row.filled, row.key, row.number)).collect::<Vec<_>>(), [
+            (true, true, Some(1)),
+            (true, false, Some(1)),
+            (true, true, Some(2)),
+            (true, false, Some(2)),
+        ]);
+
+        // Swing: 1 2 2 1, then a blank and an id the keys never issued.
+        let stored = XColumn {
+            labels: vec!["000".into(), "001".into(), "001".into(), "000".into(), String::new(), "002".into()],
+            stored: true,
+            ..column
+        };
+        let rows = rows_of(&stored, Some(&folder), 7);
+        assert_eq!(rows.iter().map(|row| (row.filled, row.key, row.number)).collect::<Vec<_>>(), [
+            (true, true, Some(1)),
+            (true, true, Some(2)),
+            (true, false, Some(2)),
+            (true, true, Some(1)),
+            (false, false, None),
+            (true, true, Some(3)),
+            (false, false, None),
+        ]);
+        assert_eq!(rows[3].cel.as_deref(), Some("a"), "a reused drawing is still its cel");
+        assert_eq!(rows[5].cel, None, "an id without a cel prints its number alone");
     }
 }

@@ -1738,9 +1738,33 @@ impl Desk {
         self.sheet_pick = Some(SheetPick { folder: folder.to_string(), start, count: count.max(1) });
     }
 
-    /// One exposure command on a picked range of one column.
+    /// The first command on a column stores a sheet made from its keys
+    /// (Python's `_xsheet_command`), here held to the cut end so the stored
+    /// column reads exactly as the grid did before the command.
+    fn ensure_sheet(&mut self, folder: &str) {
+        let end = self.cut_end() as usize;
+        let slots = match find(&self.art.layers, folder) {
+            Some(node) if node.animation && node.exposure.is_none() => {
+                let mut slots = anim::project_slots(&anim::frame_map(node));
+                if let Some(last) = slots.last().cloned() {
+                    while slots.len() < end {
+                        slots.push(last.clone());
+                    }
+                }
+                slots
+            }
+            _ => return,
+        };
+        if let Some(node) = find_mut(&mut self.art.layers, folder) {
+            node.exposure = anim::sheet_from_slots(&slots, 0);
+        }
+    }
+
+    /// One exposure command on a picked range of one column. The sheet is
+    /// what the X-sheet shows from then on; the keys still paint the picture.
     pub fn sheet_command(&mut self, folder: &str, name: &str, start: u32, count: u32, arg: i64) {
         let before = self.art.clone();
+        self.ensure_sheet(folder);
         let changed = anim::folder_command(&mut self.art, folder, name, start as usize, count as usize, arg);
         if changed {
             self.history.push(before);
@@ -2221,10 +2245,14 @@ mod tests {
         assert_eq!(desk.playhead(), 0);
         desk.stop();
 
-        // An exposure command stores a sheet on the folder without moving a key.
+        // An exposure command stores a sheet on the folder without moving a
+        // key. The sheet is the grid as it read, held to the cut end.
         desk.sheet_command(&folder, "reverse", 0, 3, 0);
         let node = find(&desk.art.layers, &folder).unwrap();
-        assert!(node.exposure.is_some());
+        let sheet = node.exposure.as_ref().expect("the first command stores the sheet");
+        assert_eq!(sheet.slots.len(), 8);
+        assert_eq!(&sheet.slots[..3], ["001", "000", "000"]);
+        assert_eq!(&sheet.slots[3..], ["001", "001", "002", "002", "002"]);
         assert_eq!(node.frames, vec![0, 2, 5]);
     }
 }

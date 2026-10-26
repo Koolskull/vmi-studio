@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use crate::doc::{present, Art};
+use crate::doc::{present_plain, Art};
 
 pub fn scale_nearest(src: &[u8], width: u32, height: u32, percent: u32) -> (u32, u32, Vec<u8>) {
     let percent = percent.clamp(1, 100);
@@ -26,8 +26,9 @@ pub fn scale_nearest(src: &[u8], width: u32, height: u32, percent: u32) -> (u32,
     (dst_w, dst_h, dst)
 }
 
+/// The picture at the playhead, never with onion skin.
 pub fn export_png(art: &mut Art, path: &Path, percent: u32) -> Result<(), String> {
-    let plate = present(art);
+    let plate = present_plain(art);
     let (width, height, pixels) = scale_nearest(&plate, art.width, art.height, percent);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

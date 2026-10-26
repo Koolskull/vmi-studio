@@ -797,7 +797,7 @@ impl StudioApp {
             let factor = if (pinch - 1.0).abs() > 1e-4 {
                 pinch
             } else if scroll.y != 0.0 {
-                1.15_f32.powf(scroll.y / 40.0)
+                1.12_f32.powf(scroll.y / 40.0)
             } else {
                 1.0
             };

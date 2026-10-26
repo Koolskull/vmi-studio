@@ -404,9 +404,14 @@ impl Tool {
     }
 }
 
+/// Bumped when a saved preset needs new traits filled in from the defaults.
+pub const SETTINGS_REV: u32 = 2;
+
 /// Settings for one palette tool. A right-click edits this record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSettings {
+    #[serde(default)]
+    pub rev: u32,
     pub tool: Tool,
     pub color: [u8; 3],
     pub size: f32,
@@ -439,6 +444,7 @@ pub struct ToolSettings {
 impl ToolSettings {
     pub fn default_for(tool: Tool) -> Self {
         let mut settings = Self {
+            rev: SETTINGS_REV,
             tool,
             color: [0xFF, 0x3E, 0xB8],
             size: 16.0,
@@ -476,7 +482,6 @@ impl ToolSettings {
                 settings.softness = 0.25;
                 settings.tip = Tip::Charcoal;
                 settings.texture = 0.9;
-                settings.color = [0x11, 0x11, 0x11];
             }
             Tool::Paint => {
                 settings.size = 24.0;
@@ -535,12 +540,25 @@ impl ToolSettings {
 
     pub fn merge(saved: Vec<Self>) -> Vec<Self> {
         let mut rack = Self::rack();
-        for item in saved {
+        for mut item in saved {
             if let Some(slot) = rack.iter_mut().find(|preset| preset.tool == item.tool) {
+                item.upgrade(slot);
                 *slot = item;
             }
         }
         rack
+    }
+
+    /// A preset saved before the tip engine knows nothing about tips or
+    /// pressure. Take those traits from the default and keep the rest.
+    fn upgrade(&mut self, default: &Self) {
+        if self.rev < 2 {
+            self.tip = default.tip;
+            self.texture = default.texture;
+            self.size_pressure = true;
+            self.opacity_pressure = true;
+        }
+        self.rev = SETTINGS_REV;
     }
 
     pub fn diameter_for(&self, pressure: f32) -> f32 {
@@ -672,6 +690,28 @@ mod tests {
             let settings = ToolSettings::default_for(*tool);
             assert!(settings.size_pressure && settings.opacity_pressure, "{tool:?}");
         }
+    }
+
+    #[test]
+    fn an_old_saved_preset_picks_up_the_tip_and_pressure_but_keeps_its_size() {
+        let mut old = ToolSettings::default_for(Tool::Paint);
+        old.rev = 0;
+        old.tip = Tip::Round;
+        old.texture = 0.0;
+        old.size_pressure = false;
+        old.size = 99.0;
+        let rack = ToolSettings::merge(vec![old]);
+        let paint = rack.iter().find(|preset| preset.tool == Tool::Paint).unwrap();
+        assert_eq!(paint.tip, Tip::Bristle);
+        assert!(paint.texture > 0.0);
+        assert!(paint.size_pressure);
+        assert_eq!(paint.size, 99.0);
+        assert_eq!(paint.rev, SETTINGS_REV);
+
+        let mut kept = ToolSettings::default_for(Tool::Paint);
+        kept.tip = Tip::Round;
+        let rack = ToolSettings::merge(vec![kept]);
+        assert_eq!(rack.iter().find(|preset| preset.tool == Tool::Paint).unwrap().tip, Tip::Round);
     }
 
     #[test]

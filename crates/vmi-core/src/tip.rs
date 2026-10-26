@@ -116,8 +116,10 @@ pub fn tip_sample(grain: Grain, x: i32, y: i32, cx: f32, cy: f32, radius: f32, d
             // same high spots. Strands run along the heading.
             let tooth = fbm(px * 0.55, py * 0.55, seed, 3);
             let strand = value_noise(across * 0.9, along * 0.08, seed + 11.0);
-            let deposit = smoothstep(0.28, 0.72, tooth) * (0.55 + 0.45 * strand);
-            TipSample { mask: 0.12 + 0.88 * deposit, shade: 0.0 }
+            // The rim only takes graphite on the high spots of the paper.
+            let threshold = 0.22 + 0.3 * edge * edge;
+            let deposit = smoothstep(threshold - 0.22, threshold + 0.28, tooth) * (0.55 + 0.45 * strand);
+            TipSample { mask: 0.1 + 0.9 * deposit, shade: (tooth - 0.5) * 0.1 }
         }
         Tip::Bristle => {
             // Streaks are a function of the across coordinate, so the dabs

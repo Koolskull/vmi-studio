@@ -36,6 +36,10 @@ struct StudioApp {
     rotate_from: Option<egui::Pos2>,
     /// A text field had focus last frame. Letter shortcuts stay quiet then.
     text_focused: bool,
+    /// The platform delivered real pen pressure at least once. Speed stays out of it then.
+    hardware_pressure: bool,
+    /// Smoothed speed pressure for the current stroke.
+    speed_pressure: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +58,8 @@ impl StudioApp {
             path_text: String::new(),
             rotate_from: None,
             text_focused: false,
+            hardware_pressure: false,
+            speed_pressure: 1.0,
         }
     }
 
@@ -470,6 +476,15 @@ impl StudioApp {
                 self.desk.redo();
             }
         });
+        let mut speed = self.desk.session.speed_pressure;
+        let hint = if self.hardware_pressure {
+            "The pen reports pressure. Speed is not used."
+        } else {
+            "No pen pressure is arriving from this platform, so speed stands in: slow is thick, fast is thin."
+        };
+        if ui.checkbox(&mut speed, "Speed pressure").on_hover_text(hint).changed() {
+            self.desk.set_speed_pressure(speed);
+        }
         self.color_box(ui, theme);
         self.shape_controls(ui, theme);
         if ui.button("All settings").on_hover_text("Every field for this tool. Right-click a cell does the same.").clicked() {
@@ -595,22 +610,26 @@ impl StudioApp {
                 ui.add_space(6.0);
                 ui.separator();
             }
-            let gap = 3.0;
-            let columns = 4.0;
-            let side = ((ui.available_width() - gap * (columns - 1.0)) / columns).floor().clamp(34.0, 72.0);
+            // Two across, like the Clip Studio tool palette. A cell is 36 px
+            // and its icon is 32 px, two picture pixels per icon pixel.
+            let gap = 2.0;
+            let side = 36.0;
             let cell = egui::vec2(side, side);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-                for tool in rows {
-                    let response = tool_cell(ui, tool, cell, theme, tool == current);
-                    if response.clicked() {
-                        self.desk.palette_click(tool, false);
+            ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+            for pair in rows.chunks(2) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                    for tool in pair {
+                        let response = tool_cell(ui, *tool, cell, theme, *tool == current);
+                        if response.clicked() {
+                            self.desk.palette_click(*tool, false);
+                        }
+                        if response.secondary_clicked() {
+                            self.desk.palette_click(*tool, true);
+                        }
                     }
-                    if response.secondary_clicked() {
-                        self.desk.palette_click(tool, true);
-                    }
-                }
-            });
+                });
+            }
         }
     }
 
@@ -746,8 +765,26 @@ impl StudioApp {
             })
         });
         if let Some(force) = force {
+            self.hardware_pressure = true;
             self.desk.set_pressure(force);
         }
+    }
+
+    /// Pressure from pen speed while the hardware reports none. A slow pen
+    /// presses hard; a fast flick thins to a third of the brush.
+    fn speed_pressure(&mut self, ui: &egui::Ui, dragging: bool) {
+        if self.hardware_pressure || !self.desk.session.speed_pressure {
+            return;
+        }
+        if !dragging {
+            self.speed_pressure = 1.0;
+            self.desk.set_pressure(1.0);
+            return;
+        }
+        let speed = ui.input(|input| input.pointer.velocity().length());
+        let target = 1.0 - (speed / 2400.0).clamp(0.0, 0.66);
+        self.speed_pressure += (target - self.speed_pressure) * 0.3;
+        self.desk.set_pressure(self.speed_pressure);
     }
 
     fn picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -848,7 +885,9 @@ impl StudioApp {
                     self.desk.down_doc(x, y, Button::Primary);
                 }
             }
-            if response.dragged() && !shift && !space && !middle {
+            let painting = response.dragged() && !shift && !space && !middle;
+            self.speed_pressure(ui, painting);
+            if painting {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let (x, y) = doc_at(pos);
                     self.desk.move_doc(x, y);
@@ -905,7 +944,7 @@ fn tool_cell(ui: &mut egui::Ui, tool: Tool, cell: egui::Vec2, theme: &Theme, act
 /// Whole-pixel scaling keeps the icon crisp. The bitmap is centered in the cell.
 fn paint_icon(painter: &egui::Painter, rect: egui::Rect, tool: Tool, color: egui::Color32) {
     let side = icons::SIDE as f32;
-    let px = ((rect.width().min(rect.height()) - 6.0) / side).floor().max(1.0);
+    let px = ((rect.width().min(rect.height()) - 4.0) / side).floor().max(1.0);
     let size = px * side;
     let origin = egui::pos2(
         (rect.center().x - size * 0.5).round(),
@@ -1161,7 +1200,7 @@ impl eframe::App for StudioApp {
         let brushes = egui::SidePanel::left("brushes")
             .resizable(true)
             .default_width(brush_default)
-            .width_range(200.0..=420.0)
+            .width_range(160.0..=420.0)
             .show(ctx, |ui| self.palette(ui));
         egui::SidePanel::right("objects")
             .resizable(true)

@@ -735,6 +735,13 @@ impl Desk {
         self.camera.rotation += delta;
     }
 
+    pub fn set_speed_pressure(&mut self, on: bool) {
+        if self.session.speed_pressure != on {
+            self.session.speed_pressure = on;
+            self.session_dirty = true;
+        }
+    }
+
     pub fn set_export_percent(&mut self, percent: u32) {
         self.session.export_percent = percent.clamp(1, 100);
         self.session_dirty = true;

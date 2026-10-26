@@ -17,6 +17,14 @@ pub struct Session {
     pub layers_width: f32,
     pub brush_width: f32,
     pub export_percent: u32,
+    /// When the pen reports no pressure, take it from speed: slow is thick,
+    /// fast is thin. Hardware pressure always wins when it arrives.
+    #[serde(default = "yes")]
+    pub speed_pressure: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Session {
@@ -29,6 +37,7 @@ impl Default for Session {
             layers_width: 280.0,
             brush_width: 232.0,
             export_percent: 100,
+            speed_pressure: true,
         }
     }
 }

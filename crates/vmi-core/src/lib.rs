@@ -2,6 +2,7 @@
 
 pub mod blend;
 pub mod color;
+pub mod palette;
 pub mod coverage;
 pub mod cut;
 pub mod doc;

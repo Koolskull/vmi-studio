@@ -1,5 +1,6 @@
-//! Layers, the named tool palette, the viewfinder, and objects.
-//! Left-click selects a tool. Right-click opens that tool's settings window.
+//! Layers, the tool grid, the viewfinder, and objects.
+//! The grid is the toolbox. Color and size sit on that same panel.
+//! Left-click selects a tool. Right-click opens every setting for that tool.
 
 use eframe::egui;
 
@@ -28,6 +29,8 @@ struct StudioApp {
     prompt: Option<Prompt>,
     path_text: String,
     rotate_from: Option<egui::Pos2>,
+    /// A text field had focus last frame. Letter shortcuts stay quiet then.
+    text_focused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,13 +48,21 @@ impl StudioApp {
             prompt: None,
             path_text: String::new(),
             rotate_from: None,
+            text_focused: false,
         }
     }
 
-    fn keys(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
-            return;
+    fn watch_text(&mut self, response: egui::Response) -> egui::Response {
+        if response.has_focus() {
+            self.text_focused = true;
         }
+        response
+    }
+
+    fn keys(&mut self, ctx: &egui::Context) {
+        // egui 0.29 reports any focused widget, including the canvas and the tool
+        // cells, as wanting the keyboard. Undo still has to run after a stroke.
+        let typing = self.text_focused;
         let mut undo = false;
         let mut redo = false;
         let mut fit = false;
@@ -64,24 +75,24 @@ impl StudioApp {
         let mut zoom_in = false;
         let mut zoom_out = false;
         let mut shortcut = String::new();
-        ctx.input(|input| {
+        ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) {
+                redo = true;
+            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
+                undo = true;
+            } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y) {
+                redo = true;
+            }
             let command = input.modifiers.command;
             let shift = input.modifiers.shift;
             let plain = !command && !input.modifiers.alt;
-            if input.key_pressed(egui::Key::Z) && command {
-                if shift {
-                    redo = true;
-                } else {
-                    undo = true;
-                }
-            }
             if input.key_pressed(egui::Key::Num0) && command {
                 fit = true;
             }
             if input.key_pressed(egui::Key::Num1) && command {
                 actual = true;
             }
-            if input.key_pressed(egui::Key::X) && shift && !command {
+            if !typing && input.key_pressed(egui::Key::X) && shift && !command {
                 cut = true;
             }
             if input.key_pressed(egui::Key::Enter) {
@@ -93,16 +104,16 @@ impl StudioApp {
             if input.key_pressed(egui::Key::Delete) {
                 delete = true;
             }
-            if input.key_pressed(egui::Key::Backspace) && plain {
+            if !typing && input.key_pressed(egui::Key::Backspace) && plain {
                 backspace = true;
             }
-            if plain && !shift && input.key_pressed(egui::Key::Equals) {
+            if !typing && plain && !shift && input.key_pressed(egui::Key::Equals) {
                 zoom_in = true;
             }
-            if plain && !shift && input.key_pressed(egui::Key::Minus) {
+            if !typing && plain && !shift && input.key_pressed(egui::Key::Minus) {
                 zoom_out = true;
             }
-            if plain && !shift {
+            if !typing && plain && !shift {
                 for (key, name) in [
                     (egui::Key::P, "P"),
                     (egui::Key::B, "B"),
@@ -168,7 +179,7 @@ impl StudioApp {
             if *field == Field::ReleaseNote {
                 continue;
             }
-            edit_field(ui, tool, *field, &mut settings, theme);
+            edit_field(ui, tool, *field, &mut settings, theme, &mut self.text_focused);
         }
         if ui.button("Reset").clicked() {
             settings = ToolSettings::default_for(tool);
@@ -192,7 +203,7 @@ impl StudioApp {
         let mut solo = node.solo;
         let before = (name.clone(), opacity, blend.clone(), clip, visible, mute, solo);
         ui.label("Layer");
-        ui.text_edit_singleline(&mut name);
+        self.watch_text(ui.text_edit_singleline(&mut name));
         ui.add(egui::Slider::new(&mut opacity, 0..=255).text("Opacity"));
         egui::ComboBox::from_label("Blend")
             .selected_text(blend_label(&blend))
@@ -345,9 +356,9 @@ impl StudioApp {
         let mut kind = object.kind.clone();
         let before = (name.clone(), kind.clone());
         ui.label("Object");
-        ui.text_edit_singleline(&mut name);
+        self.watch_text(ui.text_edit_singleline(&mut name));
         ui.label("Kind");
-        ui.text_edit_singleline(&mut kind);
+        self.watch_text(ui.text_edit_singleline(&mut kind));
         if (name.clone(), kind.clone()) != before {
             self.desk.edit_object(|object| {
                 object.name = name;
@@ -407,7 +418,8 @@ impl StudioApp {
             let mut open = true;
             egui::Window::new(title).open(&mut open).resizable(true).show(ctx, |ui| {
                 ui.label("Path");
-                ui.text_edit_singleline(&mut self.path_text);
+                let path_edit = ui.text_edit_singleline(&mut self.path_text);
+                self.watch_text(path_edit);
                 if matches!(prompt, Prompt::Export) {
                     let mut percent = i32::try_from(self.desk.session.export_percent).unwrap_or(100);
                     if ui.add(egui::Slider::new(&mut percent, 1..=100).text("Percent")).changed() {
@@ -438,8 +450,122 @@ impl StudioApp {
     fn palette(&mut self, ui: &mut egui::Ui) {
         let theme = self.desk.theme();
         ui.label(egui::RichText::new("Tools").color(rgb(theme.ink)).strong());
-        ui.add(egui::TextEdit::singleline(&mut self.desk.query).hint_text("Find a tool"));
-        ui.label(egui::RichText::new("Right-click a tool for its settings.").color(rgb(theme.soft)).small());
+        ui.horizontal(|ui| {
+            if ui.button("Undo").on_hover_text("Ctrl+Z").clicked() {
+                self.desk.undo();
+            }
+            if ui.button("Redo").on_hover_text("Ctrl+Shift+Z").clicked() {
+                self.desk.redo();
+            }
+        });
+        self.color_box(ui, theme);
+        self.shape_controls(ui, theme);
+        if ui.button("All settings").on_hover_text("Every field for this tool. Right-click a cell does the same.").clicked() {
+            let tool = self.desk.tool();
+            self.desk.palette_click(tool, true);
+        }
+        let search = ui.add(egui::TextEdit::singleline(&mut self.desk.query).hint_text("Find a tool"));
+        self.watch_text(search);
+        egui::ScrollArea::vertical().id_salt("tool-grid").show(ui, |ui| {
+            self.tool_grid(ui, theme);
+        });
+    }
+
+    fn color_box(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let active = self.desk.tool();
+        let color_tool = if active.fields().contains(&Field::Color) { active } else { Tool::Pen };
+        let mut color = self.desk.preset_of(color_tool).color;
+        let before = color;
+        let label = if color_tool == active { "Color" } else { "Pen color" };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).color(rgb(theme.ink)));
+            ui.color_edit_button_srgb(&mut color);
+            let mut hex = vmi_core::hex_of(color);
+            let response = ui.add(egui::TextEdit::singleline(&mut hex).desired_width(72.0));
+            if response.has_focus() {
+                self.text_focused = true;
+            }
+            if response.changed() {
+                if let Some(parsed) = parse_hex(&hex) {
+                    color = parsed;
+                }
+            }
+        });
+        let ink = rgb(theme.ink);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+            for swatch in SWATCHES {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                ui.painter().rect_filled(rect, 1.0, rgb(swatch));
+                if color == swatch {
+                    ui.painter().rect_stroke(rect.shrink(0.5), 1.0, egui::Stroke::new(1.5_f32, ink));
+                }
+                if response.clicked() {
+                    color = swatch;
+                }
+                response.on_hover_text(vmi_core::hex_of(swatch));
+            }
+        });
+        if color != before {
+            self.desk.edit_preset(color_tool, |slot| slot.color = color);
+        }
+    }
+
+    fn shape_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let tool = self.desk.tool();
+        let mut settings = self.desk.preset_of(tool).clone();
+        let before = settings.clone();
+        let shortcut = tool.shortcut();
+        let title = if shortcut.is_empty() { tool.name().to_string() } else { format!("{}   {shortcut}", tool.name()) };
+        ui.label(egui::RichText::new(title).strong().color(rgb(theme.ink)));
+        ui.label(egui::RichText::new(tool.usage()).small().color(rgb(theme.soft)));
+        if tool.fields().contains(&Field::Size) {
+            ui.add(egui::Slider::new(&mut settings.size, 0.5..=256.0).text("Size"));
+        }
+        if tool.fields().contains(&Field::Softness) {
+            ui.add(egui::Slider::new(&mut settings.softness, 0.0..=1.0).text("Soft"));
+        }
+        if tool.fields().contains(&Field::Opacity) {
+            ui.add(egui::Slider::new(&mut settings.opacity, 0.0..=1.0).text("Opacity"));
+        }
+        if tool.fields().contains(&Field::Edge) {
+            ui.horizontal(|ui| {
+                ui.label("Edge");
+                for edge in Edge::all() {
+                    if ui.selectable_label(settings.edge == edge, edge.label()).clicked() {
+                        settings.edge = edge;
+                    }
+                }
+            });
+        }
+        if tool.fields().contains(&Field::Chunk) {
+            ui.horizontal(|ui| {
+                ui.label("Chunk");
+                for chunk in [1u32, 2, 4] {
+                    if ui.selectable_label(settings.chunk == chunk, chunk.to_string()).clicked() {
+                        settings.chunk = chunk;
+                    }
+                }
+            });
+        }
+        if tool.fields().contains(&Field::FillTolerance) {
+            let mut tolerance = i32::from(settings.fill_tolerance);
+            if ui.add(egui::Slider::new(&mut tolerance, 0..=255).text("Tolerance")).changed() {
+                settings.fill_tolerance = tolerance as u8;
+            }
+        }
+        if tool.fields().contains(&Field::PickRadius) {
+            ui.add(egui::DragValue::new(&mut settings.pick_radius).range(2.0..=64.0).speed(0.25).prefix("Pick "));
+        }
+        if tool.fields().contains(&Field::BoneReach) {
+            ui.add(egui::DragValue::new(&mut settings.bone_reach).range(8.0..=800.0).speed(1.0).prefix("Reach "));
+        }
+        if settings != before {
+            self.desk.edit_preset(tool, |slot| *slot = settings);
+        }
+    }
+
+    fn tool_grid(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let tools = palette_matching(&self.desk.query);
         let current = self.desk.tool();
         for section in [Section::Raster, Section::Vector, Section::Picture, Section::Cut] {
@@ -447,31 +573,23 @@ impl StudioApp {
             if rows.is_empty() {
                 continue;
             }
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(section.label()).color(rgb(theme.number)).strong());
-            for tool in rows {
-                let active = tool == current;
-                let fill = if active { rgb(theme.ink) } else { rgb(theme.row) };
-                let text = if active { rgb(theme.field) } else { rgb(theme.ink) };
-                let shortcut = tool.shortcut();
-                let label = if shortcut.is_empty() {
-                    tool.name().to_string()
-                } else {
-                    format!("{}   {}", tool.name(), shortcut)
-                };
-                let response = ui.add_sized(
-                    [ui.available_width(), 28.0],
-                    egui::Button::new(egui::RichText::new(label).color(text)).fill(fill),
-                );
-                let hover = format!("{}\n{}", tool.usage(), tool.release_note());
-                response.clone().on_hover_text(hover);
-                if response.clicked() {
-                    self.desk.palette_click(tool, false);
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(section.label()).strong().color(rgb(theme.number)));
+            let gap = 4.0;
+            let cell_w = ((ui.available_width() - gap) / 2.0).max(72.0);
+            let cell = egui::vec2(cell_w, 54.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                for tool in rows {
+                    let response = tool_cell(ui, tool, cell, theme, tool == current);
+                    if response.clicked() {
+                        self.desk.palette_click(tool, false);
+                    }
+                    if response.secondary_clicked() {
+                        self.desk.palette_click(tool, true);
+                    }
                 }
-                if response.secondary_clicked() {
-                    self.desk.palette_click(tool, true);
-                }
-            }
+            });
         }
     }
 
@@ -598,7 +716,14 @@ impl StudioApp {
 
     fn picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let available = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(available, egui::Sense::click_and_drag());
+        let response = ui.allocate_rect(
+            available,
+            egui::Sense {
+                click: true,
+                drag: true,
+                focusable: false,
+            },
+        );
         let frame = Frame {
             x: response.rect.min.x,
             y: response.rect.min.y,
@@ -674,6 +799,185 @@ impl StudioApp {
     }
 }
 
+const SWATCHES: [[u8; 3]; 16] = [
+    [0, 0, 0],
+    [255, 255, 255],
+    [0x44, 0x44, 0x44],
+    [0x88, 0x88, 0x88],
+    [0xCC, 0xCC, 0xCC],
+    [0xE0, 0x20, 0x20],
+    [0xFF, 0x8A, 0x00],
+    [0xFF, 0xE1, 0x00],
+    [0x22, 0xC5, 0x5A],
+    [0x14, 0xB8, 0xC4],
+    [0x3B, 0x6C, 0xFF],
+    [0x8A, 0x3F, 0xF5],
+    [0xFF, 0x3E, 0xB8],
+    [0xF4, 0xA4, 0xC0],
+    [0x8B, 0x45, 0x13],
+    [0x00, 0x3A, 0x70],
+];
+
+fn tool_cell(ui: &mut egui::Ui, tool: Tool, cell: egui::Vec2, theme: &Theme, active: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click());
+    let fill = if active {
+        rgb(theme.ink)
+    } else if response.hovered() {
+        rgb(theme.frame)
+    } else {
+        rgb(theme.row)
+    };
+    let glyph = if active { rgb(theme.field) } else { rgb(theme.ink) };
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 3.0, fill);
+    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, rgb(theme.frame)));
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 16.0),
+        egui::vec2(22.0, 22.0),
+    );
+    paint_glyph(&painter, icon, tool, glyph);
+    let shortcut = tool.shortcut();
+    if !shortcut.is_empty() {
+        painter.text(
+            rect.right_top() + egui::vec2(-4.0, 3.0),
+            egui::Align2::RIGHT_TOP,
+            shortcut,
+            egui::FontId::proportional(9.0),
+            if active { rgb(theme.field) } else { rgb(theme.soft) },
+        );
+    }
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 4.0),
+        egui::Align2::CENTER_BOTTOM,
+        tool.name(),
+        egui::FontId::proportional(11.0),
+        glyph,
+    );
+    response.on_hover_text(format!("{}\n{}\nRight-click for every setting.", tool.name(), tool.usage()))
+}
+
+fn paint_glyph(painter: &egui::Painter, rect: egui::Rect, tool: Tool, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6_f32, color);
+    let thin = egui::Stroke::new(1.0_f32, color);
+    let at = |x: f32, y: f32| egui::pos2(rect.left() + rect.width() * x, rect.top() + rect.height() * y);
+    match tool {
+        Tool::Pen => {
+            painter.line_segment([at(0.15, 0.85), at(0.72, 0.22)], stroke);
+            painter.circle_filled(at(0.78, 0.16), 2.2, color);
+        }
+        Tool::Pencil => {
+            painter.line_segment([at(0.2, 0.82), at(0.7, 0.28)], thin);
+            painter.rect_filled(egui::Rect::from_center_size(at(0.78, 0.2), egui::vec2(4.0, 4.0)), 0.0, color);
+        }
+        Tool::Paint => {
+            painter.circle_filled(rect.center(), rect.width() * 0.28, color);
+        }
+        Tool::Air => {
+            painter.circle_stroke(rect.center(), rect.width() * 0.28, thin);
+            for point in [at(0.35, 0.4), at(0.62, 0.32), at(0.48, 0.62), at(0.7, 0.58)] {
+                painter.circle_filled(point, 1.3, color);
+            }
+        }
+        Tool::Eraser => {
+            painter.rect_stroke(egui::Rect::from_min_max(at(0.2, 0.28), at(0.8, 0.72)), 2.0, stroke);
+        }
+        Tool::Smudge => {
+            painter.circle_stroke(at(0.4, 0.48), 5.0, thin);
+            painter.circle_stroke(at(0.62, 0.48), 5.0, thin);
+        }
+        Tool::Blend => {
+            painter.circle_stroke(rect.center(), 6.0, thin);
+            painter.line_segment([at(0.22, 0.5), at(0.78, 0.5)], thin);
+        }
+        Tool::Fill => {
+            painter.line_segment([at(0.22, 0.72), at(0.5, 0.22)], stroke);
+            painter.line_segment([at(0.5, 0.22), at(0.78, 0.72)], stroke);
+            painter.line_segment([at(0.22, 0.72), at(0.78, 0.72)], stroke);
+            painter.circle_filled(at(0.72, 0.78), 1.8, color);
+        }
+        Tool::Dither => {
+            for y in 0..4 {
+                for x in 0..4 {
+                    if (x + y * 2) % 3 != 0 {
+                        let cell = rect.width() / 4.0;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(at(x as f32 / 4.0, y as f32 / 4.0), egui::vec2(cell - 1.0, cell - 1.0)),
+                            0.0,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+        Tool::Line => {
+            painter.line_segment([at(0.12, 0.8), at(0.88, 0.2)], stroke);
+        }
+        Tool::Vector => {
+            painter.line_segment([at(0.15, 0.75), at(0.45, 0.3)], thin);
+            painter.line_segment([at(0.45, 0.3), at(0.85, 0.62)], thin);
+            painter.circle_filled(at(0.15, 0.75), 2.0, color);
+            painter.circle_filled(at(0.45, 0.3), 2.0, color);
+            painter.circle_filled(at(0.85, 0.62), 2.0, color);
+        }
+        Tool::Curve => {
+            painter.line_segment([at(0.12, 0.78), at(0.35, 0.22)], thin);
+            painter.line_segment([at(0.35, 0.22), at(0.88, 0.55)], thin);
+            painter.circle_stroke(at(0.35, 0.22), 2.2, thin);
+            painter.circle_filled(at(0.12, 0.78), 2.0, color);
+            painter.circle_filled(at(0.88, 0.55), 2.0, color);
+        }
+        Tool::Point => {
+            painter.circle_stroke(rect.center(), 4.0, thin);
+            painter.line_segment([at(0.5, 0.12), at(0.5, 0.88)], thin);
+            painter.line_segment([at(0.12, 0.5), at(0.88, 0.5)], thin);
+        }
+        Tool::Bone => {
+            painter.line_segment([at(0.22, 0.72), at(0.72, 0.28)], stroke);
+            painter.circle_filled(at(0.22, 0.72), 2.6, color);
+            painter.circle_stroke(at(0.78, 0.22), 3.0, thin);
+        }
+        Tool::Grain => {
+            for point in [at(0.3, 0.3), at(0.55, 0.28), at(0.72, 0.48), at(0.4, 0.55), at(0.62, 0.7), at(0.32, 0.74)] {
+                painter.circle_filled(point, 1.5, color);
+            }
+        }
+        Tool::WarpTarget => {
+            painter.line_segment([at(0.2, 0.28), at(0.78, 0.18)], thin);
+            painter.line_segment([at(0.78, 0.18), at(0.86, 0.78)], thin);
+            painter.line_segment([at(0.86, 0.78), at(0.16, 0.7)], thin);
+            painter.line_segment([at(0.16, 0.7), at(0.2, 0.28)], thin);
+            for point in [at(0.2, 0.28), at(0.78, 0.18), at(0.86, 0.78), at(0.16, 0.7)] {
+                painter.circle_filled(point, 1.7, color);
+            }
+        }
+        Tool::WarpMask => {
+            painter.line_segment([at(0.18, 0.25), at(0.42, 0.25)], thin);
+            painter.line_segment([at(0.58, 0.25), at(0.82, 0.25)], thin);
+            painter.line_segment([at(0.18, 0.75), at(0.42, 0.75)], thin);
+            painter.line_segment([at(0.58, 0.75), at(0.82, 0.75)], thin);
+            painter.line_segment([at(0.18, 0.25), at(0.18, 0.48)], thin);
+            painter.line_segment([at(0.18, 0.58), at(0.18, 0.75)], thin);
+            painter.line_segment([at(0.82, 0.25), at(0.82, 0.48)], thin);
+            painter.line_segment([at(0.82, 0.58), at(0.82, 0.75)], thin);
+        }
+        Tool::CutRect => {
+            painter.rect_stroke(egui::Rect::from_min_max(at(0.18, 0.22), at(0.82, 0.78)), 0.0, stroke);
+        }
+        Tool::CutLasso => {
+            painter.line_segment([at(0.2, 0.55), at(0.35, 0.25)], thin);
+            painter.line_segment([at(0.35, 0.25), at(0.7, 0.3)], thin);
+            painter.line_segment([at(0.7, 0.3), at(0.82, 0.62)], thin);
+            painter.line_segment([at(0.82, 0.62), at(0.48, 0.8)], thin);
+            painter.line_segment([at(0.48, 0.8), at(0.2, 0.55)], thin);
+        }
+        Tool::CutPolygon => {
+            painter.line_segment([at(0.5, 0.16), at(0.86, 0.78)], thin);
+            painter.line_segment([at(0.86, 0.78), at(0.14, 0.78)], thin);
+            painter.line_segment([at(0.14, 0.78), at(0.5, 0.16)], thin);
+        }
+    }
+}
+
 fn paint_plate(ui: &mut egui::Ui, texture: &egui::TextureHandle, desk: &Desk, frame: Frame) {
     let painter = ui.painter().with_clip_rect(egui::Rect::from_min_size(
         egui::pos2(frame.x, frame.y),
@@ -715,7 +1019,7 @@ fn paint_plate(ui: &mut egui::Ui, texture: &egui::TextureHandle, desk: &Desk, fr
     }
 }
 
-fn edit_field(ui: &mut egui::Ui, tool: Tool, field: Field, settings: &mut ToolSettings, theme: &Theme) {
+fn edit_field(ui: &mut egui::Ui, tool: Tool, field: Field, settings: &mut ToolSettings, theme: &Theme, typing: &mut bool) {
     match field {
         Field::ReleaseNote => {
             ui.label(tool.release_note());
@@ -725,7 +1029,11 @@ fn edit_field(ui: &mut egui::Ui, tool: Tool, field: Field, settings: &mut ToolSe
                 ui.label("Color");
                 ui.color_edit_button_srgb(&mut settings.color);
                 let mut hex = vmi_core::hex_of(settings.color);
-                if ui.text_edit_singleline(&mut hex).changed() {
+                let response = ui.text_edit_singleline(&mut hex);
+                if response.has_focus() {
+                    *typing = true;
+                }
+                if response.changed() {
                     if let Some(color) = parse_hex(&hex) {
                         settings.color = color;
                     }
@@ -884,6 +1192,7 @@ impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.desk.theme());
         self.keys(ctx);
+        self.text_focused = false;
         self.windows(ctx);
         let layers_default = self.desk.session.layers_width;
         let brush_default = self.desk.session.brush_width;
@@ -932,10 +1241,10 @@ impl eframe::App for StudioApp {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    if ui.button("Undo").clicked() {
+                    if ui.button("Undo    Ctrl+Z").clicked() {
                         self.desk.undo();
                     }
-                    if ui.button("Redo").clicked() {
+                    if ui.button("Redo    Ctrl+Shift+Z").clicked() {
                         self.desk.redo();
                     }
                 });

@@ -118,7 +118,7 @@ impl Desk {
             art,
             session,
             selected,
-            status: "Right-click a tool for its settings.".into(),
+            status: "Pick a cell in the tool grid. Color and size are on that panel. Ctrl+Z undoes.".into(),
             query: String::new(),
             tool_window: None,
             layer_window: None,

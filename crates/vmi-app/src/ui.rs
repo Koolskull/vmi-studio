@@ -1614,6 +1614,10 @@ impl StudioApp {
             self.desk.set_pressure(force);
         } else if let Some(pen) = tablet::pressure() {
             self.desk.set_pressure(pen);
+        } else {
+            // No pen has spoken, or a mouse spoke after it: a lifted pen's 0
+            // must not stick to the mouse.
+            self.desk.set_pressure(1.0);
         }
     }
 
@@ -2250,8 +2254,10 @@ impl eframe::App for StudioApp {
         self.keys(ctx);
         self.text_focused = false;
         self.windows(ctx);
-        // Playback: frames fall due on the cut's clock.
-        let dt = ctx.input(|input| f64::from(input.stable_dt));
+        // Playback: frames fall due on the cut's clock. The measured frame
+        // time, not egui's predicted one, which stays at the monitor's rate
+        // while the window only repaints when a frame is due.
+        let dt = ctx.input(|input| f64::from(input.unstable_dt));
         if self.desk.tick(dt) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(self.desk.next_frame_in().max(0.001)));
         }

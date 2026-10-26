@@ -131,6 +131,9 @@ pub struct Desk {
     pub hold: u32,
     /// Seconds owed to the next frame while playing.
     play_clock: f64,
+    /// Play was just pressed: the first tick's frame time is the idle gap
+    /// before it, not playback time, and is dropped.
+    play_armed: bool,
     history: History,
     gesture: Option<Gesture>,
     overlay: Vec<u8>,
@@ -177,6 +180,7 @@ impl Desk {
             loop_wrap: false,
             hold: 2,
             play_clock: 0.0,
+            play_armed: false,
             history: History::default(),
             gesture: None,
             overlay: Vec::new(),
@@ -1455,6 +1459,7 @@ impl Desk {
     pub fn toggle_play(&mut self) {
         self.playing = !self.playing;
         self.play_clock = 0.0;
+        self.play_armed = self.playing;
         if self.playing && self.cut_end() <= 1 {
             self.playing = false;
             self.status = "One frame. Add a cel to the sheet first.".into();
@@ -1478,6 +1483,10 @@ impl Desk {
     pub fn tick(&mut self, dt: f64) -> bool {
         if !self.playing {
             return false;
+        }
+        if self.play_armed {
+            self.play_armed = false;
+            return true;
         }
         let fps = f64::from(self.art.fps.max(1));
         self.play_clock += dt.clamp(0.0, 0.25);
@@ -2206,6 +2215,8 @@ mod tests {
         desk.set_playhead(7);
         desk.toggle_play();
         assert!(desk.playing);
+        assert!(desk.tick(5.0), "the idle gap before Play is not playback time");
+        assert_eq!(desk.playhead(), 7);
         assert!(desk.tick(1.0 / f64::from(desk.art.fps) + 0.001));
         assert_eq!(desk.playhead(), 0);
         desk.stop();

@@ -1,6 +1,13 @@
 //! `.vmib` zip. Python reads `blueprint.json` and `rasters/`. Ink that is
 //! separate from the vector cache is stored under `inks/` so a reload can
 //! rebuild the strokes without painting them twice.
+//!
+//! The animation keys match `vmi_studio/vmib.py`: every layer row carries
+//! `animation`, `timeline`, and `frames`; a layer with an exposure sheet
+//! carries `exposure` (Python's `to_row`), the others omit the key; the
+//! document carries `clip_time` (`name`, `fps`, `start`, `end`, `current`)
+//! whenever the drawing has a cut to keep. Each raster is the layer's own
+//! picture, composited without onion skin.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -10,9 +17,10 @@ use serde_json::{json, Value};
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::anim::{animation_folders, cut_end, ExposureSheet, DEFAULT_FPS};
 use crate::color::hex_of;
 use crate::coverage::Edge;
-use crate::doc::{expand_raster, present, tight_pixels, Art, DeskObject, Node, NodeKind};
+use crate::doc::{expand_raster, present_plain, tight_pixels, Art, ClipTime, DeskObject, Node, NodeKind};
 use crate::tool::{CurveKind, GrainKind};
 use crate::vector::{Bone, Raster, VectorStroke, Vertex};
 
@@ -20,8 +28,6 @@ const FORMAT: &str = "vmib";
 const VERSION: u64 = 1;
 
 pub fn save(art: &mut Art, path: &Path) -> Result<(), String> {
-    let plate = present(art);
-    let _ = plate;
     let mut document = json!({
         "format": FORMAT,
         "version": VERSION,
@@ -39,7 +45,31 @@ pub fn save(art: &mut Art, path: &Path) -> Result<(), String> {
     });
     let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
     document["layers"] = Value::Array(art.layers.iter().map(|node| layer_row(art, node, &mut blobs)).collect());
+    if let Some(clip_time) = clip_time_row(art) {
+        document["clip_time"] = clip_time;
+    }
     write_zip(path, &document, &blobs)
+}
+
+/// Python writes `clip_time` only when the cut has a name. A file that came
+/// with one keeps it; a drawing that grew an animation here, or runs at
+/// another rate, gets the default name so the rate and playhead survive.
+/// `end` never shrinks below the last key.
+fn clip_time_row(art: &Art) -> Option<Value> {
+    let animated = !animation_folders(&art.layers).is_empty();
+    if art.clip_time.is_none() && !animated && art.fps == DEFAULT_FPS {
+        return None;
+    }
+    let clip = art.clip_time.clone().unwrap_or_default();
+    let name = if clip.name.trim().is_empty() { "Timeline".to_string() } else { clip.name.clone() };
+    let last_key = cut_end(&art.layers).saturating_sub(1);
+    Some(json!({
+        "name": name,
+        "fps": art.fps,
+        "start": clip.start,
+        "end": clip.end.max(last_key),
+        "current": art.playhead,
+    }))
 }
 
 fn layer_row(art: &Art, node: &Node, blobs: &mut Vec<(String, Vec<u8>)>) -> Value {
@@ -54,13 +84,13 @@ fn layer_row(art: &Art, node: &Node, blobs: &mut Vec<(String, Vec<u8>)>) -> Valu
         "shapes": true,
         "mute": node.mute,
         "solo": node.solo,
-        "animation": false,
-        "timeline": [],
+        "animation": node.animation,
+        "timeline": node.timeline,
         "warp": "",
         "marker": node.marker,
         "color": node.color,
         "vectors": node.vectors,
-        "frames": [],
+        "frames": node.frames,
         "outline": false,
         "outline_px": 0,
         "outline_rgb": [0, 0, 0],
@@ -68,6 +98,9 @@ fn layer_row(art: &Art, node: &Node, blobs: &mut Vec<(String, Vec<u8>)>) -> Valu
         "children": node.children.iter().map(|child| layer_row(art, child, blobs)).collect::<Vec<_>>(),
         "traits": !node.strokes.is_empty(),
     });
+    if let Some(sheet) = &node.exposure {
+        row["exposure"] = sheet.to_row();
+    }
     if !node.strokes.is_empty() {
         row["strokes"] = Value::Array(node.strokes.iter().map(stroke_row).collect());
     }
@@ -95,7 +128,8 @@ fn layer_picture(art: &Art, node: &Node) -> Option<Raster> {
     scratch.layers[0].opacity = 255;
     scratch.layers[0].mute = false;
     scratch.layers[0].solo = false;
-    let plate = present(&mut scratch);
+    scratch.layers[0].clip = false;
+    let plate = present_plain(&mut scratch);
     tight_pixels(&plate, art.width, art.height)
 }
 
@@ -198,6 +232,18 @@ pub fn load(path: &Path) -> Result<Art, String> {
     }
     art.next_id = max_id + 1;
     art.next_stroke = max_stroke(&art.layers) + 1;
+    if let Some(clip_time) = document.get("clip_time").and_then(Value::as_object) {
+        let number = |key: &str| clip_time.get(key).and_then(Value::as_f64).unwrap_or(0.0).max(0.0).round() as u32;
+        let fps = number("fps");
+        art.fps = if fps == 0 { DEFAULT_FPS } else { fps };
+        art.playhead = number("current");
+        let name = clip_time.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        art.clip_time = Some(ClipTime {
+            name: if name.is_empty() { "Timeline".to_string() } else { name.to_string() },
+            start: number("start"),
+            end: number("end"),
+        });
+    }
     if let Some(objects) = document.get("objects").and_then(Value::as_array) {
         for row in objects {
             let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -255,7 +301,35 @@ fn node_from(row: &Value, archive: &mut ZipArchive<File>, width: u32, height: u3
             node.children.push(node_from(child, archive, width, height, max_id)?);
         }
     }
+    node.animation = row.get("animation").and_then(Value::as_bool).unwrap_or(false);
+    node.timeline = row
+        .get("timeline")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .filter(|id| node.children.iter().any(|child| child.id == *id))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    node.frames = row
+        .get("frames")
+        .and_then(Value::as_array)
+        .map(|frames| frames.iter().filter_map(Value::as_f64).map(|frame| frame.max(0.0) as u32).collect())
+        .unwrap_or_default();
+    node.exposure = load_sheet(row.get("exposure"));
     Ok(node)
+}
+
+/// None when a layer has no exposure row or the row is not one. A row is
+/// rebuilt, not allocated.
+pub fn load_sheet(value: Option<&Value>) -> Option<ExposureSheet> {
+    let row = value?.as_object()?;
+    if row.is_empty() {
+        return None;
+    }
+    ExposureSheet::from_row(value?)
 }
 
 fn read_vectors(value: Option<&Value>) -> Vec<Vec<[f32; 2]>> {
@@ -422,5 +496,187 @@ mod tests {
         assert_eq!(layer.pixels[0], 10);
         assert!(!layer.embedded);
         assert_eq!(loaded.objects.len(), 0);
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("vmi-vmib-{tag}-{stamp}.vmib"))
+    }
+
+    fn blueprint(path: &Path) -> Value {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut raw = String::new();
+        archive.by_name("blueprint.json").unwrap().read_to_string(&mut raw).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn held_sheet() -> ExposureSheet {
+        ExposureSheet {
+            slots: vec!["000".into(), "000".into(), "000".into(), "002".into()],
+            pool: vec!["000".into(), "001".into(), "002".into()],
+            issued: 3,
+            base_seed: 11,
+            active: 2,
+        }
+    }
+
+    #[test]
+    fn a_three_cel_animation_and_its_sheet_round_trip() {
+        let mut art = Art::blank(4, 4);
+        art.file_name = "shot".into();
+        art.add_layer(None, "Paper");
+        let folder_id = art.add_group(None, "Animation");
+        let mut ids = Vec::new();
+        for (index, name) in ["1", "2", "3"].iter().enumerate() {
+            let id = art.add_layer(Some(&folder_id), name);
+            let cel = crate::doc::find_mut(&mut art.layers, &id).unwrap();
+            cel.pixels[index * 4] = 200;
+            cel.pixels[index * 4 + 3] = 255;
+            ids.push(id);
+        }
+        let folder = crate::doc::find_mut(&mut art.layers, &folder_id).unwrap();
+        folder.animation = true;
+        folder.timeline = ids.clone();
+        folder.frames = vec![0, 2, 5];
+        folder.exposure = Some(held_sheet());
+        art.fps = 30;
+        art.playhead = 4;
+        art.clip_time = Some(ClipTime { name: "Timeline 1".into(), start: 0, end: 48 });
+        art.onion = true;
+
+        let path = temp_path("anim");
+        save(&mut art, &path).unwrap();
+        let loaded = load(&path).unwrap();
+        let document = blueprint(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let folder = crate::doc::find(&loaded.layers, &folder_id).unwrap();
+        assert!(folder.animation);
+        assert_eq!(folder.timeline, ids);
+        assert_eq!(folder.frames, vec![0, 2, 5]);
+        assert_eq!(folder.exposure, Some(held_sheet()));
+        assert_eq!(folder.children.len(), 3);
+        for (index, id) in ids.iter().enumerate() {
+            let cel = crate::doc::find(&loaded.layers, id).unwrap();
+            assert!(!cel.animation);
+            assert!(cel.timeline.is_empty() && cel.frames.is_empty());
+            assert_eq!(cel.exposure, None);
+            assert_eq!(cel.pixels[index * 4], 200, "cel {id} keeps its own picture");
+            assert_eq!(cel.pixels[index * 4 + 3], 255);
+        }
+        assert_eq!(loaded.fps, 30);
+        assert_eq!(loaded.playhead, 4);
+        assert_eq!(loaded.clip_time, Some(ClipTime { name: "Timeline 1".into(), start: 0, end: 48 }));
+        assert!(!loaded.onion, "onion skin is a view, not part of the file");
+        assert_eq!(crate::anim::cel_at(folder, 4).unwrap().id, ids[1]);
+
+        let rows = document["layers"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["id"] == folder_id.as_str()).unwrap();
+        assert_eq!(row["animation"], json!(true));
+        assert_eq!(row["timeline"], json!(ids));
+        assert_eq!(row["frames"], json!([0, 2, 5]));
+        assert_eq!(row["exposure"], held_sheet().to_row());
+        assert_eq!(row["exposure"]["slots"], json!(["000", "000", "000", "002"]));
+        for cel in row["children"].as_array().unwrap() {
+            assert_eq!(cel["animation"], json!(false));
+            assert_eq!(cel["timeline"], json!([]));
+            assert_eq!(cel["frames"], json!([]));
+            assert!(cel.get("exposure").is_none(), "a layer without a sheet omits the key");
+        }
+        let paper = rows.iter().find(|row| row["name"] == "Paper").unwrap();
+        assert!(paper.get("exposure").is_none());
+        assert_eq!(
+            document["clip_time"],
+            json!({"name": "Timeline 1", "fps": 30, "start": 0, "end": 48, "current": 4})
+        );
+    }
+
+    #[test]
+    fn clip_time_is_written_for_a_cut_and_skipped_for_a_plain_drawing() {
+        let mut plain = Art::new(4, 4);
+        let path = temp_path("plain");
+        save(&mut plain, &path).unwrap();
+        let document = blueprint(&path);
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(document.get("clip_time").is_none());
+        assert_eq!((loaded.fps, loaded.playhead, loaded.clip_time), (DEFAULT_FPS, 0, None));
+        assert_eq!(document["layers"][0]["animation"], json!(false));
+        assert_eq!(document["layers"][0]["timeline"], json!([]));
+        assert_eq!(document["layers"][0]["frames"], json!([]));
+
+        let mut grown = Art::blank(4, 4);
+        let folder_id = grown.add_group(None, "Animation");
+        let first = grown.add_layer(Some(&folder_id), "1");
+        let second = grown.add_layer(Some(&folder_id), "2");
+        let folder = crate::doc::find_mut(&mut grown.layers, &folder_id).unwrap();
+        folder.animation = true;
+        folder.timeline = vec![first, second];
+        folder.frames = vec![0, 7];
+        grown.playhead = 3;
+        let path = temp_path("grown");
+        save(&mut grown, &path).unwrap();
+        let document = blueprint(&path);
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            document["clip_time"],
+            json!({"name": "Timeline", "fps": 24, "start": 0, "end": 7, "current": 3}),
+            "an animated drawing keeps its rate and playhead; end reaches the last key"
+        );
+        assert_eq!(loaded.playhead, 3);
+        assert_eq!(loaded.clip_time, Some(ClipTime { name: "Timeline".into(), start: 0, end: 7 }));
+
+        let mut slow = Art::new(4, 4);
+        slow.fps = 12;
+        let path = temp_path("slow");
+        save(&mut slow, &path).unwrap();
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.fps, 12, "another rate survives without an animation");
+    }
+
+    #[test]
+    fn an_old_blueprint_without_animation_keys_still_loads() {
+        let document = json!({
+            "format": FORMAT,
+            "version": VERSION,
+            "name": "old",
+            "width": 2,
+            "height": 2,
+            "layers": [
+                {"id": "n1", "name": "Ink", "kind": "layer"},
+                {"id": "n2", "name": "Folder", "kind": "group", "children": [
+                    {"id": "n3", "name": "1", "kind": "layer", "exposure": {}},
+                    {"id": "n4", "name": "2", "kind": "layer", "exposure": null},
+                ], "animation": true, "timeline": ["n4", "n9", 7, "n3"], "frames": [2.0, -1, 5]},
+            ],
+            "clip_time": {"name": "", "fps": 0, "start": 0, "end": 9, "current": 6},
+        });
+        let path = temp_path("old");
+        write_zip(&path, &document, &[]).unwrap();
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.layers.len(), 2);
+        assert!(!loaded.layers[0].animation);
+        assert!(loaded.layers[0].timeline.is_empty() && loaded.layers[0].frames.is_empty());
+        assert_eq!(loaded.layers[0].exposure, None);
+        let folder = &loaded.layers[1];
+        assert!(folder.animation);
+        assert_eq!(folder.timeline, vec!["n4".to_string(), "n3".to_string()], "unknown ids drop out");
+        assert_eq!(folder.frames, vec![2, 0, 5], "frames clamp at zero");
+        assert_eq!(folder.children[0].exposure, None, "an empty row is no sheet");
+        assert_eq!(folder.children[1].exposure, None);
+        assert_eq!(loaded.fps, DEFAULT_FPS, "a zero rate falls back");
+        assert_eq!(loaded.playhead, 6);
+        assert_eq!(loaded.clip_time, Some(ClipTime { name: "Timeline".into(), start: 0, end: 9 }));
+        assert_eq!(loaded.next_id, 5);
+
+        assert_eq!(load_sheet(None), None);
+        assert_eq!(load_sheet(Some(&json!(null))), None);
+        assert_eq!(load_sheet(Some(&json!({}))), None);
+        assert_eq!(load_sheet(Some(&json!({"note": "no sheet"}))), None);
+        assert_eq!(load_sheet(Some(&json!(["000"]))), None);
+        assert_eq!(load_sheet(Some(&held_sheet().to_row())), Some(held_sheet()));
     }
 }

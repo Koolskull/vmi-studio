@@ -4,12 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use vmi_core::anim;
 use vmi_core::doc::blit_into;
 use vmi_core::{
     clamp_rect, cut_folder, erase_folder, export_png, find, find_mut, hex_of, hit_stroke, load_manifest, load_session,
     load_vmib, palette_action, parent_of, parse_hex, point_inside, present_region, rect_points, save_session,
-    save_vmib as write_vmib, theme_or_studio, Art, Bone, DeskObject, History, Node, PaletteAction, Release, Section,
-    Session, StrokeHit, Tool, ToolSettings,
+    save_vmib as write_vmib, theme_or_studio, Art, Bone, ClipTime, DeskObject, History, Node, PaletteAction, Release,
+    Section, Session, StrokeHit, Tool, ToolSettings,
 };
 use vmi_paint::{flood_fill, paint_samples, paint_segment, segment_bounds, Carry, StrokeSession};
 
@@ -38,6 +39,10 @@ pub struct LayerRow {
     pub depth: usize,
     pub group: bool,
     pub visible: bool,
+    /// A folder that is one sequence.
+    pub animation: bool,
+    /// A cel's first frame, from 1. None for a child no frame specifies.
+    pub frame: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +50,14 @@ pub struct Mark {
     pub x: f32,
     pub y: f32,
     pub hot: bool,
+}
+
+/// A picked range of cells in one column of the sheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SheetPick {
+    pub folder: String,
+    pub start: u32,
+    pub count: u32,
 }
 
 enum Gesture {
@@ -106,6 +119,18 @@ pub struct Desk {
     pub cut_points: Vec<[f32; 2]>,
     pub cut_closed: bool,
     pub warp_draft: Vec<[f32; 2]>,
+    /// The sheet's picked cells, for its command menu.
+    pub sheet_pick: Option<SheetPick>,
+    /// Playback is running.
+    pub playing: bool,
+    /// Play returns to the first frame at the end. Off stops there.
+    pub loop_play: bool,
+    /// Stepping past either end wraps. Separate from playback loop.
+    pub loop_wrap: bool,
+    /// Ones, twos, or threes: how long a new cel holds.
+    pub hold: u32,
+    /// Seconds owed to the next frame while playing.
+    play_clock: f64,
     history: History,
     gesture: Option<Gesture>,
     overlay: Vec<u8>,
@@ -146,6 +171,12 @@ impl Desk {
             cut_points: Vec::new(),
             cut_closed: false,
             warp_draft: Vec::new(),
+            sheet_pick: None,
+            playing: false,
+            loop_play: true,
+            loop_wrap: false,
+            hold: 2,
+            play_clock: 0.0,
             history: History::default(),
             gesture: None,
             overlay: Vec::new(),
@@ -457,6 +488,11 @@ impl Desk {
         Ok(())
     }
 
+    /// The window changed the session directly. Save it at the end of the frame.
+    pub fn touch_session(&mut self) {
+        self.session_dirty = true;
+    }
+
     pub fn flush_session(&mut self) {
         if self.persist && self.session_dirty {
             if save_session(&self.session).is_ok() {
@@ -751,6 +787,19 @@ impl Desk {
         if (self.session.layers_width - layers).abs() > 0.5 || (self.session.brush_width - brushes).abs() > 0.5 {
             self.session.layers_width = layers;
             self.session.brush_width = brushes;
+            self.session_dirty = true;
+        }
+    }
+
+    /// The right and bottom areas' sizes, and which view each area shows.
+    pub fn note_areas(&mut self, right: f32, bottom: f32, views: &[String]) {
+        if (self.session.right_width - right).abs() > 0.5 || (self.session.bottom_height - bottom).abs() > 0.5 {
+            self.session.right_width = right;
+            self.session.bottom_height = bottom;
+            self.session_dirty = true;
+        }
+        if self.session.areas != views {
+            self.session.areas = views.to_vec();
             self.session_dirty = true;
         }
     }
@@ -1331,6 +1380,369 @@ impl Desk {
     }
 }
 
+/// The sheet, the transport, and the onion skin. Time lives on the document:
+/// `art.playhead` picks one cel per animation folder when the picture paints.
+impl Desk {
+    /// Frames in the cut: the keys, or the stored cut end when it reaches
+    /// further. Holds on the last cel live in that stored end.
+    pub fn cut_end(&self) -> u32 {
+        anim::cut_frames(&self.art).max(1)
+    }
+
+    pub fn playhead(&self) -> u32 {
+        self.art.playhead
+    }
+
+    /// Show a frame. Nothing is undone by this; it is where you are looking.
+    pub fn set_playhead(&mut self, frame: u32) {
+        let last = self.cut_end().saturating_sub(1);
+        let frame = frame.min(last);
+        if frame != self.art.playhead {
+            if self.gesture.is_some() {
+                self.cancel_gesture();
+            }
+            self.art.playhead = frame;
+            self.dirty = true;
+            self.follow_playhead();
+        }
+    }
+
+    /// The pen draws on what the picture shows: when the selection is a cel
+    /// of a timeline, moving the playhead selects the cel that folder holds
+    /// on the new frame. Before the first key the selection stays.
+    fn follow_playhead(&mut self) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        let Some(folder) = anim::owning_animation(&self.art.layers, &selected) else {
+            return;
+        };
+        let Some(node) = find(&self.art.layers, &folder) else {
+            return;
+        };
+        // A row deeper inside a group cel was chosen on purpose; leave it.
+        if !node.children.iter().any(|cel| cel.id == selected) {
+            return;
+        }
+        if let Some(shown) = anim::cel_at(node, self.art.playhead) {
+            if shown.id != selected {
+                self.selected = Some(shown.id.clone());
+            }
+        }
+    }
+
+    /// Comma and period. Past either end wraps only when loop wrap is on.
+    pub fn step_frame(&mut self, delta: i64) {
+        let end = i64::from(self.cut_end());
+        let mut next = i64::from(self.art.playhead) + delta;
+        if self.loop_wrap {
+            next = next.rem_euclid(end);
+        } else {
+            next = next.clamp(0, end - 1);
+        }
+        self.set_playhead(next as u32);
+    }
+
+    pub fn first_frame(&mut self) {
+        self.set_playhead(0);
+    }
+
+    pub fn last_frame(&mut self) {
+        let last = self.cut_end().saturating_sub(1);
+        self.set_playhead(last);
+    }
+
+    pub fn toggle_play(&mut self) {
+        self.playing = !self.playing;
+        self.play_clock = 0.0;
+        if self.playing && self.cut_end() <= 1 {
+            self.playing = false;
+            self.status = "One frame. Add a cel to the sheet first.".into();
+        } else if self.playing {
+            self.status = format!("Playing at {} fps.", self.art.fps.max(1));
+            if !self.loop_play && self.art.playhead + 1 >= self.cut_end() {
+                self.art.playhead = 0;
+                self.dirty = true;
+            }
+        } else {
+            self.status = format!("Stopped on frame {}.", self.art.playhead + 1);
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.playing = false;
+        self.play_clock = 0.0;
+    }
+
+    /// Advance playback by `dt` seconds. True while a repaint is still owed.
+    pub fn tick(&mut self, dt: f64) -> bool {
+        if !self.playing {
+            return false;
+        }
+        let fps = f64::from(self.art.fps.max(1));
+        self.play_clock += dt.clamp(0.0, 0.25);
+        let period = 1.0 / fps;
+        let mut moved = false;
+        while self.play_clock >= period {
+            self.play_clock -= period;
+            let end = self.cut_end();
+            let next = self.art.playhead + 1;
+            if next >= end {
+                if self.loop_play {
+                    self.art.playhead = 0;
+                } else {
+                    self.art.playhead = end.saturating_sub(1);
+                    self.playing = false;
+                    self.play_clock = 0.0;
+                    moved = true;
+                    break;
+                }
+            } else {
+                self.art.playhead = next;
+            }
+            moved = true;
+        }
+        if moved {
+            self.dirty = true;
+            self.follow_playhead();
+        }
+        self.playing
+    }
+
+    /// Seconds until the next frame is due, for the repaint timer.
+    pub fn next_frame_in(&self) -> f64 {
+        let fps = f64::from(self.art.fps.max(1));
+        (1.0 / fps - self.play_clock).max(0.0)
+    }
+
+    pub fn set_fps(&mut self, fps: u32) {
+        let fps = fps.clamp(1, 60);
+        if fps != self.art.fps {
+            let before = self.art.clone();
+            self.art.fps = fps;
+            self.history.push(before);
+            self.status = format!("{fps} fps.");
+        }
+    }
+
+    pub fn toggle_loop(&mut self) {
+        self.loop_play = !self.loop_play;
+        self.status = if self.loop_play { "Loop on.".into() } else { "Loop off: play stops on the last frame.".into() };
+    }
+
+    pub fn toggle_wrap(&mut self) {
+        self.loop_wrap = !self.loop_wrap;
+        self.status = if self.loop_wrap { "Stepping wraps around the cut.".into() } else { "Stepping stops at the ends.".into() };
+    }
+
+    pub fn set_hold(&mut self, hold: u32) {
+        self.hold = hold.clamp(1, 3);
+        self.status = match self.hold {
+            1 => "On ones.".into(),
+            2 => "On twos.".into(),
+            _ => "On threes.".into(),
+        };
+    }
+
+    pub fn toggle_onion(&mut self) {
+        self.art.onion = !self.art.onion;
+        self.dirty = true;
+        self.status = if self.art.onion {
+            "Onion skin: three back in purple, three ahead in green.".into()
+        } else {
+            "Onion skin off.".into()
+        };
+    }
+
+    /// The animation folder the sheet works on: the selected one, the one
+    /// the selected cel is in, or the front one.
+    pub fn sheet_folder(&self) -> Option<String> {
+        if let Some(id) = self.selected.as_deref() {
+            if let Some(node) = find(&self.art.layers, id) {
+                if node.animation {
+                    return Some(id.to_string());
+                }
+            }
+            if let Some(owner) = anim::owning_animation(&self.art.layers, id) {
+                return Some(owner);
+            }
+        }
+        anim::animation_folder_ids(&self.art.layers).last().cloned()
+    }
+
+    /// Mark a folder as a timeline, or unmark it.
+    pub fn set_animation(&mut self, id: &str, on: bool) {
+        let before = self.art.clone();
+        if anim::set_animation(&mut self.art.layers, id, on) {
+            self.history.push(before);
+            self.dirty = true;
+            let name = find(&self.art.layers, id).map(|node| node.name.clone()).unwrap_or_default();
+            self.status = if on {
+                format!("{name} is a timeline. Its layers are its cels.")
+            } else {
+                format!("{name} is a folder again.")
+            };
+        }
+    }
+
+    /// Right-click a folder: Animation.
+    pub fn toggle_animation(&mut self, id: &str) {
+        let on = find(&self.art.layers, id).map(|node| !node.animation).unwrap_or(false);
+        self.set_animation(id, on);
+    }
+
+    /// Python's `mark_current_animation`: the selected folder becomes a
+    /// timeline, or stops being one.
+    pub fn animate_selected(&mut self) {
+        let Some(id) = self.selected.clone() else {
+            self.status = "Pick a folder to mark as an animation.".into();
+            return;
+        };
+        let is_group = find(&self.art.layers, &id).map(|node| !node.is_layer()).unwrap_or(false);
+        if is_group {
+            self.toggle_animation(&id);
+        } else {
+            self.status = "Pick a folder to mark as an animation.".into();
+        }
+    }
+
+    /// Where a new frame goes without a frame named: on ones, twos or threes
+    /// the drawing under the playhead keeps its hold and the new cel starts
+    /// after it, when it is the last drawing. Inside the cut it is Python's
+    /// rule: the new cel goes right after the playhead and later keys move up.
+    /// A lone layer about to become the first frame counts as keyed at 0.
+    fn new_cel_slot(&self, folder: &str) -> u32 {
+        let playhead = self.art.playhead;
+        let Some(node) = find(&self.art.layers, folder) else {
+            return playhead;
+        };
+        if node.is_layer() {
+            return playhead.max(self.hold);
+        }
+        let pairs = anim::frame_map(node);
+        let Some(current) = anim::cel_at(node, playhead) else {
+            return playhead;
+        };
+        let start = pairs.iter().find(|(_, cel)| cel.id == current.id).map(|(start, _)| *start).unwrap_or(playhead);
+        let is_last = pairs.last().map(|(_, cel)| cel.id == current.id).unwrap_or(true);
+        if is_last {
+            playhead.max(start.saturating_add(self.hold))
+        } else {
+            playhead
+        }
+    }
+
+    /// The stored cut end grows so a cel keyed at `start` holds `hold`
+    /// frames when nothing comes after it. It never shrinks.
+    fn hold_last_cel(&mut self, folder: &str, start: u32) {
+        let is_last = find(&self.art.layers, folder)
+            .map(|node| anim::frame_map(node).iter().all(|(frame, _)| *frame <= start))
+            .unwrap_or(false);
+        if !is_last {
+            return;
+        }
+        let end = start.saturating_add(self.hold.max(1)).saturating_sub(1);
+        let clip = self.art.clip_time.get_or_insert_with(ClipTime::default);
+        clip.end = clip.end.max(end);
+    }
+
+    /// Shift+F, Python's `new_animation_frame`: a new cel at the playhead, or
+    /// at `frame`, in `folder` or in the timeline the selection belongs to. A
+    /// selected plain layer is wrapped in an Animation folder as the first
+    /// frame, and a selected plain folder is marked. The playhead follows.
+    pub fn new_cel(&mut self, folder: Option<&str>, frame: Option<u32>) {
+        let target = folder.map(str::to_string).or_else(|| self.sheet_folder()).or_else(|| self.selected.clone());
+        let Some(target) = target else {
+            self.status = "Select a layer.".into();
+            return;
+        };
+        if self.gesture.is_some() {
+            self.cancel_gesture();
+        }
+        let before = self.art.clone();
+        let at = frame.unwrap_or_else(|| self.new_cel_slot(&target));
+        match anim::add_cel(&mut self.art, &target, at) {
+            Some(id) => {
+                self.history.push(before);
+                let owner = anim::owning_animation(&self.art.layers, &id).unwrap_or(target);
+                let start = find(&self.art.layers, &owner)
+                    .and_then(|node| anim::frame_map(node).into_iter().find(|(_, cel)| cel.id == id).map(|(start, _)| start))
+                    .unwrap_or(at);
+                self.hold_last_cel(&owner, start);
+                self.selected = Some(id);
+                self.art.playhead = start;
+                // Like Shift+F in the Python desk: the skin comes on so the
+                // drawing you just left shows through.
+                self.art.onion = true;
+                self.dirty = true;
+                self.status = format!("Frame {}. Onion skin on.", start + 1);
+            }
+            None => self.status = "Select a layer.".into(),
+        }
+    }
+
+    /// Drag a block: the cel starts on another frame.
+    pub fn move_cel(&mut self, folder: &str, cel: &str, start: u32) {
+        let before = self.art.clone();
+        let moved = find_mut(&mut self.art.layers, folder).map(|node| anim::move_frame(node, cel, start)).unwrap_or(false);
+        if moved {
+            self.history.push(before);
+            self.dirty = true;
+            self.status = format!("Cel moved to frame {}.", start + 1);
+        }
+    }
+
+    /// Remove a cel and its layer.
+    pub fn delete_cel(&mut self, folder: &str, cel: &str) {
+        let before = self.art.clone();
+        let removed = find_mut(&mut self.art.layers, folder)
+            .map(|node| {
+                let len = node.children.len();
+                node.children.retain(|child| child.id != cel);
+                if let Some(index) = node.timeline.iter().position(|id| id == cel) {
+                    node.timeline.remove(index);
+                    if index < node.frames.len() {
+                        node.frames.remove(index);
+                    }
+                }
+                node.children.len() != len
+            })
+            .unwrap_or(false);
+        if removed {
+            self.history.push(before);
+            self.sheet_pick = None;
+            self.after_history();
+            self.status = "Cel deleted.".into();
+        }
+    }
+
+    /// Select the cel a level shows at a frame, so the pen draws on it.
+    pub fn pick_cel(&mut self, folder: &str, frame: u32) {
+        let id = find(&self.art.layers, folder).and_then(|node| anim::cel_at(node, frame).map(|cel| cel.id.clone()));
+        match id {
+            Some(id) => self.selected = Some(id),
+            None => self.selected = Some(folder.to_string()),
+        }
+    }
+
+    pub fn pick_range(&mut self, folder: &str, start: u32, count: u32) {
+        self.sheet_pick = Some(SheetPick { folder: folder.to_string(), start, count: count.max(1) });
+    }
+
+    /// One exposure command on a picked range of one column.
+    pub fn sheet_command(&mut self, folder: &str, name: &str, start: u32, count: u32, arg: i64) {
+        let before = self.art.clone();
+        let changed = anim::folder_command(&mut self.art, folder, name, start as usize, count as usize, arg);
+        if changed {
+            self.history.push(before);
+            self.dirty = true;
+            self.status = format!("{name}: frames {}–{}.", start + 1, start + count.max(1));
+        } else {
+            self.status = format!("{name} left the sheet as it was.");
+        }
+    }
+}
+
 fn first_layer(nodes: &[Node]) -> Option<String> {
     for node in nodes {
         if node.is_layer() {
@@ -1351,8 +1763,23 @@ fn walk_layers(nodes: &[Node], depth: usize, out: &mut Vec<LayerRow>) {
             depth,
             group: !node.is_layer(),
             visible: node.visible,
+            animation: node.animation,
+            frame: None,
         });
-        walk_layers(&node.children, depth + 1, out);
+        if node.animation {
+            // Cels carry the frame they start on, from 1.
+            let starts: Vec<(String, u32)> =
+                anim::frame_map(node).into_iter().map(|(start, cel)| (cel.id.clone(), start)).collect();
+            let before = out.len();
+            walk_layers(&node.children, depth + 1, out);
+            for row in &mut out[before..] {
+                if row.depth == depth + 1 {
+                    row.frame = starts.iter().find(|(id, _)| *id == row.id).map(|(_, start)| start + 1);
+                }
+            }
+        } else {
+            walk_layers(&node.children, depth + 1, out);
+        }
     }
 }
 
@@ -1715,5 +2142,78 @@ mod tests {
         assert_eq!(desk.art.layers[0].pixels[1], 255);
         desk.undo();
         assert_eq!(desk.art.layers[0].pixels[1], 0);
+    }
+
+    #[test]
+    fn new_frames_land_after_the_hold_and_the_cut_grows_with_them() {
+        let mut desk = tiny();
+        let ink = desk.selected.clone().expect("the lone layer is selected");
+        assert_eq!(desk.cut_end(), 1);
+        assert!(desk.sheet_folder().is_none());
+
+        // Shift+F on a plain layer wraps it, like Python: the layer is frame 1.
+        // On twos it keeps frames 1–2 and the new cel takes 3–4.
+        desk.set_hold(2);
+        desk.new_cel(None, None);
+        let folder = desk.sheet_folder().expect("the wrap is the sheet's folder");
+        assert_eq!(anim::owning_animation(&desk.art.layers, &ink).as_deref(), Some(folder.as_str()));
+        assert_eq!(desk.playhead(), 2);
+        assert_eq!(desk.cut_end(), 4);
+        assert!(desk.art.onion, "a new frame turns the skin on");
+        let node = find(&desk.art.layers, &folder).unwrap();
+        assert_eq!(node.name, "Animation");
+        assert_eq!(node.frames, vec![0, 2]);
+        assert_eq!(node.timeline[0], ink);
+
+        // On threes from frame 3: the next starts at 6, the cut reaches 9.
+        desk.set_hold(3);
+        desk.new_cel(None, None);
+        assert_eq!(desk.playhead(), 5);
+        assert_eq!(desk.cut_end(), 8);
+        let node = find(&desk.art.layers, &folder).unwrap();
+        assert_eq!(node.frames, vec![0, 2, 5]);
+
+        // Inside the cut it is Python's rule: right after the playhead, and
+        // a later key moves only when it sat on that slot.
+        desk.set_playhead(0);
+        let first = find(&desk.art.layers, &folder).unwrap().timeline[0].clone();
+        assert_eq!(desk.selected.as_deref(), Some(first.as_str()), "the pen follows the playhead to the cel it shows");
+        desk.set_hold(1);
+        desk.new_cel(None, None);
+        let node = find(&desk.art.layers, &folder).unwrap();
+        assert_eq!(node.frames, vec![0, 1, 2, 5]);
+        assert_eq!(desk.playhead(), 1);
+        assert_eq!(desk.cut_end(), 8, "a frame inside the cut leaves the stored end alone");
+
+        // Stepping stops at the ends unless wrap is on.
+        desk.last_frame();
+        assert_eq!(desk.playhead(), 7);
+        desk.step_frame(1);
+        assert_eq!(desk.playhead(), 7);
+        desk.toggle_wrap();
+        desk.step_frame(1);
+        assert_eq!(desk.playhead(), 0);
+        desk.step_frame(-1);
+        assert_eq!(desk.playhead(), 7);
+
+        // Undo takes the whole last frame back, cut end and all.
+        desk.undo();
+        let node = find(&desk.art.layers, &folder).unwrap();
+        assert_eq!(node.frames, vec![0, 2, 5]);
+        assert_eq!(desk.cut_end(), 8);
+
+        // Playback at the cut's rate wraps when loop is on.
+        desk.set_playhead(7);
+        desk.toggle_play();
+        assert!(desk.playing);
+        assert!(desk.tick(1.0 / f64::from(desk.art.fps) + 0.001));
+        assert_eq!(desk.playhead(), 0);
+        desk.stop();
+
+        // An exposure command stores a sheet on the folder without moving a key.
+        desk.sheet_command(&folder, "reverse", 0, 3, 0);
+        let node = find(&desk.art.layers, &folder).unwrap();
+        assert!(node.exposure.is_some());
+        assert_eq!(node.frames, vec![0, 2, 5]);
     }
 }

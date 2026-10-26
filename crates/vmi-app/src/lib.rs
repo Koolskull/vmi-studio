@@ -8,6 +8,8 @@ pub mod icons;
 pub mod tablet;
 
 #[cfg(feature = "window")]
+mod sheet;
+#[cfg(feature = "window")]
 mod ui;
 
 #[cfg(feature = "window")]

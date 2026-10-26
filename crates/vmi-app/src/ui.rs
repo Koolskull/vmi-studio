@@ -2,13 +2,17 @@
 //! The grid is the toolbox. Color and size sit on that same panel.
 //! Left-click selects a tool. Right-click opens every setting for that tool.
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 
 use crate::desk::{Button, Desk, Display};
 use crate::fingers::{Fingers, Tap};
 use crate::gpu::{Frame, PictureFilter, PICTURE_FILTER};
 use crate::icons;
+use crate::sheet::{self, Act, SheetState};
 use crate::tablet;
+use vmi_core::palette::Palette;
 use vmi_core::{
     blend_label, palette_matching, parse_hex, CurveKind, Edge, Field, GrainKind, Section, Theme, Tip, Tool,
     ToolSettings, BLENDS, THEMES,
@@ -25,7 +29,8 @@ pub fn run() -> eframe::Result<()> {
         Box::new(|cc| {
             // Ctrl+= and Ctrl+- zoom the picture, never the widgets.
             cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
-            tablet::install();
+            install_fonts(&cc.egui_ctx);
+            tablet::install(cc);
             Ok(Box::new(StudioApp::new()))
         }),
     )
@@ -43,6 +48,18 @@ struct StudioApp {
     fingers: Fingers,
     /// A dial drag in progress: which dial, and the value where the drag began.
     dial_drag: Option<(Dial, f32)>,
+    /// The palette window is up.
+    palette_open: bool,
+    /// The folder the palette window lists. Aseprite's own, when it exists.
+    palette_folder: String,
+    /// A path typed into the palette window's load field.
+    palette_path: String,
+    /// Which view each area shows.
+    areas: Areas,
+    /// A sheet area on AUTO turns with the window instead of staying put.
+    sheet_auto: [bool; 4],
+    /// Pointer state on the sheets.
+    sheet_state: SheetState,
 }
 
 /// One rotary on the panel. Every value is 0..=1 on the dial.
@@ -147,10 +164,143 @@ enum Prompt {
     Export,
 }
 
+/// What an area shows. Four areas, like Blender: left, center, right, bottom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum View {
+    Picture,
+    Layers,
+    XSheet,
+    Film,
+    Objects,
+}
+
+impl View {
+    const ALL: [Self; 5] = [Self::Picture, Self::Layers, Self::XSheet, Self::Film, Self::Objects];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Picture => "PICTURE",
+            Self::Layers => "LAYERS",
+            Self::XSheet => "X-SHEET",
+            Self::Film => "FILM",
+            Self::Objects => "OBJECTS",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Picture => "picture",
+            Self::Layers => "layers",
+            Self::XSheet => "xsheet",
+            Self::Film => "film",
+            Self::Objects => "objects",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|view| view.id() == id)
+    }
+
+    fn is_sheet(self) -> bool {
+        matches!(self, Self::XSheet | Self::Film)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Area {
+    Left,
+    Center,
+    Right,
+    Bottom,
+}
+
+impl Area {
+    const ALL: [Self; 4] = [Self::Left, Self::Center, Self::Right, Self::Bottom];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Center => 1,
+            Self::Right => 2,
+            Self::Bottom => 3,
+        }
+    }
+}
+
+/// The view in each area. Defaults: layers, picture, X-sheet, film.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Areas {
+    left: View,
+    center: View,
+    right: View,
+    bottom: View,
+}
+
+impl Default for Areas {
+    fn default() -> Self {
+        Self { left: View::Layers, center: View::Picture, right: View::XSheet, bottom: View::Film }
+    }
+}
+
+impl Areas {
+    fn get(&self, area: Area) -> View {
+        match area {
+            Area::Left => self.left,
+            Area::Center => self.center,
+            Area::Right => self.right,
+            Area::Bottom => self.bottom,
+        }
+    }
+
+    fn slot(&mut self, area: Area) -> &mut View {
+        match area {
+            Area::Left => &mut self.left,
+            Area::Center => &mut self.center,
+            Area::Right => &mut self.right,
+            Area::Bottom => &mut self.bottom,
+        }
+    }
+
+    /// Show `view` in `area`. The area that had it takes this area's old
+    /// view, so every view is in one place and the picture is always live.
+    fn set(&mut self, area: Area, view: View) {
+        let old = self.get(area);
+        if old == view {
+            return;
+        }
+        if let Some(other) = Area::ALL.iter().copied().find(|other| self.get(*other) == view) {
+            *self.slot(other) = old;
+        }
+        *self.slot(area) = view;
+    }
+
+    fn from_ids(ids: &[String]) -> Self {
+        let mut areas = Self::default();
+        if ids.len() == 4 {
+            let parsed: Vec<Option<View>> = ids.iter().map(|id| View::from_id(id)).collect();
+            if let [Some(left), Some(center), Some(right), Some(bottom)] = parsed[..] {
+                let mut seen = vec![left, center, right, bottom];
+                seen.sort_by_key(|view| view.id());
+                seen.dedup();
+                if seen.len() == 4 && seen.contains(&View::Picture) {
+                    areas = Self { left, center, right, bottom };
+                }
+            }
+        }
+        areas
+    }
+
+    fn ids(&self) -> Vec<String> {
+        [self.left, self.center, self.right, self.bottom].iter().map(|view| view.id().to_string()).collect()
+    }
+}
+
 impl StudioApp {
     fn new() -> Self {
+        let desk = Desk::launch();
+        let areas = Areas::from_ids(&desk.session.areas);
         Self {
-            desk: Desk::launch(),
+            desk,
             texture: None,
             prompt: None,
             path_text: String::new(),
@@ -158,6 +308,12 @@ impl StudioApp {
             text_focused: false,
             fingers: Fingers::default(),
             dial_drag: None,
+            palette_open: false,
+            palette_folder: palette_folder().to_string_lossy().into_owned(),
+            palette_path: String::new(),
+            areas,
+            sheet_auto: [false; 4],
+            sheet_state: SheetState::default(),
         }
     }
 
@@ -183,8 +339,40 @@ impl StudioApp {
         let mut backspace = false;
         let mut zoom_in = false;
         let mut zoom_out = false;
+        let mut step: i64 = 0;
+        let mut first = false;
+        let mut last = false;
+        let mut onion = false;
+        let mut play = false;
+        let mut new_cel = false;
         let mut shortcut = String::new();
         ctx.input_mut(|input| {
+            // The sheet: comma back, period forward, W first, Shift+W last,
+            // O onion skin, Shift+Space play, Shift+F a new frame.
+            if !typing && input.consume_key(egui::Modifiers::SHIFT, egui::Key::F) {
+                new_cel = true;
+            }
+            if !typing {
+                if input.key_pressed(egui::Key::Comma) {
+                    step -= 1;
+                }
+                if input.key_pressed(egui::Key::Period) {
+                    step += 1;
+                }
+                if input.key_pressed(egui::Key::W) && !input.modifiers.command {
+                    if input.modifiers.shift {
+                        last = true;
+                    } else {
+                        first = true;
+                    }
+                }
+                if input.key_pressed(egui::Key::O) && !input.modifiers.command && !input.modifiers.shift {
+                    onion = true;
+                }
+                if input.modifiers.shift && input.key_pressed(egui::Key::Space) {
+                    play = true;
+                }
+            }
             if input.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) {
                 redo = true;
             } else if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z) {
@@ -282,6 +470,24 @@ impl StudioApp {
         if !shortcut.is_empty() {
             self.desk.shortcut(&shortcut);
         }
+        if step != 0 {
+            self.desk.step_frame(step);
+        }
+        if first {
+            self.desk.first_frame();
+        }
+        if last {
+            self.desk.last_frame();
+        }
+        if onion {
+            self.desk.toggle_onion();
+        }
+        if play {
+            self.desk.toggle_play();
+        }
+        if new_cel {
+            self.desk.new_cel(None, None);
+        }
     }
 
     fn tool_settings(&mut self, ui: &mut egui::Ui, tool: Tool) {
@@ -317,8 +523,10 @@ impl StudioApp {
         let mut visible = node.visible;
         let mut mute = node.mute;
         let mut solo = node.solo;
+        let is_group = !node.is_layer();
+        let animation0 = node.animation;
         let before = (name.clone(), opacity, blend.clone(), clip, visible, mute, solo);
-        ui.label("Layer");
+        ui.label(if is_group { "Folder" } else { "Layer" });
         self.watch_text(ui.text_edit_singleline(&mut name));
         ui.add(egui::Slider::new(&mut opacity, 0..=255).text("Opacity"));
         egui::ComboBox::from_label("Blend")
@@ -332,6 +540,18 @@ impl StudioApp {
         ui.checkbox(&mut visible, "Visible");
         ui.checkbox(&mut mute, "Mute");
         ui.checkbox(&mut solo, "Solo");
+        if is_group {
+            let mut animation = animation0;
+            if ui
+                .checkbox(&mut animation, "Animation")
+                .on_hover_text("This folder is one sequence. Its layers are its cels, on the sheet.")
+                .changed()
+            {
+                let id = id.to_string();
+                self.desk.set_animation(&id, animation);
+                return;
+            }
+        }
         let now = (name.clone(), opacity, blend.clone(), clip, visible, mute, solo);
         if now != before {
             let opacity = opacity.clamp(0, 255) as u8;
@@ -525,6 +745,7 @@ impl StudioApp {
                 self.desk.close_object_window();
             }
         }
+        self.palette_window(ctx);
         if let Some(prompt) = self.prompt {
             let title = match prompt {
                 Prompt::Open => "Open",
@@ -563,62 +784,120 @@ impl StudioApp {
         }
     }
 
-    fn palette(&mut self, ui: &mut egui::Ui) {
+    /// The palette window. Tabs are the preset sets and then your own. A
+    /// swatch click picks that color. Files come and go in Aseprite's formats.
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        if !self.palette_open {
+            return;
+        }
         let theme = self.desk.theme();
-        ui.spacing_mut().item_spacing = egui::vec2(2.0, 3.0);
-        ui.horizontal(|ui| {
-            if small_cell(ui, theme, 22.0, false, |painter, rect, ink| paint_bitmap(painter, rect, &icons::UNDO, ink))
-                .on_hover_text("Undo    Ctrl+Z    two-finger tap")
-                .clicked()
-            {
-                self.desk.undo();
-            }
-            if small_cell(ui, theme, 22.0, false, |painter, rect, ink| paint_bitmap(painter, rect, &icons::REDO, ink))
-                .on_hover_text("Redo    Ctrl+Shift+Z    three-finger tap")
-                .clicked()
-            {
-                self.desk.redo();
-            }
-            let tool = self.desk.tool();
-            if small_cell(ui, theme, 22.0, self.desk.tool_window == Some(tool), |painter, rect, ink| {
-                paint_bitmap(painter, rect, &icons::GEAR, ink)
-            })
-            .on_hover_text("Every setting for this tool. Right-click a cell does the same.")
-            .clicked()
-            {
-                self.desk.palette_click(tool, true);
-            }
-            let name = if tool.shortcut().is_empty() {
-                tool.name().to_string()
-            } else {
-                format!("{} {}", tool.name(), tool.shortcut())
-            };
-            ui.label(egui::RichText::new(name).small().color(rgb(theme.soft)));
-        });
-        self.color_box(ui, theme);
-        self.dials(ui, theme);
-        self.toggles(ui, theme);
-        ui.add_space(2.0);
-        egui::ScrollArea::vertical().id_salt("tool-grid").show(ui, |ui| {
-            self.tool_grid(ui, theme);
-        });
+        let mut open = true;
+        egui::Window::new("Palette")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(272.0)
+            .show(ctx, |ui| self.palette_body(ui, theme));
+        if !open {
+            self.palette_open = false;
+        }
     }
 
-    fn color_box(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let active = self.desk.tool();
-        let color_tool = if active.fields().contains(&Field::Color) { active } else { Tool::Pen };
-        let mut color = self.desk.preset_of(color_tool).color;
-        let before = color;
-        ui.horizontal(|ui| {
-            ui.color_edit_button_srgb(&mut color).on_hover_text(if color_tool == active {
-                "Color"
-            } else {
-                "Pen color. This tool has none of its own."
-            });
-            let mut hex = vmi_core::hex_of(color);
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut hex).desired_width(56.0).font(egui::TextStyle::Small),
+    fn palette_body(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let presets = vmi_core::palette::presets();
+        let user_count = self.desk.session.palettes.len();
+        let total = presets.len() + user_count;
+        let mut tab = self.desk.session.palette_tab.min(total.saturating_sub(1));
+        let tab_before = tab;
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
+        // Tabs. The open one is white; the rest wait in the quiet color.
+        ui.horizontal_wrapped(|ui| {
+            for (index, name) in presets
+                .iter()
+                .map(|palette| palette.name.clone())
+                .chain(self.desk.session.palettes.iter().map(|palette| palette.name.clone()))
+                .enumerate()
+            {
+                if tab_label(ui, theme, &name, index == tab).clicked() {
+                    tab = index;
+                }
+            }
+            if tab_label(ui, theme, "+", false).on_hover_text("A new palette of your own.").clicked() {
+                let name = unique_palette_name(&self.desk.session.palettes, "Palette");
+                self.desk.session.palettes.push(Palette::new(name, Vec::new()));
+                tab = presets.len() + self.desk.session.palettes.len() - 1;
+            }
+        });
+        if tab != tab_before {
+            self.desk.session.palette_tab = tab;
+            self.desk.touch_session();
+        }
+        let user_index = tab.checked_sub(presets.len());
+        let palette = match user_index {
+            Some(index) => self.desk.session.palettes.get(index).cloned(),
+            None => presets.get(tab).cloned(),
+        };
+        let Some(palette) = palette else {
+            return;
+        };
+        let color_tool = color_tool_for(self.desk.tool());
+        let current = self.desk.preset_of(color_tool).color;
+        ui.add_space(2.0);
+        // The swatches. Fourteen pixels, one apart, as many across as fit.
+        let mut picked: Option<[u8; 3]> = None;
+        let mut remove: Option<usize> = None;
+        let cell = 14.0;
+        let step = cell + 1.0;
+        let across = ((ui.available_width() + 1.0) / step).floor().max(1.0) as usize;
+        let rows = palette.colors.len().div_ceil(across).max(1);
+        let (grid, _) = ui.allocate_exact_size(egui::vec2(across as f32 * step - 1.0, rows as f32 * step - 1.0), egui::Sense::hover());
+        for (index, swatch) in palette.colors.iter().enumerate() {
+            let col = (index % across) as f32;
+            let row = (index / across) as f32;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(grid.min.x + col * step, grid.min.y + row * step),
+                egui::vec2(cell, cell),
             );
+            let response = ui.interact(rect, ui.id().with(("swatch", tab, index)), egui::Sense::click());
+            ui.painter().rect_filled(rect, 0.0, rgb(*swatch));
+            if *swatch == current {
+                ui.painter().rect_stroke(rect.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, rgb(theme.ink)));
+                ui.painter().rect_stroke(rect.shrink(1.5), 0.0, egui::Stroke::new(1.0_f32, rgb(theme.field)));
+            }
+            if response.clicked() {
+                picked = Some(*swatch);
+            }
+            if response.secondary_clicked() && user_index.is_some() {
+                remove = Some(index);
+            }
+            let hint = if user_index.is_some() {
+                format!("{}  {}\nRight-click removes it.", vmi_core::hex_of(*swatch), index)
+            } else {
+                format!("{}  {}", vmi_core::hex_of(*swatch), index)
+            };
+            response.on_hover_text(hint);
+        }
+        if palette.colors.is_empty() {
+            ui.label(egui::RichText::new("Empty. + color adds the current color.").color(rgb(theme.soft)).small());
+        }
+        if let Some(color) = picked {
+            self.pick_color(color);
+        }
+        if let (Some(index), Some(at)) = (user_index, remove) {
+            if let Some(user) = self.desk.session.palettes.get_mut(index) {
+                if at < user.colors.len() {
+                    user.colors.remove(at);
+                    self.desk.touch_session();
+                }
+            }
+        }
+        ui.add_space(4.0);
+        // The current color, as hex, and the recent ones.
+        ui.horizontal(|ui| {
+            let mut color = current;
+            ui.spacing_mut().interact_size = egui::vec2(22.0, 18.0);
+            ui.color_edit_button_srgb(&mut color);
+            let mut hex = vmi_core::hex_of(color);
+            let response = ui.add(egui::TextEdit::singleline(&mut hex).desired_width(64.0).font(egui::TextStyle::Monospace));
             if response.has_focus() {
                 self.text_focused = true;
             }
@@ -627,28 +906,258 @@ impl StudioApp {
                     color = parsed;
                 }
             }
-        });
-        let ink = rgb(theme.ink);
-        let cell = 13.0;
-        for row in SWATCHES.chunks(8) {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(1.0, 1.0);
-                for swatch in row {
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(cell, cell), egui::Sense::click());
-                    ui.painter().rect_filled(rect, 0.0, rgb(*swatch));
-                    if color == *swatch {
-                        ui.painter().rect_stroke(rect.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, ink));
-                    }
-                    if response.clicked() {
-                        color = *swatch;
-                    }
-                    response.on_hover_text(vmi_core::hex_of(*swatch));
+            if color != current {
+                self.pick_color(color);
+            }
+            ui.label(egui::RichText::new("recent").color(rgb(theme.soft)).small());
+            let recent: Vec<[u8; 3]> = self.desk.session.recent_colors.iter().copied().take(12).collect();
+            let mut pick = None;
+            ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+            for (index, swatch) in recent.iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(cell, cell), egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, rgb(*swatch));
+                if response.on_hover_text(vmi_core::hex_of(*swatch)).clicked() {
+                    pick = Some((index, *swatch));
                 }
+            }
+            if let Some((_, color)) = pick {
+                self.pick_color(color);
+            }
+        });
+        ui.add_space(4.0);
+        // What this palette can do.
+        ui.horizontal_wrapped(|ui| {
+            match user_index {
+                Some(index) => {
+                    if ui.small_button("+ color").on_hover_text("Add the current color to this palette.").clicked() {
+                        if let Some(user) = self.desk.session.palettes.get_mut(index) {
+                            if !user.colors.contains(&current) {
+                                user.colors.push(current);
+                                self.desk.touch_session();
+                            }
+                        }
+                    }
+                    if ui.small_button("Save .gpl").on_hover_text("Write it into the folder below. Aseprite reads it.").clicked() {
+                        let path = Path::new(&self.palette_folder).join(format!("{}.gpl", file_stem_for(&palette.name)));
+                        match vmi_core::palette::save_file(&palette, &path) {
+                            Ok(()) => self.desk.status = format!("Saved {}", path.display()),
+                            Err(err) => self.desk.status = err,
+                        }
+                    }
+                    if ui.small_button("Delete").on_hover_text("Remove this palette. Files stay.").clicked() {
+                        if index < self.desk.session.palettes.len() {
+                            self.desk.session.palettes.remove(index);
+                            self.desk.session.palette_tab = tab.saturating_sub(1);
+                            self.desk.touch_session();
+                        }
+                    }
+                    let mut name = palette.name.clone();
+                    let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(96.0));
+                    if response.has_focus() {
+                        self.text_focused = true;
+                    }
+                    if response.changed() {
+                        if let Some(user) = self.desk.session.palettes.get_mut(index) {
+                            user.name = name;
+                            self.desk.touch_session();
+                        }
+                    }
+                }
+                None => {
+                    if ui.small_button("Copy to mine").on_hover_text("A copy you can edit and save.").clicked() {
+                        let name = unique_palette_name(&self.desk.session.palettes, &palette.name);
+                        self.desk.session.palettes.push(Palette::new(name, palette.colors.clone()));
+                        self.desk.session.palette_tab = presets.len() + self.desk.session.palettes.len() - 1;
+                        self.desk.touch_session();
+                    }
+                    ui.label(egui::RichText::new(format!("{} colors", palette.colors.len())).color(rgb(theme.soft)).small());
+                }
+            }
+        });
+        ui.separator();
+        // Files. Aseprite's palette folder when there is one.
+        ui.label(egui::RichText::new("Folder").color(rgb(theme.soft)).small());
+        let folder_edit = ui.add(egui::TextEdit::singleline(&mut self.palette_folder).desired_width(f32::INFINITY));
+        if folder_edit.has_focus() {
+            self.text_focused = true;
+        }
+        let files = palette_files(Path::new(&self.palette_folder));
+        if files.is_empty() {
+            ui.label(egui::RichText::new("No palette files here yet. Save .gpl writes one.").color(rgb(theme.soft)).small());
+        }
+        let mut load: Option<PathBuf> = None;
+        egui::ScrollArea::vertical().id_salt("palette-files").max_height(96.0).show(ui, |ui| {
+            for file in &files {
+                let name = file.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                let known = self.desk.session.palettes.iter().any(|palette| palette.name == stem_of(file));
+                if tab_label(ui, theme, &name, known).on_hover_text("Open as a palette of your own.").clicked() {
+                    load = Some(file.clone());
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Path").color(rgb(theme.soft)).small());
+            let response = ui.add(egui::TextEdit::singleline(&mut self.palette_path).desired_width(160.0));
+            if response.has_focus() {
+                self.text_focused = true;
+            }
+            if ui.small_button("Load").clicked() && !self.palette_path.trim().is_empty() {
+                load = Some(PathBuf::from(self.palette_path.trim()));
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!("Reads {}.", vmi_core::palette::EXTENSIONS.join(" ")))
+                .color(rgb(theme.soft))
+                .small(),
+        );
+        if let Some(path) = load {
+            self.load_palette(&path, presets.len());
+        }
+    }
+
+    /// Open a palette file as one of your own. A same-named one is replaced.
+    fn load_palette(&mut self, path: &Path, preset_count: usize) {
+        match vmi_core::palette::load_file(path) {
+            Ok(mut palette) => {
+                if palette.name.trim().is_empty() {
+                    palette.name = stem_of(path);
+                }
+                let count = palette.colors.len();
+                let slot = self.desk.session.palettes.iter().position(|item| item.name == palette.name);
+                let index = match slot {
+                    Some(index) => {
+                        self.desk.session.palettes[index] = palette;
+                        index
+                    }
+                    None => {
+                        self.desk.session.palettes.push(palette);
+                        self.desk.session.palettes.len() - 1
+                    }
+                };
+                self.desk.session.palette_tab = preset_count + index;
+                self.desk.touch_session();
+                self.desk.status = format!("{count} colors from {}", path.display());
+            }
+            Err(err) => self.desk.status = err,
+        }
+    }
+
+    /// The tool panel. Two tool cells across is the widest row on it; every
+    /// other row wraps to that same width, so nothing to the right is wasted.
+    fn palette(&mut self, ui: &mut egui::Ui) {
+        let theme = self.desk.theme();
+        ui.set_max_width(PANEL_INNER);
+        ui.spacing_mut().item_spacing = egui::vec2(1.0, 3.0);
+        self.head_row(ui, theme);
+        self.color_row(ui, theme);
+        self.dials(ui, theme);
+        self.toggles(ui, theme);
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical().id_salt("tool-grid").show(ui, |ui| {
+            self.tool_grid(ui, theme);
+        });
+    }
+
+    /// Undo, redo, and the settings gear: three cells that together are as
+    /// wide as the tool grid.
+    fn head_row(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let side = (PANEL_INNER - 2.0) / 3.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+            if small_cell(ui, theme, side, false, |painter, rect, ink| paint_bitmap(painter, rect, &icons::UNDO, ink))
+                .on_hover_text("Undo    Ctrl+Z    two-finger tap")
+                .clicked()
+            {
+                self.desk.undo();
+            }
+            if small_cell(ui, theme, side, false, |painter, rect, ink| paint_bitmap(painter, rect, &icons::REDO, ink))
+                .on_hover_text("Redo    Ctrl+Shift+Z    three-finger tap")
+                .clicked()
+            {
+                self.desk.redo();
+            }
+            let tool = self.desk.tool();
+            if small_cell(ui, theme, side, self.desk.tool_window == Some(tool), |painter, rect, ink| {
+                paint_bitmap(painter, rect, &icons::GEAR, ink)
+            })
+            .on_hover_text(format!("{}: every setting. Right-click a cell does the same.", tool.name()))
+            .clicked()
+            {
+                self.desk.palette_click(tool, true);
+            }
+        });
+    }
+
+    /// The color cell and the palette cell. Click the color for the picker,
+    /// right-click it for the palette window. The palette cell shows the
+    /// first colors of the current palette and opens that window.
+    fn color_row(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let active = self.desk.tool();
+        let color_tool = color_tool_for(active);
+        let mut color = self.desk.preset_of(color_tool).color;
+        let before = color;
+        let height = 22.0;
+        let half = (PANEL_INNER - CELL_GAP) / 2.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(CELL_GAP, 0.0);
+            ui.spacing_mut().interact_size = egui::vec2(half, height);
+            let response = ui.color_edit_button_srgb(&mut color).on_hover_text(if color_tool == active {
+                format!("Color {}\nClick: picker. Right-click: palette window.", vmi_core::hex_of(color))
+            } else {
+                format!("Pen color {}. This tool has none of its own.", vmi_core::hex_of(color))
             });
-        }
+            if response.secondary_clicked() {
+                self.palette_open = !self.palette_open;
+            }
+            let swatches: Vec<[u8; 3]> = self.current_palette().colors.iter().copied().take(18).collect();
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(half, height), egui::Sense::click());
+            let lit = self.palette_open;
+            let fill = if lit {
+                rgb(theme.ink)
+            } else if response.hovered() {
+                rgb(theme.frame)
+            } else {
+                rgb(theme.row)
+            };
+            let painter = ui.painter().with_clip_rect(rect);
+            painter.rect_filled(rect, 0.0, fill);
+            painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, rgb(theme.frame)));
+            // Six by three, five pixels each, centered: the palette in miniature.
+            let px = 5.0;
+            let origin = egui::pos2((rect.center().x - 3.0 * px).round(), (rect.center().y - 1.5 * px).round());
+            for (index, swatch) in swatches.iter().enumerate() {
+                let col = (index % 6) as f32;
+                let row = (index / 6) as f32;
+                let min = egui::pos2(origin.x + col * px, origin.y + row * px);
+                painter.rect_filled(egui::Rect::from_min_size(min, egui::vec2(px, px)), 0.0, rgb(*swatch));
+            }
+            if response.on_hover_text("Palettes: presets, your own, and Aseprite files.").clicked() {
+                self.palette_open = !self.palette_open;
+            }
+        });
         if color != before {
-            self.desk.edit_preset(color_tool, |slot| slot.color = color);
+            self.pick_color(color);
         }
+    }
+
+    /// The palette the window has open.
+    fn current_palette(&self) -> Palette {
+        let presets = vmi_core::palette::presets();
+        let tab = self.desk.session.palette_tab;
+        if tab < presets.len() {
+            presets[tab].clone()
+        } else if let Some(palette) = self.desk.session.palettes.get(tab - presets.len()) {
+            palette.clone()
+        } else {
+            presets[0].clone()
+        }
+    }
+
+    /// Set the color of the tool that owns one, and remember it.
+    fn pick_color(&mut self, color: [u8; 3]) {
+        let tool = color_tool_for(self.desk.tool());
+        self.desk.edit_preset(tool, |slot| slot.color = color);
+        self.desk.session.note_recent_color(color);
     }
 
     /// The rotaries. 7 o'clock is 0, the long way around to 5 o'clock is 1.
@@ -662,45 +1171,51 @@ impl StudioApp {
         let mut settings = self.desk.preset_of(tool).clone();
         let before = settings.clone();
         let defaults = ToolSettings::default_for(tool);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
-            for dial in shown {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click_and_drag());
-                    let value = dial.get(&settings);
-                    paint_dial(ui.painter(), rect, value, &dial.digits(&settings), theme, value > 0.0);
-                    if response.drag_started() {
-                        self.dial_drag = Some((dial, value));
-                    }
-                    if response.dragged() {
-                        if let Some((which, start)) = self.dial_drag {
-                            if which == dial {
-                                // Up raises. The whole sweep is `travel` pixels.
-                                let delta = response.interact_pointer_pos().map(|pos| pos.y).unwrap_or(0.0);
-                                let origin = ui.input(|input| input.pointer.press_origin()).map(|pos| pos.y).unwrap_or(delta);
-                                dial.set(&mut settings, start + (origin - delta) / dial.travel());
+        // Three dials fill the panel width: 3 × 22 and two 4 px gaps is 74.
+        for row in shown.chunks(3) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                for dial in row.iter().copied() {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click_and_drag());
+                        let value = dial.get(&settings);
+                        paint_dial(ui.painter(), rect, value, &dial.digits(&settings), theme, value > 0.0);
+                        if response.drag_started() {
+                            self.dial_drag = Some((dial, value));
+                        }
+                        if response.dragged() {
+                            if let Some((which, start)) = self.dial_drag {
+                                if which == dial {
+                                    // Up raises. The whole sweep is `travel` pixels.
+                                    let delta = response.interact_pointer_pos().map(|pos| pos.y).unwrap_or(0.0);
+                                    let origin =
+                                        ui.input(|input| input.pointer.press_origin()).map(|pos| pos.y).unwrap_or(delta);
+                                    dial.set(&mut settings, start + (origin - delta) / dial.travel());
+                                }
                             }
                         }
-                    }
-                    if response.drag_stopped() {
-                        self.dial_drag = None;
-                    }
-                    if response.double_clicked() {
-                        dial.set(&mut settings, dial.get(&defaults));
-                    }
-                    let scroll = if response.hovered() { ui.input(|input| input.raw_scroll_delta.y) } else { 0.0 };
-                    if scroll != 0.0 {
-                        dial.set(&mut settings, value + scroll / (dial.travel() * 2.0));
-                    }
-                    response.on_hover_text(dial.hint());
-                    let label = egui::RichText::new(dial.label()).color(rgb(theme.soft)).font(egui::FontId::monospace(8.0));
-                    ui.allocate_ui(egui::vec2(22.0, 10.0), |ui| {
-                        ui.centered_and_justified(|ui| ui.label(label));
+                        if response.drag_stopped() {
+                            self.dial_drag = None;
+                        }
+                        if response.double_clicked() {
+                            dial.set(&mut settings, dial.get(&defaults));
+                        }
+                        let scroll = if response.hovered() { ui.input(|input| input.raw_scroll_delta.y) } else { 0.0 };
+                        if scroll != 0.0 {
+                            dial.set(&mut settings, value + scroll / (dial.travel() * 2.0));
+                        }
+                        response.on_hover_text(dial.hint());
+                        let label =
+                            egui::RichText::new(dial.label()).color(rgb(theme.soft)).font(egui::FontId::monospace(8.0));
+                        ui.allocate_ui(egui::vec2(22.0, 10.0), |ui| {
+                            ui.centered_and_justified(|ui| ui.label(label));
+                        });
                     });
-                });
-            }
-        });
+                }
+            });
+        }
         if settings != before {
             self.desk.edit_preset(tool, |slot| *slot = settings);
         }
@@ -712,34 +1227,47 @@ impl StudioApp {
         let fields = tool.fields();
         let mut settings = self.desk.preset_of(tool).clone();
         let before = settings.clone();
+        // Five tips across: 5 × 14 and four 1 px gaps is 74. Three edges or
+        // three chunks across: 3 × 24 and two gaps.
+        let five = egui::vec2((PANEL_INNER - 4.0) / 5.0, 16.0);
+        let three = egui::vec2((PANEL_INNER - 2.0) / 3.0, 16.0);
         if fields.contains(&Field::Tip) {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
                 for tip in Tip::all() {
                     let letter = &tip.label()[..1];
-                    if letter_cell(ui, theme, letter, settings.tip == tip).on_hover_text(format!("{}\n{}", tip.label(), tip.usage())).clicked() {
+                    if letter_cell(ui, theme, five, letter, settings.tip == tip)
+                        .on_hover_text(format!("{}\n{}", tip.label(), tip.usage()))
+                        .clicked()
+                    {
                         settings.tip = tip;
                     }
                 }
             });
         }
-        if fields.contains(&Field::Edge) || fields.contains(&Field::Chunk) {
+        if fields.contains(&Field::Edge) {
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                if fields.contains(&Field::Edge) {
-                    for edge in Edge::all() {
-                        let letter = &edge.label()[..1];
-                        if letter_cell(ui, theme, letter, settings.edge == edge).on_hover_text(format!("Edge: {}", edge.label())).clicked() {
-                            settings.edge = edge;
-                        }
+                ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+                for edge in Edge::all() {
+                    let letter = &edge.label()[..1];
+                    if letter_cell(ui, theme, three, letter, settings.edge == edge)
+                        .on_hover_text(format!("Edge: {}", edge.label()))
+                        .clicked()
+                    {
+                        settings.edge = edge;
                     }
                 }
-                if fields.contains(&Field::Chunk) {
-                    ui.add_space(4.0);
-                    for chunk in [1u32, 2, 4] {
-                        if letter_cell(ui, theme, &chunk.to_string(), settings.chunk == chunk).on_hover_text(format!("Chunk {chunk}")).clicked() {
-                            settings.chunk = chunk;
-                        }
+            });
+        }
+        if fields.contains(&Field::Chunk) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
+                for chunk in [1u32, 2, 4] {
+                    if letter_cell(ui, theme, three, &chunk.to_string(), settings.chunk == chunk)
+                        .on_hover_text(format!("Chunk {chunk}: dither cells {chunk} px square"))
+                        .clicked()
+                    {
+                        settings.chunk = chunk;
                     }
                 }
             });
@@ -763,9 +1291,8 @@ impl StudioApp {
             }
             // Two across, like the Clip Studio tool palette. A cell is 36 px
             // and its icon is 32 px, two picture pixels per icon pixel.
-            let gap = 2.0;
-            let side = 36.0;
-            let cell = egui::vec2(side, side);
+            let gap = CELL_GAP;
+            let cell = egui::vec2(CELL_SIDE, CELL_SIDE);
             ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
             for pair in rows.chunks(2) {
                 ui.horizontal(|ui| {
@@ -797,28 +1324,47 @@ impl StudioApp {
         ui.label(egui::RichText::new("Front is on top. Right-click a row for its settings.").color(rgb(theme.soft)).small());
         let rows = self.desk.layer_rows();
         let selected = self.desk.selected.clone();
-        for row in rows {
-            ui.horizontal(|ui| {
-                ui.add_space(row.depth as f32 * 12.0);
-                let mut visible = row.visible;
-                if ui.checkbox(&mut visible, "").changed() {
-                    self.desk.update_layer(&row.id, |node| node.visible = visible);
-                }
-                let active = selected.as_deref() == Some(row.id.as_str());
-                let prefix = if row.group { "▸ " } else { "" };
-                let fill = if active { rgb(theme.ink) } else { rgb(theme.row) };
-                let text = if active { rgb(theme.field) } else { rgb(theme.ink) };
-                let response = ui.add_sized(
-                    [ui.available_width(), 24.0],
-                    egui::Button::new(egui::RichText::new(format!("{prefix}{}", row.name)).color(text)).fill(fill),
-                );
-                if response.clicked() {
-                    self.desk.select_layer(row.id.clone());
-                }
-                if response.secondary_clicked() {
-                    self.desk.open_layer_window(row.id.clone());
-                }
-            });
+        let mut toggle_animation: Option<String> = None;
+        egui::ScrollArea::vertical().id_salt("layer-rows").auto_shrink([false, false]).show(ui, |ui| {
+            for row in rows {
+                ui.horizontal(|ui| {
+                    ui.add_space(row.depth as f32 * 12.0);
+                    let mut visible = row.visible;
+                    if ui.checkbox(&mut visible, "").changed() {
+                        self.desk.update_layer(&row.id, |node| node.visible = visible);
+                    }
+                    if row.group {
+                        // A, like M, S, and C on the Python rows: this folder is a sequence.
+                        if letter_cell(ui, theme, egui::vec2(16.0, 16.0), "A", row.animation)
+                            .on_hover_text("Animation: this folder is one sequence. Its layers are its cels.")
+                            .clicked()
+                        {
+                            toggle_animation = Some(row.id.clone());
+                        }
+                    }
+                    let active = selected.as_deref() == Some(row.id.as_str());
+                    let prefix = if row.group { "▸ " } else { "" };
+                    let suffix = match row.frame {
+                        Some(frame) => format!("  f{frame}"),
+                        None => String::new(),
+                    };
+                    let fill = if active { rgb(theme.ink) } else { rgb(theme.row) };
+                    let text = if active { rgb(theme.field) } else { rgb(theme.ink) };
+                    let response = ui.add_sized(
+                        [ui.available_width(), 24.0],
+                        egui::Button::new(egui::RichText::new(format!("{prefix}{}{suffix}", row.name)).color(text)).fill(fill),
+                    );
+                    if response.clicked() {
+                        self.desk.select_layer(row.id.clone());
+                    }
+                    if response.secondary_clicked() {
+                        self.desk.open_layer_window(row.id.clone());
+                    }
+                });
+            }
+        });
+        if let Some(id) = toggle_animation {
+            self.desk.toggle_animation(&id);
         }
     }
 
@@ -868,6 +1414,155 @@ impl StudioApp {
         }
         if let Some((from, to)) = reorder {
             self.desk.reorder_object(from, to);
+        }
+    }
+
+    /// The strip at the top of an area: its name opens the list of views.
+    /// A sheet area carries the transport too.
+    fn area_header(&mut self, ui: &mut egui::Ui, area: Area) {
+        let theme = self.desk.theme();
+        let view = self.areas.get(area);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(3.0, 2.0);
+            let title = egui::RichText::new(view.label()).monospace().small().color(rgb(theme.ink));
+            ui.menu_button(title, |ui| {
+                for candidate in View::ALL {
+                    if ui.selectable_label(candidate == view, candidate.label()).clicked() {
+                        self.areas.set(area, candidate);
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("What this area shows.");
+            if view.is_sheet() {
+                self.transport(ui, area, theme);
+            }
+        });
+    }
+
+    /// Back, Play, Forward, Loop, Onion, in that order like the Python bar,
+    /// then the cut's numbers.
+    fn transport(&mut self, ui: &mut egui::Ui, area: Area, theme: &Theme) {
+        let cell = egui::vec2(18.0, 16.0);
+        let word = egui::vec2(34.0, 16.0);
+        if letter_cell(ui, theme, cell, "<", false).on_hover_text("Back one frame    ,    (W: first frame)").clicked() {
+            self.desk.step_frame(-1);
+        }
+        let playing = self.desk.playing;
+        if letter_cell(ui, theme, word, if playing { "STOP" } else { "PLAY" }, playing)
+            .on_hover_text("Play the cut at its frame rate    Shift+Space")
+            .clicked()
+        {
+            self.desk.toggle_play();
+        }
+        if letter_cell(ui, theme, cell, ">", false).on_hover_text("Forward one frame    .    (Shift+W: last frame)").clicked() {
+            self.desk.step_frame(1);
+        }
+        if letter_cell(ui, theme, word, "LOOP", self.desk.loop_play)
+            .on_hover_text("Play returns to the first frame. Off stops on the last.")
+            .clicked()
+        {
+            self.desk.toggle_loop();
+        }
+        if letter_cell(ui, theme, word, "SKIN", self.desk.art.onion)
+            .on_hover_text("Onion skin: three back in purple, three ahead in green    O")
+            .clicked()
+        {
+            self.desk.toggle_onion();
+        }
+        let counter = format!("{:03}/{:03}", self.desk.playhead() + 1, self.desk.cut_end());
+        ui.label(egui::RichText::new(counter).monospace().small().color(rgb(theme.ink)));
+        let mut fps = self.desk.art.fps.clamp(1, 60);
+        let response = ui.add(egui::DragValue::new(&mut fps).range(1..=60).speed(0.1).prefix("FPS "));
+        if response.changed() {
+            self.desk.set_fps(fps);
+        }
+        for hold in [1u32, 2, 3] {
+            let name = match hold {
+                1 => "ones",
+                2 => "twos",
+                _ => "threes",
+            };
+            if letter_cell(ui, theme, cell, &hold.to_string(), self.desk.hold == hold)
+                .on_hover_text(format!("On {name}: a new frame holds {hold}."))
+                .clicked()
+            {
+                self.desk.set_hold(hold);
+            }
+        }
+        if letter_cell(ui, theme, word, "+CEL", false)
+            .on_hover_text("New frame after this drawing, on the hold picked here    Shift+F")
+            .clicked()
+        {
+            self.desk.new_cel(None, None);
+        }
+        if letter_cell(ui, theme, word, "WRAP", self.desk.loop_wrap)
+            .on_hover_text("Stepping past the end wraps. Separate from LOOP.")
+            .clicked()
+        {
+            self.desk.toggle_wrap();
+        }
+        let index = area.index();
+        let mode = self.sheet_mode(area);
+        let shown = if self.sheet_auto[index] { "AUTO" } else { mode.label() };
+        if letter_cell(ui, theme, egui::vec2(52.0, 16.0), shown, false)
+            .on_hover_text("AUTO, FILM, X-SHEET. Auto shows the sheet in a wide window, the film in a tall one.")
+            .clicked()
+        {
+            // AUTO -> FILM -> X-SHEET -> AUTO.
+            if self.sheet_auto[index] {
+                self.sheet_auto[index] = false;
+                self.areas.set(area, View::Film);
+            } else if self.areas.get(area) == View::Film {
+                self.areas.set(area, View::XSheet);
+            } else {
+                self.sheet_auto[index] = true;
+            }
+        }
+    }
+
+    /// The orientation a sheet area draws.
+    fn sheet_mode(&self, area: Area) -> sheet::Mode {
+        if self.sheet_auto[area.index()] {
+            sheet::Mode::Auto
+        } else if self.areas.get(area) == View::Film {
+            sheet::Mode::Film
+        } else {
+            sheet::Mode::XSheet
+        }
+    }
+
+    fn area_body(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, area: Area) {
+        match self.areas.get(area) {
+            View::Picture => {
+                self.picture_bar(ui);
+                self.picture(ui, ctx);
+            }
+            View::Layers => self.layers(ui),
+            View::Objects => self.objects(ui),
+            View::XSheet | View::Film => {
+                let mode = self.sheet_mode(area);
+                let theme = self.desk.theme();
+                let acts = sheet::show(ui, &self.desk, &mut self.sheet_state, mode, theme);
+                for act in acts {
+                    self.apply(act);
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, act: Act) {
+        match act {
+            Act::SetFrame(frame) => self.desk.set_playhead(frame),
+            Act::Pick { folder, frame } => self.desk.pick_cel(&folder, frame),
+            Act::Range { folder, start, count } => self.desk.pick_range(&folder, start, count),
+            Act::MoveCel { folder, cel, start } => self.desk.move_cel(&folder, &cel, start),
+            Act::NewCel { folder, frame } => self.desk.new_cel(Some(&folder), Some(frame)),
+            Act::DeleteCel { folder, cel } => self.desk.delete_cel(&folder, &cel),
+            Act::Command { folder, name, start, count, arg } => self.desk.sheet_command(&folder, name, start, count, arg),
+            Act::NewFrame => self.desk.new_cel(None, None),
+            Act::AnimateSelected => self.desk.animate_selected(),
         }
     }
 
@@ -1067,24 +1762,106 @@ impl StudioApp {
     }
 }
 
-const SWATCHES: [[u8; 3]; 16] = [
-    [0, 0, 0],
-    [255, 255, 255],
-    [0x44, 0x44, 0x44],
-    [0x88, 0x88, 0x88],
-    [0xCC, 0xCC, 0xCC],
-    [0xE0, 0x20, 0x20],
-    [0xFF, 0x8A, 0x00],
-    [0xFF, 0xE1, 0x00],
-    [0x22, 0xC5, 0x5A],
-    [0x14, 0xB8, 0xC4],
-    [0x3B, 0x6C, 0xFF],
-    [0x8A, 0x3F, 0xF5],
-    [0xFF, 0x3E, 0xB8],
-    [0xF4, 0xA4, 0xC0],
-    [0x8B, 0x45, 0x13],
-    [0x00, 0x3A, 0x70],
-];
+/// A tool cell is 36 px; two across with a 2 px gap is 74. That is the panel.
+const CELL_SIDE: f32 = 36.0;
+const CELL_GAP: f32 = 2.0;
+const PANEL_INNER: f32 = CELL_SIDE * 2.0 + CELL_GAP;
+/// The panel's own margin on each side.
+const PANEL_MARGIN: f32 = 4.0;
+
+/// A name that acts as a tab. The chosen one is white; the rest are quiet.
+fn tab_label(ui: &mut egui::Ui, theme: &Theme, text: &str, chosen: bool) -> egui::Response {
+    let color = if chosen { rgb(theme.ink) } else { rgb(theme.soft) };
+    let label = egui::Label::new(egui::RichText::new(text).monospace().color(color)).sense(egui::Sense::click());
+    let response = ui.add(label);
+    if chosen {
+        let rect = response.rect;
+        let y = rect.bottom() + 1.0;
+        ui.painter().line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0_f32, rgb(theme.ink)));
+    } else if response.hovered() {
+        ui.painter().rect_filled(response.rect.expand(1.0), 0.0, rgb(theme.frame));
+        ui.painter().text(response.rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(ui.text_style_height(&egui::TextStyle::Monospace) * 0.75), rgb(theme.ink));
+    }
+    response
+}
+
+fn unique_palette_name(palettes: &[Palette], base: &str) -> String {
+    if !palettes.iter().any(|palette| palette.name.eq_ignore_ascii_case(base)) {
+        return base.to_string();
+    }
+    let mut number = 2;
+    loop {
+        let candidate = format!("{base} {number}");
+        if !palettes.iter().any(|palette| palette.name.eq_ignore_ascii_case(&candidate)) {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+/// A file name for a palette name: letters, digits, dash, underscore.
+fn file_stem_for(name: &str) -> String {
+    let stem: String = name
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    if stem.is_empty() {
+        "palette".into()
+    } else {
+        stem
+    }
+}
+
+fn stem_of(path: &Path) -> String {
+    path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Aseprite's palette folder when it exists, else the desk's own.
+fn palette_folder() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut candidates = vec![home.join(".config").join("aseprite").join("palettes")];
+    candidates.push(home.join("Library").join("Application Support").join("Aseprite").join("palettes"));
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        candidates.push(PathBuf::from(appdata).join("Aseprite").join("palettes"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir())
+        .unwrap_or_else(|| home.join(".cache").join("vmi-studio").join("palettes"))
+}
+
+/// Palette files in a folder, by name.
+fn palette_files(folder: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .map(|ext| vmi_core::palette::EXTENSIONS.contains(&ext.to_string_lossy().to_ascii_lowercase().as_str()))
+                    .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// The tool whose color the color cell edits: this one, or the pen.
+fn color_tool_for(active: Tool) -> Tool {
+    if active.fields().contains(&Field::Color) {
+        active
+    } else {
+        Tool::Pen
+    }
+}
 
 fn tool_cell(ui: &mut egui::Ui, tool: Tool, cell: egui::Vec2, theme: &Theme, active: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(cell, egui::Sense::click());
@@ -1139,7 +1916,18 @@ fn small_cell(
     lit: bool,
     draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    sized_cell(ui, theme, egui::vec2(side, side), lit, draw)
+}
+
+/// A cell of any size with a painted mark. Lit cells invert.
+fn sized_cell(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    size: egui::Vec2,
+    lit: bool,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let fill = if lit {
         rgb(theme.ink)
     } else if response.hovered() {
@@ -1155,9 +1943,9 @@ fn small_cell(
     response
 }
 
-fn letter_cell(ui: &mut egui::Ui, theme: &Theme, letter: &str, lit: bool) -> egui::Response {
+fn letter_cell(ui: &mut egui::Ui, theme: &Theme, size: egui::Vec2, letter: &str, lit: bool) -> egui::Response {
     let text = letter.to_string();
-    small_cell(ui, theme, 18.0, lit, move |painter, rect, ink| {
+    sized_cell(ui, theme, size, lit, move |painter, rect, ink| {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(10.0), ink);
     })
 }
@@ -1402,7 +2190,58 @@ fn apply_theme(ctx: &egui::Context, theme: &Theme) {
     visuals.selection.bg_fill = rgb(theme.frame);
     visuals.selection.stroke = stroke;
     visuals.window_stroke = egui::Stroke::new(1.0_f32, rgb(theme.frame));
+    // K-OS chrome: square corners, no shadows, no hover swell.
+    visuals.window_rounding = 0.0.into();
+    visuals.menu_rounding = 0.0.into();
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow::NONE;
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.rounding = 0.0.into();
+        widget.expansion = 0.0;
+    }
     ctx.set_visuals(visuals);
+}
+
+/// The house face when the font cache has it, else one mono face for all
+/// the chrome. The Python app unpacks faces into `~/.cache/vmi-studio/fonts`.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mono = fonts.families.get(&egui::FontFamily::Monospace).cloned().unwrap_or_default();
+    match house_font() {
+        Some((name, bytes)) => {
+            fonts.font_data.insert(name.clone(), egui::FontData::from_owned(bytes));
+            let mut stack = vec![name];
+            stack.extend(mono);
+            fonts.families.insert(egui::FontFamily::Monospace, stack.clone());
+            fonts.families.insert(egui::FontFamily::Proportional, stack);
+        }
+        None => {
+            fonts.families.insert(egui::FontFamily::Proportional, mono);
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// courier-pixel first, then sometype-mono, from the shared font cache.
+fn house_font() -> Option<(String, Vec<u8>)> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)?;
+    let folder = home.join(".cache").join("vmi-studio").join("fonts");
+    let entries: Vec<PathBuf> = std::fs::read_dir(folder).ok()?.flatten().map(|entry| entry.path()).collect();
+    let face = |wanted: &[&str]| {
+        entries.iter().find(|path| {
+            let name = path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            (name.ends_with(".ttf") || name.ends_with(".otf")) && wanted.iter().all(|part| name.contains(part))
+        })
+    };
+    let path = face(&["courier", "pixel"]).or_else(|| face(&["sometype"]))?;
+    let bytes = std::fs::read(path).ok()?;
+    Some((stem_of(path), bytes))
 }
 
 impl eframe::App for StudioApp {
@@ -1411,29 +2250,12 @@ impl eframe::App for StudioApp {
         self.keys(ctx);
         self.text_focused = false;
         self.windows(ctx);
+        // Playback: frames fall due on the cut's clock.
+        let dt = ctx.input(|input| f64::from(input.stable_dt));
+        if self.desk.tick(dt) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(self.desk.next_frame_in().max(0.001)));
+        }
         let layers_default = self.desk.session.layers_width;
-        let brush_default = self.desk.session.brush_width;
-        let layers = egui::SidePanel::left("layers")
-            .resizable(true)
-            .default_width(layers_default)
-            .width_range(180.0..=480.0)
-            .show(ctx, |ui| {
-                ui.heading("Layers");
-                self.layers(ui);
-            });
-        let brushes = egui::SidePanel::left("brushes")
-            .resizable(true)
-            .default_width(brush_default.clamp(112.0, 150.0))
-            .width_range(112.0..=150.0)
-            .show(ctx, |ui| self.palette(ui));
-        egui::SidePanel::right("objects")
-            .resizable(true)
-            .default_width(220.0)
-            .width_range(160.0..=420.0)
-            .show(ctx, |ui| {
-                ui.heading("Objects");
-                self.objects(ui);
-            });
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -1465,6 +2287,34 @@ impl eframe::App for StudioApp {
                         self.desk.redo();
                     }
                 });
+                ui.menu_button("Layer", |ui| {
+                    if ui.button("Layer").clicked() {
+                        self.desk.add_layer();
+                    }
+                    if ui.button("Group").clicked() {
+                        self.desk.add_group();
+                    }
+                    ui.separator();
+                    let selected = self.desk.selected.clone();
+                    let folder = selected.as_deref().and_then(|id| vmi_core::find(&self.desk.art.layers, id)).filter(|node| !node.is_layer());
+                    let is_animation = folder.map(|node| node.animation).unwrap_or(false);
+                    let has_folder = folder.is_some();
+                    if ui.add_enabled(has_folder, egui::Button::new(if is_animation { "Animation folder    ✓" } else { "Animation folder" }))
+                        .on_hover_text("The selected folder is one sequence. Its layers are its cels.")
+                        .clicked()
+                    {
+                        if let Some(id) = selected.clone() {
+                            self.desk.toggle_animation(&id);
+                        }
+                    }
+                    if ui
+                        .button("New frame    Shift+F")
+                        .on_hover_text("An empty cel after this drawing; a lone layer becomes frame 1 first. The skin comes on.")
+                        .clicked()
+                    {
+                        self.desk.new_cel(None, None);
+                    }
+                });
                 ui.menu_button("Theme", |ui| {
                     for theme in THEMES {
                         if ui.button(theme.name).clicked() {
@@ -1473,11 +2323,31 @@ impl eframe::App for StudioApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
-                    if ui.button("Fit").clicked() {
+                    if ui.button("Fit    Ctrl+0").clicked() {
                         self.desk.fit(self.desk.last_frame);
                     }
-                    if ui.button("Actual size").clicked() {
+                    if ui.button("Actual size    Ctrl+1").clicked() {
                         self.desk.actual();
+                    }
+                    ui.separator();
+                    let onion = self.desk.art.onion;
+                    if ui.button(if onion { "Onion skin    O  ✓" } else { "Onion skin    O" }).clicked() {
+                        self.desk.toggle_onion();
+                    }
+                    if ui.button(if self.palette_open { "Palette    ✓" } else { "Palette" }).clicked() {
+                        self.palette_open = !self.palette_open;
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Areas").small().color(rgb(self.desk.theme().soft)));
+                    for (area, name) in [(Area::Left, "Left"), (Area::Right, "Right"), (Area::Bottom, "Bottom"), (Area::Center, "Center")] {
+                        ui.menu_button(format!("{name}: {}", self.areas.get(area).label()), |ui| {
+                            for candidate in View::ALL {
+                                if ui.selectable_label(self.areas.get(area) == candidate, candidate.label()).clicked() {
+                                    self.areas.set(area, candidate);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                     }
                 });
             });
@@ -1489,15 +2359,79 @@ impl eframe::App for StudioApp {
                 ui.label(self.desk.status.as_str());
             });
         });
+        let left = egui::SidePanel::left("layers")
+            .resizable(true)
+            .default_width(layers_default)
+            .width_range(180.0..=480.0)
+            .show(ctx, |ui| {
+                self.area_header(ui, Area::Left);
+                self.area_body(ui, ctx, Area::Left);
+            });
+        // Exactly two tool cells plus the margins. Not a pixel to the right.
+        let panel_frame = egui::Frame::side_top_panel(&ctx.style())
+            .inner_margin(egui::Margin::symmetric(PANEL_MARGIN, PANEL_MARGIN))
+            .rounding(0.0);
+        let brushes = egui::SidePanel::left("brushes")
+            .resizable(false)
+            .frame(panel_frame)
+            .exact_width(PANEL_INNER + PANEL_MARGIN * 2.0)
+            .show(ctx, |ui| self.palette(ui));
+        let right = egui::SidePanel::right("right-area")
+            .resizable(true)
+            .default_width(self.desk.session.right_width)
+            .width_range(120.0..=720.0)
+            .show(ctx, |ui| {
+                self.area_header(ui, Area::Right);
+                self.area_body(ui, ctx, Area::Right);
+            });
+        // The sheet sits under the picture, between the side panes.
+        let bottom = egui::TopBottomPanel::bottom("bottom-area")
+            .resizable(true)
+            .default_height(self.desk.session.bottom_height)
+            .height_range(48.0..=520.0)
+            .show(ctx, |ui| {
+                self.area_header(ui, Area::Bottom);
+                self.area_body(ui, ctx, Area::Bottom);
+            });
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.picture_bar(ui);
-            self.picture(ui, ctx);
+            if self.areas.center != View::Picture {
+                self.area_header(ui, Area::Center);
+            }
+            self.area_body(ui, ctx, Area::Center);
         });
-        self.desk.note_widths(layers.response.rect.width(), brushes.response.rect.width());
+        self.desk.note_widths(left.response.rect.width(), brushes.response.rect.width());
+        self.desk.note_areas(right.response.rect.width(), bottom.response.rect.height(), &self.areas.ids());
         self.desk.flush_session();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.desk.flush_session();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_view_lives_in_one_area_and_the_picture_never_leaves() {
+        let mut areas = Areas::default();
+        assert_eq!(areas.ids(), ["layers", "picture", "xsheet", "film"]);
+        // Objects on the right: the X-sheet steps aside into the hidden slot.
+        areas.set(Area::Right, View::Objects);
+        assert_eq!(areas.right, View::Objects);
+        assert_eq!(areas.center, View::Picture);
+        // The picture on the left swaps with the layers.
+        areas.set(Area::Left, View::Picture);
+        assert_eq!(areas.left, View::Picture);
+        assert_eq!(areas.center, View::Layers);
+        // A bad or old session falls back to the defaults.
+        assert_eq!(Areas::from_ids(&[]), Areas::default());
+        assert_eq!(Areas::from_ids(&["layers".into(), "layers".into(), "film".into(), "xsheet".into()]), Areas::default());
+        let kept = Areas::from_ids(&areas.ids());
+        assert_eq!(kept, areas);
+        assert_eq!(color_tool_for(Tool::Pen), Tool::Pen);
+        assert_eq!(file_stem_for("DB 32 / mine"), "DB-32---mine");
+        assert_eq!(unique_palette_name(&[Palette::new("Mine", vec![])], "Mine"), "Mine 2");
     }
 }

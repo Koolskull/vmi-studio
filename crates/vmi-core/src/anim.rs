@@ -38,13 +38,16 @@ use crate::doc::{find, find_mut, fresh_name, Art, Node, NodeKind};
 
 /// Default playback rate, the same as `csptime.py`.
 pub const DEFAULT_FPS: u32 = 24;
-/// Onion skin tone for past cels, `onion.PAST`.
-pub const PAST: [u8; 3] = [176, 64, 255];
-/// Onion skin tone for future cels, `onion.FUTURE`.
-pub const FUTURE: [u8; 3] = [40, 210, 90];
-/// Onion skin opacity by distance from the playhead, `onion._STRENGTH`.
-pub const STRENGTH: [f32; 3] = [0.55, 0.34, 0.20];
-/// Neighbour cels each way, `onion._LIMIT`.
+/// Onion skin tone for past cels. KoolDraw's purple.
+pub const PAST: [u8; 3] = [180, 80, 255];
+/// Onion skin tone for future cels. KoolDraw's green.
+pub const FUTURE: [u8; 3] = [60, 220, 120];
+/// Onion skin opacity by distance from the playhead: KoolDraw's 0.7, 0.4, 0.18.
+pub const STRENGTH: [f32; 3] = [0.7, 0.4, 0.18];
+/// How far a neighbour's own colour is pulled toward its tone. KoolDraw's
+/// 0.88 leaves a little of the drawing's colour in the skin.
+pub const ONION_TINT: f32 = 0.88;
+/// Neighbour cels each way: three back, three ahead.
 pub const ONION_LIMIT: u8 = 3;
 /// The last drawing id an exposure sheet can issue, `exposure.FRAME_MAX`.
 pub const FRAME_MAX: u32 = 0xFFF;
@@ -1416,9 +1419,9 @@ mod tests {
         let (past, future, _) = onion_neighbors(&long, 4, 1, 0);
         assert_eq!(names(&past), ["3"]);
         assert!(future.is_empty());
-        assert_eq!(onion_strength(0), 0.55);
-        assert_eq!(onion_strength(2), 0.20);
-        assert_eq!(onion_strength(9), 0.20);
+        assert_eq!(onion_strength(0), 0.7);
+        assert_eq!(onion_strength(2), 0.18);
+        assert_eq!(onion_strength(9), 0.18);
     }
 
     #[test]

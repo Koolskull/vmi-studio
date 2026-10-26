@@ -22,7 +22,7 @@ pub use anim::{
     folder_command, frame_map, key_of, move_cel, move_frame, neighbors, next_frame_slot, onion_neighbors, owning_animation,
     project_slots, run_command, set_animation, set_playhead, sheet_from_slots, step_frame, timeline_cels,
     unspecified_cels, write_frames, xsheet_columns, xsheet_command, Cel, ExposureSheet, SheetOnion, XColumn,
-    DEFAULT_FPS, FUTURE, ONION_LIMIT, PAST, STRENGTH,
+    DEFAULT_FPS, FUTURE, ONION_LIMIT, ONION_TINT, PAST, STRENGTH,
 };
 pub use blend::{blend_label, BLENDS};
 pub use bridge::load_manifest;

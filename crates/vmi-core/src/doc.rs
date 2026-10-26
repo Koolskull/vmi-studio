@@ -9,7 +9,8 @@
 //! when `Art::onion` is on, `present_plain` never does.
 
 use crate::anim::{
-    animation_folder_ids, cel_at, onion_neighbors, onion_strength, ExposureSheet, DEFAULT_FPS, FUTURE, ONION_LIMIT, PAST,
+    animation_folder_ids, cel_at, onion_neighbors, onion_strength, ExposureSheet, DEFAULT_FPS, FUTURE, ONION_LIMIT,
+    ONION_TINT, PAST,
 };
 use crate::blend::{mix, mix_hsl};
 use crate::color::Rgba;
@@ -552,11 +553,12 @@ fn blit_layer(node: &mut Node, target: Target<'_>, width: u32, height: u32) {
     }
 }
 
-/// The alpha of one cel composited on its own, scaled by its opacity, over
-/// the target rectangle. Python's `composite_image(width, height, [cel])`:
-/// not gated, so the cel paints as it is.
-fn cel_alpha(art: &mut Art, id: &str, w: u32, h: u32, ox: i32, oy: i32) -> Vec<f32> {
-    let mut alpha = vec![0f32; (w as usize) * (h as usize)];
+/// One cel composited on its own over the target rectangle, as straight
+/// RGBA floats with the alpha scaled by its opacity. Python's
+/// `composite_image(width, height, [cel])`: not gated, so the cel paints as
+/// it is.
+fn cel_plate(art: &mut Art, id: &str, w: u32, h: u32, ox: i32, oy: i32) -> Vec<f32> {
+    let mut out = vec![0f32; (w as usize) * (h as usize) * 4];
     let ctx = Ctx {
         width: art.width,
         height: art.height,
@@ -567,23 +569,27 @@ fn cel_alpha(art: &mut Art, id: &str, w: u32, h: u32, ox: i32, oy: i32) -> Vec<f
         solo: false,
     };
     let Some(node) = find_mut(&mut art.layers, id) else {
-        return alpha;
+        return out;
     };
-    let mut plate = vec![0u8; (w as usize) * (h as usize) * 4];
+    let mut plate = vec![0u8; out.len()];
     appearance(node, Target { buf: &mut plate, w, h, ox, oy }, &ctx);
     let opacity = f32::from(node.opacity) / 255.0;
-    for (index, value) in alpha.iter_mut().enumerate() {
-        *value = f32::from(plate[index * 4 + 3]) * opacity;
+    for (index, value) in out.iter_mut().enumerate() {
+        *value = f32::from(plate[index]);
+        if index % 4 == 3 {
+            *value *= opacity;
+        }
     }
-    alpha
+    out
 }
 
-/// Onion skin, `onion.apply_onion`. For each animation folder the neighbour
-/// cels are tinted (future green under past purple, nearest on top, opacity by
-/// distance) and shown over the picture wherever the current cel is clear.
-/// Python keeps the picture's alpha, so over clear paper the tint vanished
-/// behind the checker; here it is composited source-over, which is the same
-/// colour wherever the picture is opaque and stays visible over clear paper.
+/// Onion skin the way KoolDraw does it. For each animation folder the
+/// neighbour cels are tinted (future green under past purple, nearest on top,
+/// opacity by distance, each pulled `ONION_TINT` of the way to its tone) and
+/// shown over the picture wherever the current cel is clear. Python kept the
+/// picture's alpha, so over clear paper the tint vanished behind the checker;
+/// here it is composited source-over, which is the same colour wherever the
+/// picture is opaque and stays visible over clear paper.
 fn apply_onion(art: &mut Art, roots: &[String], target: Target<'_>) {
     let Target { buf: dst, w, h, ox, oy } = target;
     let past_limit = usize::from(art.onion_past.min(ONION_LIMIT));
@@ -616,9 +622,9 @@ fn apply_onion(art: &mut Art, roots: &[String], target: Target<'_>) {
         }
         let mut canvas = vec![0f32; pixels * 4];
         for (id, tone, strength) in rows {
-            let alpha = cel_alpha(art, &id, w, h, ox, oy);
-            for (index, cover) in alpha.iter().enumerate() {
-                let top_a = cover * strength / 255.0;
+            let plate = cel_plate(art, &id, w, h, ox, oy);
+            for index in 0..pixels {
+                let top_a = plate[index * 4 + 3] * strength / 255.0;
                 if top_a <= 0.0 {
                     continue;
                 }
@@ -626,14 +632,15 @@ fn apply_onion(art: &mut Art, roots: &[String], target: Target<'_>) {
                 let base_a = base[3] / 255.0;
                 let out_a = top_a + base_a * (1.0 - top_a);
                 for channel in 0..3 {
-                    let mixed = f32::from(tone[channel]) * top_a + base[channel] * base_a * (1.0 - top_a);
+                    let toned = plate[index * 4 + channel] * (1.0 - ONION_TINT) + f32::from(tone[channel]) * ONION_TINT;
+                    let mixed = toned * top_a + base[channel] * base_a * (1.0 - top_a);
                     base[channel] = if out_a > 1e-6 { mixed / out_a } else { 0.0 };
                 }
                 base[3] = out_a * 255.0;
             }
         }
-        let cover = match current {
-            Some(id) => cel_alpha(art, &id, w, h, ox, oy),
+        let cover: Vec<f32> = match current {
+            Some(id) => cel_plate(art, &id, w, h, ox, oy).chunks_exact(4).map(|px| px[3]).collect(),
             None => vec![0f32; pixels],
         };
         for index in 0..pixels {

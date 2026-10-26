@@ -30,6 +30,23 @@ pub struct Session {
     /// Colors picked lately, most recent first. At most `RECENT_COLORS`.
     #[serde(default)]
     pub recent_colors: Vec<[u8; 3]>,
+    /// The right area's width.
+    #[serde(default = "default_right_width")]
+    pub right_width: f32,
+    /// The bottom area's height.
+    #[serde(default = "default_bottom_height")]
+    pub bottom_height: f32,
+    /// The view in each area: left, center, right, bottom. Empty means the defaults.
+    #[serde(default)]
+    pub areas: Vec<String>,
+}
+
+fn default_right_width() -> f32 {
+    236.0
+}
+
+fn default_bottom_height() -> f32 {
+    132.0
 }
 
 impl Default for Session {
@@ -45,6 +62,9 @@ impl Default for Session {
             palettes: Vec::new(),
             palette_tab: 0,
             recent_colors: Vec::new(),
+            right_width: default_right_width(),
+            bottom_height: default_bottom_height(),
+            areas: Vec::new(),
         }
     }
 }

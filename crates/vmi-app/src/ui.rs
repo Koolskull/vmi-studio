@@ -944,12 +944,12 @@ impl StudioApp {
                             Err(err) => self.desk.status = err,
                         }
                     }
-                    if ui.small_button("Delete").on_hover_text("Remove this palette. Files stay.").clicked() {
-                        if index < self.desk.session.palettes.len() {
-                            self.desk.session.palettes.remove(index);
-                            self.desk.session.palette_tab = tab.saturating_sub(1);
-                            self.desk.touch_session();
-                        }
+                    if ui.small_button("Delete").on_hover_text("Remove this palette. Files stay.").clicked()
+                        && index < self.desk.session.palettes.len()
+                    {
+                        self.desk.session.palettes.remove(index);
+                        self.desk.session.palette_tab = tab.saturating_sub(1);
+                        self.desk.touch_session();
                     }
                     let mut name = palette.name.clone();
                     let response = ui.add(egui::TextEdit::singleline(&mut name).desired_width(96.0));

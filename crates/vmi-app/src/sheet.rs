@@ -312,10 +312,8 @@ fn xsheet(
                 let frame = ((pos.y - ruler.min.y) / CELL_H).floor().max(0.0) as u32;
                 acts.push(Act::SetFrame(frame.min(rows - 1)));
             }
-            if ruler_response.drag_stopped() || (!ruler_response.dragged() && !ruler_response.clicked()) {
-                if !ui.input(|input| input.pointer.primary_down()) {
-                    state.drag = None;
-                }
+            if !ui.input(|input| input.pointer.primary_down()) {
+                state.drag = None;
             }
         }
         // Cells.

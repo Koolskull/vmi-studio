@@ -212,6 +212,24 @@ It prints `VMI STUDIO 0.03`. A drawing dropped on the icon, or chosen with Open 
 
 An optional font catalog can live in `~/Documents/work/Github/bgcardbuilder`, or in the directory named by `BGCARDBUILDER`. Without it, the header font list is the system monospace. That is the default face either way.
 
+## The Rust desk
+
+`crates/` holds the remake: `vmi-core` (the document, the blueprint, the animation model, palettes), `vmi-paint` (the brushes), and `vmi-app` (the window). The binary is still `vmi-studio`, the cache is still `~/.cache/vmi-studio`, and it reads and writes the same `.vmib` version 1.
+
+```bash
+cargo run -p vmi-app --release
+```
+
+The window is black, square-cornered, and set in Courier Pixel when `~/.cache/vmi-studio/fonts` holds it, else Sometype Mono, else the system monospace. Four areas sit like Blender's: left, center, right, bottom. Each one shows Picture, Layers, X-Sheet, Film, or Objects, from the menu in its corner or from View → Areas. The defaults are Layers, Picture, the vertical X-sheet, and the film strip. Exactly one area is the live picture; choosing a view that is already open swaps the two. The brush panel between Layers and the picture is 74 px wide: two 36 px columns of tools, and every dial and toggle row wraps to that width. Right-click the colour cell for the palette window.
+
+The sheet is KoolDraw's timeline, drawn two ways. Down the X-sheet, time runs down and every level is a column, the front level at the left and the back level last. Along the film, levels are lanes and frames run right. Time is stable: a column or lane never moves when the playhead does. A key cell prints the cel's number, a held frame is one dotted cell (dashes in the film), a rest is `---`, and a red needle lies on the exact frame. The mode cell at the end of the transport cycles AUTO, FILM, X-SHEET; AUTO shows the sheet in a wide window and the film in a tall one. Click a cell to show that frame and select its cel. Shift-click or drag to pick a range, then right-click for the exposure commands: Reverse, Swing, Step, Each, Reset Step, Increase Step, Decrease Step, Autoexpose, Reframe, Repeat, Insert, Clear, Cut. Drag a key to move it. Drag the frame numbers to scrub.
+
+The transport is Back, Play, Forward, Loop, Skin, then the counter, FPS, the hold cells 1 2 3 (ones, twos, threes), +CEL, WRAP, and the mode cell. Comma steps back, period forward, W is the first frame and Shift+W the last, Shift+Space plays, O toggles the onion skin, Shift+F is a new frame. A new frame lands after the drawing under the playhead on the hold you picked, and the cut grows so the last cel holds the same. A lone layer becomes frame 1 of a new Animation folder first, the way the Python desk does it. Moving the playhead selects the cel it shows, so the pen draws on what you see. LOOP returns playback to the first frame; WRAP lets stepping go round the ends and is separate. The onion skin is KoolDraw's: three back in purple, three ahead in green, 0.7, 0.4, 0.18 by distance, each cel's own colour pulled 0.88 of the way to its tone. It is a view and never reaches the file.
+
+The palette window has a tab per palette: the presets (Kool Skull, DB32, DB16, Sweetie 16, PICO-8, Endesga 32, Game Boy, Game Boy Pocket, NES, Commodore 64, CGA, ZX Spectrum, Apple II, Greys) and your own, with `+` for a new one. It lists the files in Aseprite's palette folder when there is one (`~/.config/aseprite/palettes`, `~/Library/Application Support/Aseprite/palettes`, `%APPDATA%\Aseprite\palettes`), else `~/.cache/vmi-studio/palettes`, and loads `.gpl`, `.hex`, `.pal`, `.txt`, `.act`, `.ase`, `.aseprite`, and `.png`. Save writes `.gpl`, which Aseprite reads back. Recent colours sit under the hex field.
+
+Pen pressure is the tablet's, never the pen's speed. On an X11 session, which is Zorin's default, and under XWayland, a second X connection reads the XInput2 `Abs Pressure` valuator of whichever device spoke last. On a native Wayland session the desk binds `zwp_tablet_v2` on winit's display; compositors that stop emulating a pointer for a bound pen get the seat back, which keeps the pen drawing at full pressure until the window reads tablet-v2 itself. Windows pens arrive as touch force through winit. On macOS an AppKit event monitor reads tablet-point pressure, and the Huion and XP-Pen drivers' fractional mouse pressure counts as a pen. A mouse clears the pen and presses at 1. The desk prints one `tablet:` line on start that says which listener it found.
+
 ## What 0.03 does not do
 
 The app does not write `.clip`, `.psd`, `.kra`, or `.blend`. It does not upload to 2kool.tv. GIMP files that are not 8-bit stay as names without pixels. Photoshop placed layers and smart objects are not read. The earlier `v1.0.0` download does not include the timeline, warp drawing, image-material previews, or this header. A build from this source is 0.03. The files on the v0.01 release are the last packaged builds.

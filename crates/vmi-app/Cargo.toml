@@ -19,3 +19,8 @@ required-features = ["window"]
 eframe = { version = "0.29", optional = true }
 vmi-core = { path = "../vmi-core" }
 vmi-paint = { path = "../vmi-paint" }
+
+# Tablet pressure on macOS comes straight from AppKit. Same versions winit uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2", features = ["NSEvent", "block2"] }
+block2 = "0.5"

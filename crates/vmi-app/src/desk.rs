@@ -735,10 +735,10 @@ impl Desk {
         self.camera.rotation += delta;
     }
 
-    pub fn set_speed_pressure(&mut self, on: bool) {
-        if self.session.speed_pressure != on {
-            self.session.speed_pressure = on;
-            self.session_dirty = true;
+    /// Drop the stroke in progress and put the layer back. Nothing else changes.
+    pub fn escape_stroke(&mut self) {
+        if self.gesture.is_some() {
+            self.cancel_gesture();
         }
     }
 

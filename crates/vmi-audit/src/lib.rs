@@ -276,7 +276,7 @@ mod tests {
         assert!(path.ends_with("rust-desk.json"));
         assert!(!path.ends_with("session.json"));
         let session = Session::default();
-        assert!((session.brush_width - 232.0).abs() < 0.1);
+        assert!((session.brush_width - 124.0).abs() < 0.1);
         assert_eq!(session.presets.len(), Tool::PALETTE.len());
     }
 

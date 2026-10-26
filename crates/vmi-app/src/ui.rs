@@ -5,8 +5,10 @@
 use eframe::egui;
 
 use crate::desk::{Button, Desk, Display};
+use crate::fingers::{Fingers, Tap};
 use crate::gpu::{Frame, PictureFilter, PICTURE_FILTER};
 use crate::icons;
+use crate::tablet;
 use vmi_core::{
     blend_label, palette_matching, parse_hex, CurveKind, Edge, Field, GrainKind, Section, Theme, Tip, Tool,
     ToolSettings, BLENDS, THEMES,
@@ -23,6 +25,7 @@ pub fn run() -> eframe::Result<()> {
         Box::new(|cc| {
             // Ctrl+= and Ctrl+- zoom the picture, never the widgets.
             cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+            tablet::install();
             Ok(Box::new(StudioApp::new()))
         }),
     )
@@ -36,10 +39,105 @@ struct StudioApp {
     rotate_from: Option<egui::Pos2>,
     /// A text field had focus last frame. Letter shortcuts stay quiet then.
     text_focused: bool,
-    /// The platform delivered real pen pressure at least once. Speed stays out of it then.
-    hardware_pressure: bool,
-    /// Smoothed speed pressure for the current stroke.
-    speed_pressure: f32,
+    /// Finger taps on a touch screen: two undo, three redo.
+    fingers: Fingers,
+    /// A dial drag in progress: which dial, and the value where the drag began.
+    dial_drag: Option<(Dial, f32)>,
+}
+
+/// One rotary on the panel. Every value is 0..=1 on the dial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dial {
+    Size,
+    Soft,
+    Opacity,
+    Texture,
+    Tolerance,
+    Pick,
+    Reach,
+}
+
+impl Dial {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Size => "SIZ",
+            Self::Soft => "SOF",
+            Self::Opacity => "OPA",
+            Self::Texture => "TEX",
+            Self::Tolerance => "TOL",
+            Self::Pick => "PIK",
+            Self::Reach => "RCH",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Size => "Size. Drag up for a bigger brush. Double-click resets.",
+            Self::Soft => "Softness. Drag up to soften the edge.",
+            Self::Opacity => "Opacity.",
+            Self::Texture => "Texture. How much of the generated tip shows.",
+            Self::Tolerance => "Fill tolerance.",
+            Self::Pick => "Pick radius for points and handles.",
+            Self::Reach => "Bone reach.",
+        }
+    }
+
+    fn field(self) -> Field {
+        match self {
+            Self::Size => Field::Size,
+            Self::Soft => Field::Softness,
+            Self::Opacity => Field::Opacity,
+            Self::Texture => Field::Texture,
+            Self::Tolerance => Field::FillTolerance,
+            Self::Pick => Field::PickRadius,
+            Self::Reach => Field::BoneReach,
+        }
+    }
+
+    const ALL: [Self; 7] = [Self::Size, Self::Soft, Self::Opacity, Self::Texture, Self::Tolerance, Self::Pick, Self::Reach];
+
+    /// 0..=1 from the setting.
+    fn get(self, settings: &ToolSettings) -> f32 {
+        match self {
+            Self::Size => (settings.size / 255.0).clamp(0.0, 1.0),
+            Self::Soft => settings.softness.clamp(0.0, 1.0),
+            Self::Opacity => settings.opacity.clamp(0.0, 1.0),
+            Self::Texture => settings.texture.clamp(0.0, 1.0),
+            Self::Tolerance => f32::from(settings.fill_tolerance) / 255.0,
+            Self::Pick => ((settings.pick_radius - 2.0) / 62.0).clamp(0.0, 1.0),
+            Self::Reach => ((settings.bone_reach - 8.0) / 792.0).clamp(0.0, 1.0),
+        }
+    }
+
+    fn set(self, settings: &mut ToolSettings, value: f32) {
+        let value = value.clamp(0.0, 1.0);
+        match self {
+            Self::Size => settings.size = (value * 255.0).round().max(1.0),
+            Self::Soft => settings.softness = value,
+            Self::Opacity => settings.opacity = value,
+            Self::Texture => settings.texture = value,
+            Self::Tolerance => settings.fill_tolerance = (value * 255.0).round() as u8,
+            Self::Pick => settings.pick_radius = 2.0 + value * 62.0,
+            Self::Reach => settings.bone_reach = 8.0 + value * 792.0,
+        }
+    }
+
+    /// Two hex digits, Thrash Tracker style. Size shows its pixel count.
+    fn digits(self, settings: &ToolSettings) -> String {
+        let byte = match self {
+            Self::Size => settings.size.round().clamp(0.0, 255.0) as u32,
+            _ => (self.get(settings) * 255.0).round() as u32,
+        };
+        format!("{byte:02X}")
+    }
+
+    /// Pixels of drag for the full sweep.
+    fn travel(self) -> f32 {
+        match self {
+            Self::Size => 200.0,
+            _ => 120.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,8 +156,8 @@ impl StudioApp {
             path_text: String::new(),
             rotate_from: None,
             text_focused: false,
-            hardware_pressure: false,
-            speed_pressure: 1.0,
+            fingers: Fingers::default(),
+            dial_drag: None,
         }
     }
 
@@ -467,32 +565,40 @@ impl StudioApp {
 
     fn palette(&mut self, ui: &mut egui::Ui) {
         let theme = self.desk.theme();
-        ui.label(egui::RichText::new("Tools").color(rgb(theme.ink)).strong());
+        ui.spacing_mut().item_spacing = egui::vec2(2.0, 3.0);
         ui.horizontal(|ui| {
-            if ui.button("Undo").on_hover_text("Ctrl+Z").clicked() {
+            if small_cell(ui, theme, 22.0, false, |painter, rect, ink| paint_bitmap(painter, rect, &icons::UNDO, ink))
+                .on_hover_text("Undo    Ctrl+Z    two-finger tap")
+                .clicked()
+            {
                 self.desk.undo();
             }
-            if ui.button("Redo").on_hover_text("Ctrl+Shift+Z").clicked() {
+            if small_cell(ui, theme, 22.0, false, |painter, rect, ink| paint_bitmap(painter, rect, &icons::REDO, ink))
+                .on_hover_text("Redo    Ctrl+Shift+Z    three-finger tap")
+                .clicked()
+            {
                 self.desk.redo();
             }
-        });
-        let mut speed = self.desk.session.speed_pressure;
-        let hint = if self.hardware_pressure {
-            "The pen reports pressure. Speed is not used."
-        } else {
-            "No pen pressure is arriving from this platform, so speed stands in: slow is thick, fast is thin."
-        };
-        if ui.checkbox(&mut speed, "Speed pressure").on_hover_text(hint).changed() {
-            self.desk.set_speed_pressure(speed);
-        }
-        self.color_box(ui, theme);
-        self.shape_controls(ui, theme);
-        if ui.button("All settings").on_hover_text("Every field for this tool. Right-click a cell does the same.").clicked() {
             let tool = self.desk.tool();
-            self.desk.palette_click(tool, true);
-        }
-        let search = ui.add(egui::TextEdit::singleline(&mut self.desk.query).hint_text("Find a tool"));
-        self.watch_text(search);
+            if small_cell(ui, theme, 22.0, self.desk.tool_window == Some(tool), |painter, rect, ink| {
+                paint_bitmap(painter, rect, &icons::GEAR, ink)
+            })
+            .on_hover_text("Every setting for this tool. Right-click a cell does the same.")
+            .clicked()
+            {
+                self.desk.palette_click(tool, true);
+            }
+            let name = if tool.shortcut().is_empty() {
+                tool.name().to_string()
+            } else {
+                format!("{} {}", tool.name(), tool.shortcut())
+            };
+            ui.label(egui::RichText::new(name).small().color(rgb(theme.soft)));
+        });
+        self.color_box(ui, theme);
+        self.dials(ui, theme);
+        self.toggles(ui, theme);
+        ui.add_space(2.0);
         egui::ScrollArea::vertical().id_salt("tool-grid").show(ui, |ui| {
             self.tool_grid(ui, theme);
         });
@@ -503,12 +609,16 @@ impl StudioApp {
         let color_tool = if active.fields().contains(&Field::Color) { active } else { Tool::Pen };
         let mut color = self.desk.preset_of(color_tool).color;
         let before = color;
-        let label = if color_tool == active { "Color" } else { "Pen color" };
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(label).color(rgb(theme.ink)));
-            ui.color_edit_button_srgb(&mut color);
+            ui.color_edit_button_srgb(&mut color).on_hover_text(if color_tool == active {
+                "Color"
+            } else {
+                "Pen color. This tool has none of its own."
+            });
             let mut hex = vmi_core::hex_of(color);
-            let response = ui.add(egui::TextEdit::singleline(&mut hex).desired_width(72.0));
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut hex).desired_width(56.0).font(egui::TextStyle::Small),
+            );
             if response.has_focus() {
                 self.text_focused = true;
             }
@@ -519,79 +629,120 @@ impl StudioApp {
             }
         });
         let ink = rgb(theme.ink);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-            for swatch in SWATCHES {
-                let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                ui.painter().rect_filled(rect, 1.0, rgb(swatch));
-                if color == swatch {
-                    ui.painter().rect_stroke(rect.shrink(0.5), 1.0, egui::Stroke::new(1.5_f32, ink));
+        let cell = 13.0;
+        for row in SWATCHES.chunks(8) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(1.0, 1.0);
+                for swatch in row {
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(cell, cell), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 0.0, rgb(*swatch));
+                    if color == *swatch {
+                        ui.painter().rect_stroke(rect.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, ink));
+                    }
+                    if response.clicked() {
+                        color = *swatch;
+                    }
+                    response.on_hover_text(vmi_core::hex_of(*swatch));
                 }
-                if response.clicked() {
-                    color = swatch;
-                }
-                response.on_hover_text(vmi_core::hex_of(swatch));
-            }
-        });
+            });
+        }
         if color != before {
             self.desk.edit_preset(color_tool, |slot| slot.color = color);
         }
     }
 
-    fn shape_controls(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+    /// The rotaries. 7 o'clock is 0, the long way around to 5 o'clock is 1.
+    fn dials(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let tool = self.desk.tool();
+        let fields = tool.fields();
+        let shown: Vec<Dial> = Dial::ALL.iter().copied().filter(|dial| fields.contains(&dial.field())).collect();
+        if shown.is_empty() {
+            return;
+        }
         let mut settings = self.desk.preset_of(tool).clone();
         let before = settings.clone();
-        let shortcut = tool.shortcut();
-        let title = if shortcut.is_empty() { tool.name().to_string() } else { format!("{}   {shortcut}", tool.name()) };
-        ui.label(egui::RichText::new(title).strong().color(rgb(theme.ink)));
-        ui.label(egui::RichText::new(tool.usage()).small().color(rgb(theme.soft)));
-        if tool.fields().contains(&Field::Size) {
-            ui.add(egui::Slider::new(&mut settings.size, 0.5..=256.0).text("Size"));
-        }
-        if tool.fields().contains(&Field::Softness) {
-            ui.add(egui::Slider::new(&mut settings.softness, 0.0..=1.0).text("Soft"));
-        }
-        if tool.fields().contains(&Field::Opacity) {
-            ui.add(egui::Slider::new(&mut settings.opacity, 0.0..=1.0).text("Opacity"));
-        }
-        if tool.fields().contains(&Field::Tip) {
-            tip_row(ui, &mut settings);
-        }
-        if tool.fields().contains(&Field::Texture) {
-            ui.add(egui::Slider::new(&mut settings.texture, 0.0..=1.0).text("Texture"));
-        }
-        if tool.fields().contains(&Field::Edge) {
-            ui.horizontal(|ui| {
-                ui.label("Edge");
-                for edge in Edge::all() {
-                    if ui.selectable_label(settings.edge == edge, edge.label()).clicked() {
-                        settings.edge = edge;
+        let defaults = ToolSettings::default_for(tool);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+            for dial in shown {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click_and_drag());
+                    let value = dial.get(&settings);
+                    paint_dial(ui.painter(), rect, value, &dial.digits(&settings), theme, value > 0.0);
+                    if response.drag_started() {
+                        self.dial_drag = Some((dial, value));
                     }
-                }
-            });
-        }
-        if tool.fields().contains(&Field::Chunk) {
-            ui.horizontal(|ui| {
-                ui.label("Chunk");
-                for chunk in [1u32, 2, 4] {
-                    if ui.selectable_label(settings.chunk == chunk, chunk.to_string()).clicked() {
-                        settings.chunk = chunk;
+                    if response.dragged() {
+                        if let Some((which, start)) = self.dial_drag {
+                            if which == dial {
+                                // Up raises. The whole sweep is `travel` pixels.
+                                let delta = response.interact_pointer_pos().map(|pos| pos.y).unwrap_or(0.0);
+                                let origin = ui.input(|input| input.pointer.press_origin()).map(|pos| pos.y).unwrap_or(delta);
+                                dial.set(&mut settings, start + (origin - delta) / dial.travel());
+                            }
+                        }
                     }
-                }
-            });
-        }
-        if tool.fields().contains(&Field::FillTolerance) {
-            let mut tolerance = i32::from(settings.fill_tolerance);
-            if ui.add(egui::Slider::new(&mut tolerance, 0..=255).text("Tolerance")).changed() {
-                settings.fill_tolerance = tolerance as u8;
+                    if response.drag_stopped() {
+                        self.dial_drag = None;
+                    }
+                    if response.double_clicked() {
+                        dial.set(&mut settings, dial.get(&defaults));
+                    }
+                    let scroll = if response.hovered() { ui.input(|input| input.raw_scroll_delta.y) } else { 0.0 };
+                    if scroll != 0.0 {
+                        dial.set(&mut settings, value + scroll / (dial.travel() * 2.0));
+                    }
+                    response.on_hover_text(dial.hint());
+                    let label = egui::RichText::new(dial.label()).color(rgb(theme.soft)).font(egui::FontId::monospace(8.0));
+                    ui.allocate_ui(egui::vec2(22.0, 10.0), |ui| {
+                        ui.centered_and_justified(|ui| ui.label(label));
+                    });
+                });
             }
+        });
+        if settings != before {
+            self.desk.edit_preset(tool, |slot| *slot = settings);
         }
-        if tool.fields().contains(&Field::PickRadius) {
-            ui.add(egui::DragValue::new(&mut settings.pick_radius).range(2.0..=64.0).speed(0.25).prefix("Pick "));
+    }
+
+    /// Letter boxes: tip, edge, chunk. Lit when chosen.
+    fn toggles(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let tool = self.desk.tool();
+        let fields = tool.fields();
+        let mut settings = self.desk.preset_of(tool).clone();
+        let before = settings.clone();
+        if fields.contains(&Field::Tip) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                for tip in Tip::all() {
+                    let letter = &tip.label()[..1];
+                    if letter_cell(ui, theme, letter, settings.tip == tip).on_hover_text(format!("{}\n{}", tip.label(), tip.usage())).clicked() {
+                        settings.tip = tip;
+                    }
+                }
+            });
         }
-        if tool.fields().contains(&Field::BoneReach) {
-            ui.add(egui::DragValue::new(&mut settings.bone_reach).range(8.0..=800.0).speed(1.0).prefix("Reach "));
+        if fields.contains(&Field::Edge) || fields.contains(&Field::Chunk) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                if fields.contains(&Field::Edge) {
+                    for edge in Edge::all() {
+                        let letter = &edge.label()[..1];
+                        if letter_cell(ui, theme, letter, settings.edge == edge).on_hover_text(format!("Edge: {}", edge.label())).clicked() {
+                            settings.edge = edge;
+                        }
+                    }
+                }
+                if fields.contains(&Field::Chunk) {
+                    ui.add_space(4.0);
+                    for chunk in [1u32, 2, 4] {
+                        if letter_cell(ui, theme, &chunk.to_string(), settings.chunk == chunk).on_hover_text(format!("Chunk {chunk}")).clicked() {
+                            settings.chunk = chunk;
+                        }
+                    }
+                }
+            });
         }
         if settings != before {
             self.desk.edit_preset(tool, |slot| *slot = settings);
@@ -765,26 +916,39 @@ impl StudioApp {
             })
         });
         if let Some(force) = force {
-            self.hardware_pressure = true;
             self.desk.set_pressure(force);
+        } else if let Some(pen) = tablet::pressure() {
+            self.desk.set_pressure(pen);
         }
     }
 
-    /// Pressure from pen speed while the hardware reports none. A slow pen
-    /// presses hard; a fast flick thins to a third of the brush.
-    fn speed_pressure(&mut self, ui: &egui::Ui, dragging: bool) {
-        if self.hardware_pressure || !self.desk.session.speed_pressure {
-            return;
+    /// Finger taps: two undo, three redo. Any second finger cancels the
+    /// stroke the first one started, so a tap never leaves a dot.
+    fn finger_taps(&mut self, ui: &egui::Ui) {
+        let now_ms = (ui.input(|input| input.time) * 1000.0) as u64;
+        let events: Vec<egui::Event> = ui.input(|input| input.events.clone());
+        for event in events {
+            if let egui::Event::Touch { id, phase, pos, force, .. } = event {
+                // A pen reports force. A finger does not.
+                if force.is_some() {
+                    continue;
+                }
+                match phase {
+                    egui::TouchPhase::Start => self.fingers.start(id.0, pos.x, pos.y, now_ms),
+                    egui::TouchPhase::Move => self.fingers.moved(id.0, pos.x, pos.y),
+                    egui::TouchPhase::End => self.fingers.end(id.0, now_ms),
+                    egui::TouchPhase::Cancel => self.fingers.cancel(),
+                }
+            }
         }
-        if !dragging {
-            self.speed_pressure = 1.0;
-            self.desk.set_pressure(1.0);
-            return;
+        if self.fingers.many() {
+            self.desk.escape_stroke();
         }
-        let speed = ui.input(|input| input.pointer.velocity().length());
-        let target = 1.0 - (speed / 2400.0).clamp(0.0, 0.66);
-        self.speed_pressure += (target - self.speed_pressure) * 0.3;
-        self.desk.set_pressure(self.speed_pressure);
+        match self.fingers.take() {
+            Some(Tap::Undo) => self.desk.undo(),
+            Some(Tap::Redo) => self.desk.redo(),
+            None => {}
+        }
     }
 
     fn picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -805,6 +969,7 @@ impl StudioApp {
         };
         self.desk.fit_once(frame);
         self.read_pressure(ui);
+        self.finger_taps(ui);
         match self.desk.take_display(self.texture.is_none()) {
             Some(Display::Full(pixels)) => {
                 let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -885,8 +1050,7 @@ impl StudioApp {
                     self.desk.down_doc(x, y, Button::Primary);
                 }
             }
-            let painting = response.dragged() && !shift && !space && !middle;
-            self.speed_pressure(ui, painting);
+            let painting = response.dragged() && !shift && !space && !middle && !self.fingers.many();
             if painting {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let (x, y) = doc_at(pos);
@@ -965,6 +1129,66 @@ fn tip_row(ui: &mut egui::Ui, settings: &mut ToolSettings) {
             }
         }
     });
+}
+
+/// A square cell with a painted mark. Lit cells invert.
+fn small_cell(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    side: f32,
+    lit: bool,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    let fill = if lit {
+        rgb(theme.ink)
+    } else if response.hovered() {
+        rgb(theme.frame)
+    } else {
+        rgb(theme.row)
+    };
+    let ink = if lit { rgb(theme.field) } else { rgb(theme.ink) };
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, rgb(theme.frame)));
+    draw(&painter, rect, ink);
+    response
+}
+
+fn letter_cell(ui: &mut egui::Ui, theme: &Theme, letter: &str, lit: bool) -> egui::Response {
+    let text = letter.to_string();
+    small_cell(ui, theme, 18.0, lit, move |painter, rect, ink| {
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::monospace(10.0), ink);
+    })
+}
+
+fn paint_bitmap(painter: &egui::Painter, rect: egui::Rect, bitmap: &icons::Icon, color: egui::Color32) {
+    let side = icons::SIDE as f32;
+    let px = ((rect.width().min(rect.height()) - 4.0) / side).floor().max(1.0);
+    let size = px * side;
+    let origin = egui::pos2((rect.center().x - size * 0.5).round(), (rect.center().y - size * 0.5).round());
+    for (col, row) in icons::cells(bitmap) {
+        let min = egui::pos2(origin.x + col as f32 * px, origin.y + row as f32 * px);
+        painter.rect_filled(egui::Rect::from_min_size(min, egui::vec2(px, px)), 0.0, color);
+    }
+}
+
+/// 7 o'clock at 0, the long way around to 5 o'clock at 1. Same sweep as Thrash Tracker.
+fn dial_angle(amount: f32) -> f32 {
+    let span = amount.clamp(0.0, 1.0);
+    2.0 * std::f32::consts::PI / 3.0 + span * 5.0 * std::f32::consts::PI / 3.0
+}
+
+/// A rotary. The bump rides the rim. Two hex digits sit in the middle.
+fn paint_dial(painter: &egui::Painter, rect: egui::Rect, amount: f32, digits: &str, theme: &Theme, lit: bool) {
+    let color = if lit { rgb(theme.ink) } else { rgb(theme.quiet) };
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.5 - 1.0;
+    painter.circle_stroke(center, radius, egui::Stroke::new(1.0_f32, color));
+    let angle = dial_angle(amount);
+    let bump = egui::pos2((center.x + angle.cos() * radius).round(), (center.y + angle.sin() * radius).round());
+    painter.rect_filled(egui::Rect::from_center_size(bump, egui::vec2(3.0, 3.0)), 0.0, color);
+    painter.text(center, egui::Align2::CENTER_CENTER, digits, egui::FontId::monospace(8.0), color);
 }
 
 fn paint_plate(ui: &mut egui::Ui, texture: &egui::TextureHandle, desk: &Desk, frame: Frame) {
@@ -1199,8 +1423,8 @@ impl eframe::App for StudioApp {
             });
         let brushes = egui::SidePanel::left("brushes")
             .resizable(true)
-            .default_width(brush_default)
-            .width_range(160.0..=420.0)
+            .default_width(brush_default.clamp(112.0, 150.0))
+            .width_range(112.0..=150.0)
             .show(ctx, |ui| self.palette(ui));
         egui::SidePanel::right("objects")
             .resizable(true)

@@ -2,8 +2,10 @@
 //! that tool's settings and leaves the current tool selected.
 
 pub mod desk;
+pub mod fingers;
 pub mod gpu;
 pub mod icons;
+pub mod tablet;
 
 #[cfg(feature = "window")]
 mod ui;

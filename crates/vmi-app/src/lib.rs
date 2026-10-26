@@ -3,6 +3,7 @@
 
 pub mod desk;
 pub mod gpu;
+pub mod icons;
 
 #[cfg(feature = "window")]
 mod ui;

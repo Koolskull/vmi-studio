@@ -4,18 +4,25 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use vmi_core::doc::blit_buffer;
+use vmi_core::doc::blit_into;
 use vmi_core::{
-    cut_folder, erase_folder, export_png, find, find_mut, hex_of, hit_stroke, load_manifest, load_session, load_vmib,
-    palette_action, parent_of, parse_hex, point_inside, present, rect_points, save_session, save_vmib as write_vmib,
-    theme_or_studio, Art, Bone, DeskObject, History, Node, PaletteAction, Release, Section, Session, StrokeHit,
-    Tool, ToolSettings,
+    clamp_rect, cut_folder, erase_folder, export_png, find, find_mut, hex_of, hit_stroke, load_manifest, load_session,
+    load_vmib, palette_action, parent_of, parse_hex, point_inside, present_region, rect_points, save_session,
+    save_vmib as write_vmib, theme_or_studio, Art, Bone, DeskObject, History, Node, PaletteAction, Release, Section,
+    Session, StrokeHit, Tool, ToolSettings,
 };
-use vmi_paint::{flood_fill, paint_samples, paint_segment, StrokeSession};
+use vmi_paint::{flood_fill, paint_samples, paint_segment, segment_bounds, Carry, StrokeSession};
 
-use crate::gpu::{with_checker, Camera, Frame};
+use crate::gpu::{with_checker_at, Camera, Frame};
 
-const PRESSURE: f32 = 1.0;
+/// What the viewfinder has to upload this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Display {
+    /// The whole picture over its checker.
+    Full(Vec<u8>),
+    /// One rectangle of it. `rgba` is `w * h * 4`.
+    Part { x: u32, y: u32, w: u32, h: u32, rgba: Vec<u8> },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -92,6 +99,10 @@ pub struct Desk {
     pub fitted: bool,
     pub last_frame: Frame,
     pub dirty: bool,
+    /// Pixels a pen move touched since the last upload. `dirty` wins over this.
+    pub dirty_rect: Option<[i32; 4]>,
+    /// The pen's pressure for the next sample. 1 when nothing reports it.
+    pub pressure: f32,
     pub cut_points: Vec<[f32; 2]>,
     pub cut_closed: bool,
     pub warp_draft: Vec<[f32; 2]>,
@@ -99,6 +110,8 @@ pub struct Desk {
     gesture: Option<Gesture>,
     overlay: Vec<u8>,
     overlay_live: bool,
+    /// The last full plate shown, over its checker. Partial uploads patch it.
+    plate: Vec<u8>,
     warp_layer: Option<String>,
     previous_tool: Tool,
     persist: bool,
@@ -128,6 +141,8 @@ impl Desk {
             fitted: false,
             last_frame: Frame { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
             dirty: true,
+            dirty_rect: None,
+            pressure: 1.0,
             cut_points: Vec::new(),
             cut_closed: false,
             warp_draft: Vec::new(),
@@ -135,6 +150,7 @@ impl Desk {
             gesture: None,
             overlay: Vec::new(),
             overlay_live: false,
+            plate: Vec::new(),
             warp_layer: None,
             previous_tool: Tool::Pen,
             persist: false,
@@ -501,7 +517,23 @@ impl Desk {
             return;
         };
         self.gesture = Some(self.drag(gesture, x, y));
-        self.dirty = true;
+    }
+
+    /// Pressure for the samples that follow. The window feeds this from the
+    /// pen when the platform reports it.
+    pub fn set_pressure(&mut self, pressure: f32) {
+        self.pressure = if pressure.is_finite() { pressure.clamp(0.0, 1.0) } else { 1.0 };
+    }
+
+    fn touch_rect(&mut self, rect: Option<[i32; 4]>) {
+        let Some(rect) = rect else {
+            self.dirty = true;
+            return;
+        };
+        self.dirty_rect = Some(match self.dirty_rect {
+            Some(have) => [have[0].min(rect[0]), have[1].min(rect[1]), have[2].max(rect[2]), have[3].max(rect[3])],
+            None => rect,
+        });
     }
 
     pub fn up_doc(&mut self, x: f32, y: f32) {
@@ -678,6 +710,22 @@ impl Desk {
         }
     }
 
+    /// Zoom so the document point under screen `(sx, sy)` stays under it.
+    pub fn zoom_at(&mut self, frame: Frame, sx: f32, sy: f32, factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let before = self.camera.zoom;
+        let after = (before * factor).clamp(0.05, 32.0);
+        let applied = after / before;
+        let (cx, cy) = frame.center();
+        let rx = sx - cx - self.camera.pan_x;
+        let ry = sy - cy - self.camera.pan_y;
+        self.camera.pan_x = sx - cx - rx * applied;
+        self.camera.pan_y = sy - cy - ry * applied;
+        self.camera.zoom = after;
+    }
+
     pub fn pan_by(&mut self, dx: f32, dy: f32) {
         self.camera.pan_x += dx;
         self.camera.pan_y += dy;
@@ -700,27 +748,54 @@ impl Desk {
         }
     }
 
+    /// The whole picture over its checker. Also refreshes the cached plate.
     pub fn display_rgba(&mut self) -> Vec<u8> {
+        match self.take_display(true) {
+            Some(Display::Full(rgba)) => rgba,
+            _ => self.plate.clone(),
+        }
+    }
+
+    /// What changed since the last call, or `None` when nothing did. A pen
+    /// move hands back only the rectangle it touched.
+    pub fn take_display(&mut self, force_full: bool) -> Option<Display> {
         let width = self.art.width;
         let height = self.art.height;
-        let mut plate = present(&mut self.art);
-        if self.overlay_live && self.overlay.len() == plate.len() {
-            blit_buffer(
-                &mut plate,
-                width,
-                height,
-                &self.overlay,
-                width,
-                height,
-                0,
-                0,
-                255,
-                false,
-                "normal",
-            );
+        let need = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        let full = force_full || self.dirty || self.plate.len() != need;
+        let rect = self.dirty_rect.take();
+        if full {
+            self.dirty = false;
+            let rgba = self.compose([0, 0, width as i32, height as i32]);
+            self.plate = rgba.clone();
+            return Some(Display::Full(rgba));
         }
-        self.dirty = false;
-        with_checker(&plate, width, height)
+        let rect = clamp_rect(rect?, width, height);
+        let w = (rect[2] - rect[0]).max(0) as u32;
+        let h = (rect[3] - rect[1]).max(0) as u32;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let rgba = self.compose(rect);
+        for row in 0..h as usize {
+            let src = row * w as usize * 4;
+            let dst = ((rect[1] as usize + row) * width as usize + rect[0] as usize) * 4;
+            self.plate[dst..dst + w as usize * 4].copy_from_slice(&rgba[src..src + w as usize * 4]);
+        }
+        Some(Display::Part { x: rect[0] as u32, y: rect[1] as u32, w, h, rgba })
+    }
+
+    fn compose(&mut self, rect: [i32; 4]) -> Vec<u8> {
+        let width = self.art.width;
+        let height = self.art.height;
+        let mut plate = present_region(&mut self.art, rect);
+        let rw = (rect[2] - rect[0]).max(0) as u32;
+        let rh = (rect[3] - rect[1]).max(0) as u32;
+        let need = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        if self.overlay_live && self.overlay.len() == need {
+            blit_into(&mut plate, rw, rh, rect[0], rect[1], &self.overlay, width, height, 0, 0, 255, false, "normal");
+        }
+        with_checker_at(&plate, rw, rh, rect[0], rect[1])
     }
 
     pub fn marks(&self) -> Vec<Mark> {
@@ -784,20 +859,23 @@ impl Desk {
         let before = self.art.clone();
         let base = find(&self.art.layers, &layer).map(|node| node.pixels.clone()).unwrap_or_default();
         let mut session = StrokeSession::default();
-        session.begin(x, y, PRESSURE);
+        let pressure = self.pressure;
+        session.begin(x, y, pressure);
         let mut changed = false;
         if tool.release() == Release::Stroke {
             self.ensure_overlay();
             self.overlay.fill(0);
-            let mut carry = None;
+            let mut carry = Carry::default();
             paint_samples(&mut self.overlay, width, height, &session.samples, tool, &settings, &mut carry);
             self.overlay_live = true;
             changed = true;
+            self.dirty = true;
         } else if let Some(node) = find_mut(&mut self.art.layers, &layer) {
             changed = paint_samples(&mut node.pixels, width, height, &session.samples, tool, &settings, &mut session.carry);
+            let first = (x, y, pressure);
+            self.touch_rect(segment_bounds(width, height, first, first, tool, &settings));
         }
         self.gesture = Some(Gesture::Paint { layer, tool, settings, before, base, session, changed });
-        self.dirty = true;
     }
 
     fn begin_point(&mut self, x: f32, y: f32) {
@@ -888,40 +966,50 @@ impl Desk {
         let (width, height) = (self.art.width, self.art.height);
         match gesture {
             Gesture::Paint { mut session, layer, tool, settings, before, base, mut changed } => {
+                let pressure = self.pressure;
                 if tool == Tool::Line {
-                    session.line_to(x, y, PRESSURE);
+                    // The old line and the new one both need a repaint.
+                    let start = session.samples.first().copied().unwrap_or((x, y, pressure));
+                    let old_end = session.samples.last().copied().unwrap_or(start);
+                    session.line_to(x, y, pressure);
                     if let Some(node) = find_mut(&mut self.art.layers, &layer) {
                         if node.pixels.len() == base.len() {
                             node.pixels.copy_from_slice(&base);
                         }
-                        let mut carry = None;
+                        let mut carry = Carry::default();
                         changed |= paint_samples(&mut node.pixels, width, height, &session.samples, tool, &settings, &mut carry);
                     }
+                    self.touch_rect(segment_bounds(width, height, start, old_end, tool, &settings));
+                    self.touch_rect(segment_bounds(width, height, start, (x, y, pressure), tool, &settings));
                 } else if tool.release() == Release::Stroke {
                     if moved_from(session.samples.last(), x, y) {
-                        session.push(x, y, PRESSURE);
+                        // The overlay is a preview. Dabs land along the move only;
+                        // the kept stroke is rebuilt from its traits on release.
+                        let from = session.samples.last().copied().unwrap_or((x, y, pressure));
+                        session.push(x, y, pressure);
                         self.ensure_overlay();
-                        self.overlay.fill(0);
-                        let mut carry = None;
-                        paint_samples(&mut self.overlay, width, height, &session.samples, tool, &settings, &mut carry);
+                        let mut carry = Carry::default();
+                        paint_segment(&mut self.overlay, width, height, from, (x, y, pressure), tool, &settings, &mut carry);
                         self.overlay_live = true;
                         changed = true;
+                        self.touch_rect(segment_bounds(width, height, from, (x, y, pressure), tool, &settings));
                     }
                 } else if moved_from(session.samples.last(), x, y) {
-                    let from = session.samples.last().copied().unwrap_or((x, y, PRESSURE));
-                    session.push(x, y, PRESSURE);
+                    let from = session.samples.last().copied().unwrap_or((x, y, pressure));
+                    session.push(x, y, pressure);
                     if let Some(node) = find_mut(&mut self.art.layers, &layer) {
                         changed |= paint_segment(
                             &mut node.pixels,
                             width,
                             height,
                             from,
-                            (x, y, PRESSURE),
+                            (x, y, pressure),
                             tool,
                             &settings,
                             &mut session.carry,
                         );
                     }
+                    self.touch_rect(segment_bounds(width, height, from, (x, y, pressure), tool, &settings));
                 }
                 Gesture::Paint { session, layer, tool, settings, before, base, changed }
             }
@@ -971,6 +1059,7 @@ impl Desk {
                 }
                 if changed {
                     self.unbake(&layer);
+                    self.dirty = true;
                 }
                 Gesture::Point { layer, stroke, which, before, changed }
             }
@@ -985,6 +1074,7 @@ impl Desk {
                             found.bone = Some(Bone { x0, y0, x1: x, y1: y, reach });
                             found.touch();
                             changed = true;
+                            self.dirty = true;
                         }
                     }
                 }
@@ -996,6 +1086,7 @@ impl Desk {
                         if (point[0] - x).hypot(point[1] - y) > 0.01 {
                             *point = [x, y];
                             changed = true;
+                            self.dirty = true;
                         }
                     }
                 }
@@ -1003,11 +1094,13 @@ impl Desk {
             }
             Gesture::CutRect { x0, y0 } => {
                 self.cut_points = rect_points(x0, y0, x, y);
+                self.dirty = true;
                 Gesture::CutRect { x0, y0 }
             }
             Gesture::CutLasso => {
                 if self.cut_points.last().map(|point| (point[0] - x).hypot(point[1] - y) > 1.0).unwrap_or(true) {
                     self.cut_points.push([x, y]);
+                    self.dirty = true;
                 }
                 Gesture::CutLasso
             }
@@ -1357,7 +1450,7 @@ fn open_with_python(path: &Path) -> Result<Art, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmi_core::Edge;
+    use vmi_core::{present, Edge};
 
     fn alpha_at(art: &Art, x: i32, y: i32) -> u8 {
         let node = art.layers.iter().find(|node| node.is_layer());
@@ -1436,6 +1529,67 @@ mod tests {
         desk.up_doc(16.0, 4.0);
         assert!(desk.art.layers[0].strokes.len() == 1);
         assert!(alpha_at(&desk.art, 10, 4) > 0 || alpha_at(&desk.art, 8, 4) > 0);
+    }
+
+    #[test]
+    fn a_pen_move_uploads_only_the_rectangle_it_touched() {
+        let mut desk = tiny();
+        desk.edit_preset(Tool::Pen, |slot| {
+            slot.size = 6.0;
+            slot.size_pressure = false;
+        });
+        let first = desk.take_display(false);
+        assert!(matches!(first, Some(Display::Full(_))));
+        assert_eq!(desk.take_display(false), None, "nothing changed, nothing to upload");
+        desk.down_doc(10.0, 10.0, Button::Primary);
+        desk.move_doc(20.0, 12.0);
+        let Some(Display::Part { x, y, w, h, rgba }) = desk.take_display(false) else {
+            panic!("a pen move is a partial upload");
+        };
+        assert!(x <= 6 && y <= 6, "{x},{y}");
+        assert!(x + w >= 24 && y + h >= 16, "{w},{h}");
+        assert!(w < desk.art.width && h < desk.art.height);
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        // The patched plate is the same picture a full compose gives.
+        let patched = desk.plate.clone();
+        let fresh = desk.display_rgba();
+        assert_eq!(patched, fresh);
+        desk.up_doc(20.0, 12.0);
+        assert!(matches!(desk.take_display(false), Some(Display::Full(_))));
+    }
+
+    #[test]
+    fn pressure_is_read_per_sample_and_a_light_pen_draws_thin() {
+        let mut heavy = tiny();
+        heavy.edit_preset(Tool::Pen, |slot| slot.size = 12.0);
+        heavy.down_doc(10.0, 16.0, Button::Primary);
+        heavy.move_doc(36.0, 16.0);
+        heavy.up_doc(36.0, 16.0);
+        let mut light = tiny();
+        light.edit_preset(Tool::Pen, |slot| slot.size = 12.0);
+        light.set_pressure(0.15);
+        light.down_doc(10.0, 16.0, Button::Primary);
+        light.move_doc(36.0, 16.0);
+        light.up_doc(36.0, 16.0);
+        let count = |desk: &Desk| desk.art.layers[0].pixels.iter().skip(3).step_by(4).filter(|a| **a > 0).count();
+        assert!(count(&light) > 0);
+        assert!(count(&light) < count(&heavy), "{} vs {}", count(&light), count(&heavy));
+        assert!(ToolSettings::default_for(Tool::Pencil).size_pressure);
+    }
+
+    #[test]
+    fn zoom_at_keeps_the_document_point_under_the_pointer() {
+        let mut desk = tiny();
+        let frame = Frame { x: 100.0, y: 50.0, w: 400.0, h: 300.0 };
+        desk.fit(frame);
+        let (sx, sy) = (180.0, 120.0);
+        let (w, h) = (desk.art.width as f32, desk.art.height as f32);
+        let before = desk.camera.to_doc(frame, w, h, sx, sy);
+        desk.zoom_at(frame, sx, sy, 2.5);
+        let after = desk.camera.to_doc(frame, w, h, sx, sy);
+        assert!((before.0 - after.0).abs() < 1e-3, "{before:?} {after:?}");
+        assert!((before.1 - after.1).abs() < 1e-3, "{before:?} {after:?}");
+        assert!(desk.camera.zoom > 1.0);
     }
 
     #[test]

@@ -4,11 +4,12 @@
 
 use eframe::egui;
 
-use crate::desk::{Button, Desk};
+use crate::desk::{Button, Desk, Display};
 use crate::gpu::{Frame, PictureFilter, PICTURE_FILTER};
+use crate::icons;
 use vmi_core::{
-    blend_label, palette_matching, parse_hex, CurveKind, Edge, Field, GrainKind, Section, Theme, Tool, ToolSettings,
-    BLENDS, THEMES,
+    blend_label, palette_matching, parse_hex, CurveKind, Edge, Field, GrainKind, Section, Theme, Tip, Tool,
+    ToolSettings, BLENDS, THEMES,
 };
 
 pub fn run() -> eframe::Result<()> {
@@ -19,7 +20,11 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "kool-skull-studio",
         options,
-        Box::new(|_cc| Ok(Box::new(StudioApp::new()))),
+        Box::new(|cc| {
+            // Ctrl+= and Ctrl+- zoom the picture, never the widgets.
+            cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+            Ok(Box::new(StudioApp::new()))
+        }),
     )
 }
 
@@ -107,17 +112,24 @@ impl StudioApp {
             if !typing && input.key_pressed(egui::Key::Backspace) && plain {
                 backspace = true;
             }
-            if !typing && plain && !shift && input.key_pressed(egui::Key::Equals) {
+            // `=`, `+`, Ctrl+`=`, and Ctrl+`+` zoom in; `-` and Ctrl+`-` zoom out.
+            let zoom_keys = !typing && !input.modifiers.alt;
+            if zoom_keys && (input.key_pressed(egui::Key::Equals) || input.key_pressed(egui::Key::Plus)) {
                 zoom_in = true;
             }
-            if !typing && plain && !shift && input.key_pressed(egui::Key::Minus) {
+            if zoom_keys && input.key_pressed(egui::Key::Minus) {
                 zoom_out = true;
             }
             if !typing && plain && !shift {
                 for (key, name) in [
                     (egui::Key::P, "P"),
+                    (egui::Key::N, "N"),
+                    (egui::Key::C, "C"),
                     (egui::Key::B, "B"),
+                    (egui::Key::A, "A"),
                     (egui::Key::E, "E"),
+                    (egui::Key::S, "S"),
+                    (egui::Key::D, "D"),
                     (egui::Key::F, "F"),
                     (egui::Key::L, "L"),
                     (egui::Key::V, "V"),
@@ -158,10 +170,10 @@ impl StudioApp {
             self.desk.backspace();
         }
         if zoom_in {
-            self.desk.zoom_at_center(1.1);
+            self.desk.zoom_at_center(1.25);
         }
         if zoom_out {
-            self.desk.zoom_at_center(1.0 / 1.1);
+            self.desk.zoom_at_center(1.0 / 1.25);
         }
         if !shortcut.is_empty() {
             self.desk.shortcut(&shortcut);
@@ -528,6 +540,12 @@ impl StudioApp {
         if tool.fields().contains(&Field::Opacity) {
             ui.add(egui::Slider::new(&mut settings.opacity, 0.0..=1.0).text("Opacity"));
         }
+        if tool.fields().contains(&Field::Tip) {
+            tip_row(ui, &mut settings);
+        }
+        if tool.fields().contains(&Field::Texture) {
+            ui.add(egui::Slider::new(&mut settings.texture, 0.0..=1.0).text("Texture"));
+        }
         if tool.fields().contains(&Field::Edge) {
             ui.horizontal(|ui| {
                 ui.label("Edge");
@@ -573,11 +591,14 @@ impl StudioApp {
             if rows.is_empty() {
                 continue;
             }
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(section.label()).strong().color(rgb(theme.number)));
-            let gap = 4.0;
-            let cell_w = ((ui.available_width() - gap) / 2.0).max(72.0);
-            let cell = egui::vec2(cell_w, 54.0);
+            if section != Section::Raster {
+                ui.add_space(6.0);
+                ui.separator();
+            }
+            let gap = 3.0;
+            let columns = 4.0;
+            let side = ((ui.available_width() - gap * (columns - 1.0)) / columns).floor().clamp(34.0, 72.0);
+            let cell = egui::vec2(side, side);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
                 for tool in rows {
@@ -714,6 +735,21 @@ impl StudioApp {
         });
     }
 
+    /// A pen that reports force arrives as a touch. A mouse does not, and
+    /// keeps full pressure.
+    fn read_pressure(&mut self, ui: &egui::Ui) {
+        let force = ui.input(|input| {
+            input.events.iter().rev().find_map(|event| match event {
+                egui::Event::Touch { phase: egui::TouchPhase::End | egui::TouchPhase::Cancel, .. } => Some(1.0),
+                egui::Event::Touch { force: Some(force), .. } => Some(*force),
+                _ => None,
+            })
+        });
+        if let Some(force) = force {
+            self.desk.set_pressure(force);
+        }
+    }
+
     fn picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let available = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(
@@ -731,16 +767,45 @@ impl StudioApp {
             h: response.rect.height(),
         };
         self.desk.fit_once(frame);
-        if self.desk.dirty || self.texture.is_none() {
-            let pixels = self.desk.display_rgba();
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [self.desk.art.width as usize, self.desk.art.height as usize],
-                &pixels,
-            );
-            self.texture = Some(ctx.load_texture("plate", image, texture_options()));
+        self.read_pressure(ui);
+        match self.desk.take_display(self.texture.is_none()) {
+            Some(Display::Full(pixels)) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [self.desk.art.width as usize, self.desk.art.height as usize],
+                    &pixels,
+                );
+                match &mut self.texture {
+                    Some(texture) => texture.set(image, texture_options()),
+                    None => self.texture = Some(ctx.load_texture("plate", image, texture_options())),
+                }
+            }
+            Some(Display::Part { x, y, w, h, rgba }) => {
+                if let Some(texture) = &mut self.texture {
+                    let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    texture.set_partial([x as usize, y as usize], image, texture_options());
+                }
+            }
+            None => {}
         }
         if let Some(texture) = &self.texture {
             paint_plate(ui, texture, &self.desk, frame);
+        }
+        if response.hovered() {
+            // Ctrl+wheel and a pinch come in as a zoom factor. A plain wheel
+            // zooms too; the picture is the only thing under the pointer.
+            let (pinch, scroll) = ui.input(|input| (input.zoom_delta(), input.raw_scroll_delta));
+            let factor = if (pinch - 1.0).abs() > 1e-4 {
+                pinch
+            } else if scroll.y != 0.0 {
+                1.15_f32.powf(scroll.y / 40.0)
+            } else {
+                1.0
+            };
+            if (factor - 1.0).abs() > 1e-4 {
+                if let Some(pos) = response.hover_pos() {
+                    self.desk.zoom_at(frame, pos.x, pos.y, factor);
+                }
+            }
         }
         let space = ui.input(|input| input.key_down(egui::Key::Space));
         let shift = ui.input(|input| input.modifiers.shift);
@@ -827,155 +892,40 @@ fn tool_cell(ui: &mut egui::Ui, tool: Tool, cell: egui::Vec2, theme: &Theme, act
     } else {
         rgb(theme.row)
     };
-    let glyph = if active { rgb(theme.field) } else { rgb(theme.ink) };
+    let ink = if active { rgb(theme.field) } else { rgb(theme.ink) };
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 3.0, fill);
-    painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0_f32, rgb(theme.frame)));
-    let icon = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 16.0),
-        egui::vec2(22.0, 22.0),
-    );
-    paint_glyph(&painter, icon, tool, glyph);
+    painter.rect_filled(rect, 0.0, fill);
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, rgb(theme.frame)));
+    paint_icon(&painter, rect, tool, ink);
     let shortcut = tool.shortcut();
-    if !shortcut.is_empty() {
-        painter.text(
-            rect.right_top() + egui::vec2(-4.0, 3.0),
-            egui::Align2::RIGHT_TOP,
-            shortcut,
-            egui::FontId::proportional(9.0),
-            if active { rgb(theme.field) } else { rgb(theme.soft) },
-        );
-    }
-    painter.text(
-        egui::pos2(rect.center().x, rect.bottom() - 4.0),
-        egui::Align2::CENTER_BOTTOM,
-        tool.name(),
-        egui::FontId::proportional(11.0),
-        glyph,
-    );
-    response.on_hover_text(format!("{}\n{}\nRight-click for every setting.", tool.name(), tool.usage()))
+    let title = if shortcut.is_empty() { tool.name().to_string() } else { format!("{}  [{shortcut}]", tool.name()) };
+    response.on_hover_text(format!("{title}\n{}\nRight-click: settings", tool.usage()))
 }
 
-fn paint_glyph(painter: &egui::Painter, rect: egui::Rect, tool: Tool, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.6_f32, color);
-    let thin = egui::Stroke::new(1.0_f32, color);
-    let at = |x: f32, y: f32| egui::pos2(rect.left() + rect.width() * x, rect.top() + rect.height() * y);
-    match tool {
-        Tool::Pen => {
-            painter.line_segment([at(0.15, 0.85), at(0.72, 0.22)], stroke);
-            painter.circle_filled(at(0.78, 0.16), 2.2, color);
-        }
-        Tool::Pencil => {
-            painter.line_segment([at(0.2, 0.82), at(0.7, 0.28)], thin);
-            painter.rect_filled(egui::Rect::from_center_size(at(0.78, 0.2), egui::vec2(4.0, 4.0)), 0.0, color);
-        }
-        Tool::Paint => {
-            painter.circle_filled(rect.center(), rect.width() * 0.28, color);
-        }
-        Tool::Air => {
-            painter.circle_stroke(rect.center(), rect.width() * 0.28, thin);
-            for point in [at(0.35, 0.4), at(0.62, 0.32), at(0.48, 0.62), at(0.7, 0.58)] {
-                painter.circle_filled(point, 1.3, color);
-            }
-        }
-        Tool::Eraser => {
-            painter.rect_stroke(egui::Rect::from_min_max(at(0.2, 0.28), at(0.8, 0.72)), 2.0, stroke);
-        }
-        Tool::Smudge => {
-            painter.circle_stroke(at(0.4, 0.48), 5.0, thin);
-            painter.circle_stroke(at(0.62, 0.48), 5.0, thin);
-        }
-        Tool::Blend => {
-            painter.circle_stroke(rect.center(), 6.0, thin);
-            painter.line_segment([at(0.22, 0.5), at(0.78, 0.5)], thin);
-        }
-        Tool::Fill => {
-            painter.line_segment([at(0.22, 0.72), at(0.5, 0.22)], stroke);
-            painter.line_segment([at(0.5, 0.22), at(0.78, 0.72)], stroke);
-            painter.line_segment([at(0.22, 0.72), at(0.78, 0.72)], stroke);
-            painter.circle_filled(at(0.72, 0.78), 1.8, color);
-        }
-        Tool::Dither => {
-            for y in 0..4 {
-                for x in 0..4 {
-                    if (x + y * 2) % 3 != 0 {
-                        let cell = rect.width() / 4.0;
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(at(x as f32 / 4.0, y as f32 / 4.0), egui::vec2(cell - 1.0, cell - 1.0)),
-                            0.0,
-                            color,
-                        );
-                    }
-                }
-            }
-        }
-        Tool::Line => {
-            painter.line_segment([at(0.12, 0.8), at(0.88, 0.2)], stroke);
-        }
-        Tool::Vector => {
-            painter.line_segment([at(0.15, 0.75), at(0.45, 0.3)], thin);
-            painter.line_segment([at(0.45, 0.3), at(0.85, 0.62)], thin);
-            painter.circle_filled(at(0.15, 0.75), 2.0, color);
-            painter.circle_filled(at(0.45, 0.3), 2.0, color);
-            painter.circle_filled(at(0.85, 0.62), 2.0, color);
-        }
-        Tool::Curve => {
-            painter.line_segment([at(0.12, 0.78), at(0.35, 0.22)], thin);
-            painter.line_segment([at(0.35, 0.22), at(0.88, 0.55)], thin);
-            painter.circle_stroke(at(0.35, 0.22), 2.2, thin);
-            painter.circle_filled(at(0.12, 0.78), 2.0, color);
-            painter.circle_filled(at(0.88, 0.55), 2.0, color);
-        }
-        Tool::Point => {
-            painter.circle_stroke(rect.center(), 4.0, thin);
-            painter.line_segment([at(0.5, 0.12), at(0.5, 0.88)], thin);
-            painter.line_segment([at(0.12, 0.5), at(0.88, 0.5)], thin);
-        }
-        Tool::Bone => {
-            painter.line_segment([at(0.22, 0.72), at(0.72, 0.28)], stroke);
-            painter.circle_filled(at(0.22, 0.72), 2.6, color);
-            painter.circle_stroke(at(0.78, 0.22), 3.0, thin);
-        }
-        Tool::Grain => {
-            for point in [at(0.3, 0.3), at(0.55, 0.28), at(0.72, 0.48), at(0.4, 0.55), at(0.62, 0.7), at(0.32, 0.74)] {
-                painter.circle_filled(point, 1.5, color);
-            }
-        }
-        Tool::WarpTarget => {
-            painter.line_segment([at(0.2, 0.28), at(0.78, 0.18)], thin);
-            painter.line_segment([at(0.78, 0.18), at(0.86, 0.78)], thin);
-            painter.line_segment([at(0.86, 0.78), at(0.16, 0.7)], thin);
-            painter.line_segment([at(0.16, 0.7), at(0.2, 0.28)], thin);
-            for point in [at(0.2, 0.28), at(0.78, 0.18), at(0.86, 0.78), at(0.16, 0.7)] {
-                painter.circle_filled(point, 1.7, color);
-            }
-        }
-        Tool::WarpMask => {
-            painter.line_segment([at(0.18, 0.25), at(0.42, 0.25)], thin);
-            painter.line_segment([at(0.58, 0.25), at(0.82, 0.25)], thin);
-            painter.line_segment([at(0.18, 0.75), at(0.42, 0.75)], thin);
-            painter.line_segment([at(0.58, 0.75), at(0.82, 0.75)], thin);
-            painter.line_segment([at(0.18, 0.25), at(0.18, 0.48)], thin);
-            painter.line_segment([at(0.18, 0.58), at(0.18, 0.75)], thin);
-            painter.line_segment([at(0.82, 0.25), at(0.82, 0.48)], thin);
-            painter.line_segment([at(0.82, 0.58), at(0.82, 0.75)], thin);
-        }
-        Tool::CutRect => {
-            painter.rect_stroke(egui::Rect::from_min_max(at(0.18, 0.22), at(0.82, 0.78)), 0.0, stroke);
-        }
-        Tool::CutLasso => {
-            painter.line_segment([at(0.2, 0.55), at(0.35, 0.25)], thin);
-            painter.line_segment([at(0.35, 0.25), at(0.7, 0.3)], thin);
-            painter.line_segment([at(0.7, 0.3), at(0.82, 0.62)], thin);
-            painter.line_segment([at(0.82, 0.62), at(0.48, 0.8)], thin);
-            painter.line_segment([at(0.48, 0.8), at(0.2, 0.55)], thin);
-        }
-        Tool::CutPolygon => {
-            painter.line_segment([at(0.5, 0.16), at(0.86, 0.78)], thin);
-            painter.line_segment([at(0.86, 0.78), at(0.14, 0.78)], thin);
-            painter.line_segment([at(0.14, 0.78), at(0.5, 0.16)], thin);
-        }
+/// Whole-pixel scaling keeps the icon crisp. The bitmap is centered in the cell.
+fn paint_icon(painter: &egui::Painter, rect: egui::Rect, tool: Tool, color: egui::Color32) {
+    let side = icons::SIDE as f32;
+    let px = ((rect.width().min(rect.height()) - 6.0) / side).floor().max(1.0);
+    let size = px * side;
+    let origin = egui::pos2(
+        (rect.center().x - size * 0.5).round(),
+        (rect.center().y - size * 0.5).round(),
+    );
+    for (col, row) in icons::cells(icons::icon(tool)) {
+        let min = egui::pos2(origin.x + col as f32 * px, origin.y + row as f32 * px);
+        painter.rect_filled(egui::Rect::from_min_size(min, egui::vec2(px, px)), 0.0, color);
     }
+}
+
+fn tip_row(ui: &mut egui::Ui, settings: &mut ToolSettings) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Tip");
+        for tip in Tip::all() {
+            if ui.selectable_label(settings.tip == tip, tip.label()).on_hover_text(tip.usage()).clicked() {
+                settings.tip = tip;
+            }
+        }
+    });
 }
 
 fn paint_plate(ui: &mut egui::Ui, texture: &egui::TextureHandle, desk: &Desk, frame: Frame) {
@@ -1051,6 +1001,10 @@ fn edit_field(ui: &mut egui::Ui, tool: Tool, field: Field, settings: &mut ToolSe
         }
         Field::Softness => {
             ui.add(egui::Slider::new(&mut settings.softness, 0.0..=1.0).text("Softness"));
+        }
+        Field::Tip => tip_row(ui, settings),
+        Field::Texture => {
+            ui.add(egui::Slider::new(&mut settings.texture, 0.0..=1.0).text("Texture"));
         }
         Field::Edge => {
             ui.horizontal(|ui| {

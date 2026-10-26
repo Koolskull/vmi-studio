@@ -66,6 +66,12 @@ pub const PICTURE_FILTER: PictureFilter = PictureFilter::Nearest;
 
 /// Composite the clear plate over a checker. The document itself stays clear.
 pub fn with_checker(plate: &[u8], width: u32, height: u32) -> Vec<u8> {
+    with_checker_at(plate, width, height, 0, 0)
+}
+
+/// The same checker for a region whose first pixel is document `(ox, oy)`,
+/// so a patched rectangle lines up with the squares around it.
+pub fn with_checker_at(plate: &[u8], width: u32, height: u32, ox: i32, oy: i32) -> Vec<u8> {
     let need = (width as usize).saturating_mul(height as usize).saturating_mul(4);
     if width == 0 || height == 0 || plate.len() < need {
         return plate.to_vec();
@@ -74,7 +80,9 @@ pub fn with_checker(plate: &[u8], width: u32, height: u32) -> Vec<u8> {
     for y in 0..height {
         for x in 0..width {
             let index = ((y * width + x) * 4) as usize;
-            let dark = ((x / 8) ^ (y / 8)) & 1 == 0;
+            let doc_x = (x as i32 + ox).max(0) as u32;
+            let doc_y = (y as i32 + oy).max(0) as u32;
+            let dark = ((doc_x / 8) ^ (doc_y / 8)) & 1 == 0;
             let base = if dark { 32u32 } else { 48 };
             let alpha = u32::from(plate[index + 3]);
             let mix = |src: u8| ((u32::from(src) * alpha + base * (255 - alpha)) / 255) as u8;

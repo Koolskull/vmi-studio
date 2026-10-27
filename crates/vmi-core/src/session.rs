@@ -39,6 +39,13 @@ pub struct Session {
     /// The view in each area: left, center, right, bottom. Empty means the defaults.
     #[serde(default)]
     pub areas: Vec<String>,
+    /// The UI face id. `monospace` is the house stack.
+    #[serde(default = "default_font")]
+    pub font: String,
+}
+
+fn default_font() -> String {
+    "monospace".into()
 }
 
 fn default_right_width() -> f32 {
@@ -65,6 +72,7 @@ impl Default for Session {
             right_width: default_right_width(),
             bottom_height: default_bottom_height(),
             areas: Vec::new(),
+            font: default_font(),
         }
     }
 }
@@ -79,8 +87,12 @@ impl Session {
 }
 
 pub fn session_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    home.join(".cache").join("vmi-studio").join("rust-desk.json")
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cache")
+        .join("vmi-studio")
+        .join("rust-desk.json")
 }
 
 pub fn load() -> Session {
@@ -116,17 +128,36 @@ mod tests {
 
     #[test]
     fn a_session_round_trips_the_active_tool() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("vmi-session-{stamp}.json"));
         let mut session = Session::default();
         session.tool = Tool::Dither;
-        session.presets.iter_mut().find(|preset| preset.tool == Tool::Dither).unwrap().chunk = 4;
+        session
+            .presets
+            .iter_mut()
+            .find(|preset| preset.tool == Tool::Dither)
+            .unwrap()
+            .chunk = 4;
         save_to(&path, &session).unwrap();
         let loaded = load_from(&path).unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.tool, Tool::Dither);
-        assert_eq!(loaded.presets.iter().find(|preset| preset.tool == Tool::Dither).unwrap().chunk, 4);
-        assert!(loaded.presets.iter().any(|preset| preset.tool == Tool::Vector));
+        assert_eq!(
+            loaded
+                .presets
+                .iter()
+                .find(|preset| preset.tool == Tool::Dither)
+                .unwrap()
+                .chunk,
+            4
+        );
+        assert!(loaded
+            .presets
+            .iter()
+            .any(|preset| preset.tool == Tool::Vector));
     }
 
     #[test]
@@ -136,7 +167,11 @@ mod tests {
         fields.remove("palettes");
         fields.remove("palette_tab");
         fields.remove("recent_colors");
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        fields.remove("font");
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("vmi-session-old-{stamp}.json"));
         fs::write(&path, old.to_string()).unwrap();
         let loaded = load_from(&path).unwrap();
@@ -144,14 +179,20 @@ mod tests {
         assert!(loaded.palettes.is_empty());
         assert_eq!(loaded.palette_tab, 0);
         assert!(loaded.recent_colors.is_empty());
+        assert_eq!(loaded.font, "monospace");
     }
 
     #[test]
     fn palettes_and_recent_colors_round_trip() {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("vmi-session-palette-{stamp}.json"));
         let mut session = Session::default();
-        session.palettes.push(Palette::new("Mine", vec![[1, 2, 3], [4, 5, 6]]));
+        session
+            .palettes
+            .push(Palette::new("Mine", vec![[1, 2, 3], [4, 5, 6]]));
         session.palette_tab = 3;
         session.note_recent_color([9, 9, 9]);
         save_to(&path, &session).unwrap();
@@ -174,6 +215,13 @@ mod tests {
         session.note_recent_color([10, 0, 0]);
         assert_eq!(session.recent_colors.len(), RECENT_COLORS);
         assert_eq!(session.recent_colors[0], [10, 0, 0]);
-        assert_eq!(session.recent_colors.iter().filter(|color| **color == [10, 0, 0]).count(), 1);
+        assert_eq!(
+            session
+                .recent_colors
+                .iter()
+                .filter(|color| **color == [10, 0, 0])
+                .count(),
+            1
+        );
     }
 }

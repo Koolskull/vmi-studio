@@ -8,8 +8,11 @@ use eframe::egui;
 
 use crate::desk::{Button, Desk, Display, LoadEvent};
 use crate::fingers::{Fingers, Tap};
+use crate::gate::Gate;
 use crate::gpu::{Frame, PictureFilter, PICTURE_FILTER};
 use crate::icons;
+use crate::newpage::{NewPage, NewPageAct};
+use crate::settings::{SettingsAct, SettingsBar};
 use crate::sheet::{self, Act, SheetState};
 use crate::tablet;
 use vmi_core::palette::Palette;
@@ -60,6 +63,14 @@ struct StudioApp {
     sheet_auto: [bool; 4],
     /// Pointer state on the sheets.
     sheet_state: SheetState,
+    /// The veil while a drawing is read.
+    gate: Gate,
+    /// File → New picture.
+    newpage: NewPage,
+    /// Settings, font, theme, at the right of the menu bar.
+    settings: SettingsBar,
+    /// The face id last handed to egui. Empty until the first apply.
+    applied_font: String,
 }
 
 /// One rotary on the panel. Every value is 0..=1 on the dial.
@@ -314,6 +325,10 @@ impl StudioApp {
             areas,
             sheet_auto: [false; 4],
             sheet_state: SheetState::default(),
+            gate: Gate::new(),
+            newpage: NewPage::new(),
+            settings: SettingsBar::new(),
+            applied_font: String::new(),
         }
     }
 
@@ -325,6 +340,10 @@ impl StudioApp {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
+        // The gate and the New picture dialog are modal. Shortcuts wait.
+        if self.gate.active() || self.newpage.is_open() {
+            return;
+        }
         // egui 0.29 reports any focused widget, including the canvas and the tool
         // cells, as wanting the keyboard. Undo still has to run after a stroke.
         let typing = self.text_focused;
@@ -753,19 +772,91 @@ impl StudioApp {
         }
         for event in self.desk.take_load_events() {
             match event {
-                LoadEvent::Started(_) | LoadEvent::Catchup(_) | LoadEvent::Note(_) | LoadEvent::Shown => {}
-                LoadEvent::Failed(message) => self.desk.status = message,
+                LoadEvent::Started(name) => self.gate.start(&name, false),
+                LoadEvent::Catchup(name) => self.gate.start(&name, true),
+                LoadEvent::Note(note) => self.gate.hear(&note),
+                LoadEvent::Shown => self.gate.complete(),
+                LoadEvent::Failed(message) => {
+                    self.gate.complete();
+                    self.desk.status = message;
+                }
             }
         }
     }
 
-    /// File → New picture, and the launcher button.
+    /// File → New picture, and the launcher button. The dialog chooses the plate.
     fn new_picture(&mut self) {
-        let (_, width, height) = vmi_core::newpage::PRESETS[0];
-        if let Err(err) =
-            self.desk.open_blank(i64::from(width), i64::from(height), vmi_core::newpage::PAPER_WHITE, None, false)
-        {
-            self.desk.status = err;
+        self.newpage.open();
+    }
+
+    fn overlays(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        let theme = self.desk.theme();
+        if self.gate.show(ctx, theme, now) {
+            ctx.request_repaint_after(self.gate.tick_interval());
+        }
+        let mut typing = false;
+        let act = self.newpage.show(ctx, theme, &mut typing);
+        if typing {
+            self.text_focused = true;
+        }
+        if let NewPageAct::Create(choice) = act {
+            let texture = choice.texture.clone();
+            if let Err(err) = self.desk.open_blank(
+                i64::from(choice.width),
+                i64::from(choice.height),
+                &choice.background,
+                texture.as_deref(),
+                choice.grid,
+            ) {
+                self.desk.status = err;
+            }
+        }
+    }
+
+    fn apply_settings(&mut self, ctx: &egui::Context, act: SettingsAct) {
+        match act {
+            SettingsAct::None => {}
+            SettingsAct::Font(id) => {
+                let name = vmi_core::fonts::face(&id).map(|face| face.label).unwrap_or_else(|| id.clone());
+                self.desk.status = format!("Loading {name}");
+                self.desk.set_font(&id);
+                self.applied_font.clear();
+                self.sync_font(ctx, true);
+            }
+            SettingsAct::Theme(id) => self.desk.set_theme(&id),
+        }
+    }
+
+    /// Apply `session.font` once it changes. `announce` writes the Python status lines.
+    fn sync_font(&mut self, ctx: &egui::Context, announce: bool) {
+        let id = if self.desk.session.font.is_empty() {
+            vmi_core::fonts::DEFAULT_FACE.to_string()
+        } else {
+            self.desk.session.font.clone()
+        };
+        if self.applied_font == id {
+            return;
+        }
+        let name = vmi_core::fonts::face(&id).map(|face| face.label).unwrap_or_else(|| id.clone());
+        match face_bytes(&id) {
+            Ok(bytes) => {
+                install_face(ctx, bytes);
+                self.applied_font = id;
+                if announce {
+                    self.desk.status = format!("UI font: {name}");
+                }
+            }
+            Err(_) => {
+                if announce {
+                    self.desk.status = format!("Could not load {name}.");
+                }
+                if id != vmi_core::fonts::DEFAULT_FACE {
+                    self.desk.set_font(vmi_core::fonts::DEFAULT_FACE);
+                }
+                self.applied_font = vmi_core::fonts::DEFAULT_FACE.to_string();
+                install_face(ctx, vmi_core::fonts::house_bytes());
+            }
         }
     }
 
@@ -2447,9 +2538,13 @@ fn apply_theme(ctx: &egui::Context, theme: &Theme) {
 /// The house face when the font cache has it, else one mono face for all
 /// the chrome. The Python app unpacks faces into `~/.cache/vmi-studio/fonts`.
 fn install_fonts(ctx: &egui::Context) {
+    install_face(ctx, vmi_core::fonts::house_bytes().or_else(house_font));
+}
+
+fn install_face(ctx: &egui::Context, named: Option<(String, Vec<u8>)>) {
     let mut fonts = egui::FontDefinitions::default();
     let mono = fonts.families.get(&egui::FontFamily::Monospace).cloned().unwrap_or_default();
-    match house_font() {
+    match named {
         Some((name, bytes)) => {
             fonts.font_data.insert(name.clone(), egui::FontData::from_owned(bytes));
             let mut stack = vec![name];
@@ -2462,6 +2557,20 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// Bytes for a face id. `monospace` is the house stack and never downloads.
+fn face_bytes(id: &str) -> Result<Option<(String, Vec<u8>)>, String> {
+    if id.is_empty() || id == vmi_core::fonts::DEFAULT_FACE {
+        return Ok(vmi_core::fonts::house_bytes());
+    }
+    let face = vmi_core::fonts::face(id).ok_or_else(|| format!("Could not load {id}."))?;
+    let path = vmi_core::fonts::ensure(&face)?;
+    let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+    if !vmi_core::fonts::looks_like_font(&bytes) {
+        return Err(format!("Could not load {}.", face.label));
+    }
+    Ok(Some((face.id, bytes)))
 }
 
 /// courier-pixel first, then sometype-mono, from the shared font cache.
@@ -2483,6 +2592,7 @@ fn house_font() -> Option<(String, Vec<u8>)> {
 impl eframe::App for StudioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx, self.desk.theme());
+        self.sync_font(ctx, false);
         self.keys(ctx);
         self.text_focused = false;
         self.windows(ctx);
@@ -2593,6 +2703,18 @@ impl eframe::App for StudioApp {
                         });
                     }
                 });
+                let font_id = self.desk.session.font.clone();
+                let theme_id = self.desk.session.theme.clone();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let act = ui
+                        .allocate_ui_with_layout(
+                            egui::vec2(380.0, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| self.settings.show(ui, &font_id, &theme_id),
+                        )
+                        .inner;
+                    self.apply_settings(ctx, act);
+                });
             });
         });
         egui::TopBottomPanel::top("tabs")
@@ -2614,6 +2736,7 @@ impl eframe::App for StudioApp {
         });
         if self.desk.on_browser {
             egui::CentralPanel::default().show(ctx, |ui| self.browser_page(ui));
+            self.overlays(ctx);
             self.desk.flush_session();
             return;
         }
@@ -2659,6 +2782,7 @@ impl eframe::App for StudioApp {
         });
         self.desk.note_widths(left.response.rect.width(), brushes.response.rect.width());
         self.desk.note_areas(right.response.rect.width(), bottom.response.rect.height(), &self.areas.ids());
+        self.overlays(ctx);
         self.desk.flush_session();
     }
 

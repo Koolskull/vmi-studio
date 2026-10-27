@@ -311,7 +311,16 @@ impl Desk {
     pub fn set_theme(&mut self, id: &str) {
         self.session.theme = theme_or_studio(id).id.to_string();
         self.session_dirty = true;
-        self.status = format!("{} theme.", self.theme().name);
+        self.status = format!("Theme: {}", self.theme().name);
+    }
+
+    /// The header's font menu. `monospace` is the house stack.
+    pub fn set_font(&mut self, id: &str) {
+        if self.session.font == id {
+            return;
+        }
+        self.session.font = id.to_string();
+        self.session_dirty = true;
     }
 
     pub fn preset(&self) -> &ToolSettings {

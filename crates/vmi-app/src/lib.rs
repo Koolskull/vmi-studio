@@ -8,25 +8,25 @@ pub mod icons;
 pub mod tablet;
 
 #[cfg(feature = "window")]
-mod cloudui;
+pub mod cloudui;
 #[cfg(feature = "window")]
-mod effects;
+pub mod effects;
 #[cfg(feature = "window")]
-mod exportui;
+pub mod exportui;
 #[cfg(feature = "window")]
-mod gate;
+pub mod gate;
 #[cfg(feature = "window")]
-mod launch;
+pub mod launch;
 #[cfg(feature = "window")]
-mod newpage;
+pub mod newpage;
 #[cfg(feature = "window")]
-mod settings;
+pub mod settings;
 #[cfg(feature = "window")]
-mod sheet;
+pub mod sheet;
 #[cfg(feature = "window")]
-mod taskboard;
+pub mod taskboard;
 #[cfg(feature = "window")]
-mod ui;
+pub mod ui;
 
 #[cfg(feature = "window")]
 pub fn run() -> eframe::Result<()> {

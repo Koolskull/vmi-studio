@@ -8,16 +8,16 @@
 //! skin (`vmi_studio/onion.py`) is a view: `present` tints the neighbour cels
 //! when `Art::onion` is on, `present_plain` never does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::anim::{
-    animation_folder_ids, cel_at, onion_neighbors, onion_strength, ExposureSheet, DEFAULT_FPS, FUTURE, ONION_LIMIT,
-    ONION_TINT, PAST,
+    animation_folder_ids, cel_at, onion_neighbors, onion_strength, timeline_cels, ExposureSheet, DEFAULT_FPS, FUTURE,
+    ONION_LIMIT, ONION_TINT, PAST,
 };
 use crate::blend::{mix, mix_hsl};
 use crate::color::Rgba;
 use crate::coverage::source_over;
-use crate::kosv::{CelMark, Effect, Kosv};
+use crate::kosv::{self, CelMark, Effect, Kosv, Maps, Param, Picture};
 use crate::tasks::{Task, TaskColors};
 use crate::vector::{Raster, VectorStroke};
 
@@ -362,9 +362,16 @@ fn branch_solo(node: &Node) -> bool {
 /// Paper is clear. The viewfinder draws the checker behind this. Onion skin
 /// follows `art.onion`.
 pub fn present(art: &mut Art) -> Vec<u8> {
+    present_live(art, None)
+}
+
+/// `present` with the KOSV grain clock. `live` is the window's 84 ms tick
+/// while a live effect (grain, jiggle, VHS, the glitches) is on the picture;
+/// None keeps the grain locked to the playhead frame.
+pub fn present_live(art: &mut Art, live: Option<i64>) -> Vec<u8> {
     let width = art.width;
     let height = art.height;
-    present_region(art, [0, 0, width as i32, height as i32])
+    present_region_live(art, [0, 0, width as i32, height as i32], live)
 }
 
 /// The picture with onion skin off whatever `art.onion` says. Export and the
@@ -379,23 +386,53 @@ pub fn present_plain(art: &mut Art) -> Vec<u8> {
 /// its first pixel is the document pixel at `(x0, y0)`. A pen move only needs
 /// the pixels it touched. Onion skin follows `art.onion`.
 pub fn present_region(art: &mut Art, rect: [i32; 4]) -> Vec<u8> {
+    present_region_live(art, rect, None)
+}
+
+/// `present_region` with the KOSV grain clock.
+pub fn present_region_live(art: &mut Art, rect: [i32; 4], live: Option<i64>) -> Vec<u8> {
     let onion = art.onion;
-    compose_region(art, rect, onion)
+    compose_region(art, rect, onion, live)
 }
 
 /// `present_region` with onion skin off.
 pub fn present_region_plain(art: &mut Art, rect: [i32; 4]) -> Vec<u8> {
-    compose_region(art, rect, false)
+    compose_region(art, rect, false, None)
 }
 
-fn compose_region(art: &mut Art, rect: [i32; 4], onion: bool) -> Vec<u8> {
+fn compose_region(art: &mut Art, rect: [i32; 4], onion: bool, live: Option<i64>) -> Vec<u8> {
     let [x0, y0, x1, y1] = clamp_rect(rect, art.width, art.height);
     let rw = (x1 - x0).max(0) as u32;
     let rh = (y1 - y0).max(0) as u32;
-    let mut dst = vec![0u8; (rw as usize).saturating_mul(rh as usize).saturating_mul(4)];
     if rw == 0 || rh == 0 {
-        return dst;
+        return Vec::new();
     }
+    // A KOSV stack reads the whole plate: the grain, the line shifts, and the
+    // datamosh cels do not stop at a pen move's rectangle. With a stack on
+    // the picture the whole plate composites, like the Python, then the
+    // region is cut from it.
+    let jobs = effect_jobs(art);
+    let whole = !jobs.is_empty() && (x0 != 0 || y0 != 0 || rw != art.width || rh != art.height);
+    if whole {
+        let width = art.width;
+        let height = art.height;
+        let full = compose_whole(art, [0, 0, width as i32, height as i32], onion, live, &jobs);
+        let mut out = vec![0u8; (rw as usize) * (rh as usize) * 4];
+        for row in 0..rh as usize {
+            let src = ((y0 as usize + row) * width as usize + x0 as usize) * 4;
+            let dst = row * rw as usize * 4;
+            out[dst..dst + rw as usize * 4].copy_from_slice(&full[src..src + rw as usize * 4]);
+        }
+        return out;
+    }
+    compose_whole(art, [x0, y0, x1, y1], onion, live, &jobs)
+}
+
+fn compose_whole(art: &mut Art, rect: [i32; 4], onion: bool, live: Option<i64>, jobs: &HashMap<String, Job>) -> Vec<u8> {
+    let [x0, y0, x1, y1] = rect;
+    let rw = (x1 - x0).max(0) as u32;
+    let rh = (y1 - y0).max(0) as u32;
+    let mut dst = vec![0u8; (rw as usize).saturating_mul(rh as usize).saturating_mul(4)];
     let roots = animation_folder_ids(&art.layers);
     let ctx = Ctx {
         width: art.width,
@@ -405,12 +442,207 @@ fn compose_region(art: &mut Art, rect: [i32; 4], onion: bool) -> Vec<u8> {
         solo_on: any_solo(&art.layers),
         roots: &roots,
         solo: false,
+        frame: i64::from(art.playhead),
+        live,
+        jobs: Some(jobs),
     };
     paint_list(&mut art.layers, Target { buf: &mut dst, w: rw, h: rh, ox: x0, oy: y0 }, &ctx);
     if onion {
         apply_onion(art, &roots, Target { buf: &mut dst, w: rw, h: rh, ox: x0, oy: y0 });
     }
     dst
+}
+
+/// The KOSV stack to run on one painted row, with the pictures its reference
+/// slots and datamosh cels read. Python's `_kosv_paint` builds these as it
+/// paints; here they are gathered first, since the painter holds the tree.
+struct Job {
+    effects: Vec<Effect>,
+    maps: Maps,
+}
+
+/// One row that paints with a stack: the row's id, the stack, and the
+/// animation folder whose cels a datamosh reads.
+struct Plan {
+    painted: String,
+    effects: Vec<Effect>,
+    source: Option<String>,
+}
+
+/// Every row that paints with a stack this frame. A cel standing in for its
+/// animation folder runs the folder's stack before its own, reading the
+/// folder's cel marks (Python's `_View`).
+fn effect_jobs(art: &mut Art) -> HashMap<String, Job> {
+    let roots = animation_folder_ids(&art.layers);
+    let mut plans = Vec::new();
+    plan_effects(&art.layers, &roots, art.playhead, &mut plans);
+    if plans.is_empty() {
+        return HashMap::new();
+    }
+    let mut wanted: HashSet<String> = HashSet::new();
+    for plan in &plans {
+        for effect in &plan.effects {
+            for slot in kosv::REFS {
+                if let Some(Param::Text(id)) = effect.params.get(*slot) {
+                    if !id.is_empty() {
+                        wanted.insert(id.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut refs: HashMap<String, Picture> = HashMap::new();
+    for id in wanted {
+        if let Some(picture) = layer_picture(art, &id) {
+            refs.insert(id, picture);
+        }
+    }
+    let mut shots: HashMap<String, (Vec<Picture>, Vec<CelMark>, Vec<String>)> = HashMap::new();
+    let mut jobs = HashMap::new();
+    for plan in plans {
+        let mut maps = Maps::default();
+        for effect in &plan.effects {
+            for slot in kosv::REFS {
+                let Some(Param::Text(id)) = effect.params.get(*slot) else {
+                    continue;
+                };
+                let Some(picture) = refs.get(id) else {
+                    continue;
+                };
+                let target = match *slot {
+                    "plate" => &mut maps.plate,
+                    "shape" => &mut maps.shape,
+                    "clip" => &mut maps.clip,
+                    "matte" => &mut maps.matte,
+                    _ => &mut maps.other,
+                };
+                *target = Some(picture.clone());
+            }
+        }
+        if plan.effects.iter().any(|effect| effect.id == "datamosh") {
+            let source = plan.source.clone().unwrap_or_else(|| plan.painted.clone());
+            if !shots.contains_key(&source) {
+                shots.insert(source.clone(), datamosh_cels(art, &source));
+            }
+            if let Some((frames, marks, ids)) = shots.get(&source) {
+                maps.frames = frames.clone();
+                maps.marks = marks.clone();
+                maps.ids = ids.clone();
+                // The index is this cel, not the clock. The clock still drives keyed knobs.
+                maps.index = ids.iter().position(|id| *id == plan.painted).unwrap_or(0);
+            }
+        }
+        jobs.insert(plan.painted, Job { effects: plan.effects, maps });
+    }
+    jobs
+}
+
+fn plan_effects(nodes: &[Node], roots: &[String], playhead: u32, out: &mut Vec<Plan>) {
+    for node in nodes {
+        if node.kind == NodeKind::Group && roots.contains(&node.id) {
+            if let Some(cel) = cel_at(node, playhead) {
+                let mut effects = node.effects.clone();
+                effects.extend(cel.effects.iter().cloned());
+                if !effects.is_empty() {
+                    out.push(Plan { painted: cel.id.clone(), effects, source: Some(node.id.clone()) });
+                }
+            }
+            continue;
+        }
+        if !node.effects.is_empty() {
+            out.push(Plan { painted: node.id.clone(), effects: node.effects.clone(), source: None });
+        }
+        if node.kind == NodeKind::Group {
+            plan_effects(&node.children, roots, playhead, out);
+        }
+    }
+}
+
+/// RGBA picture of one layer, for a KOSV map slot. A folder gives nothing,
+/// like Python's `_layer_image`.
+fn layer_picture(art: &mut Art, id: &str) -> Option<Picture> {
+    let width = art.width;
+    let height = art.height;
+    let node = find_mut(&mut art.layers, id)?;
+    if node.kind != NodeKind::Layer {
+        return None;
+    }
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    blit_layer(node, Target { buf: &mut rgba, w: width, h: height, ox: 0, oy: 0 }, width, height);
+    Some(Picture { width, height, rgba })
+}
+
+/// Every cel of an animation folder as its own picture, with the folder's
+/// mark on each (I when it has none), in timeline order.
+fn datamosh_cels(art: &mut Art, folder_id: &str) -> (Vec<Picture>, Vec<CelMark>, Vec<String>) {
+    let Some(folder) = find(&art.layers, folder_id) else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    let ids: Vec<String> = timeline_cels(folder).iter().map(|cel| cel.id.clone()).collect();
+    let marks: Vec<CelMark> = ids
+        .iter()
+        .map(|id| {
+            folder.cel_marks.get(id).cloned().unwrap_or(CelMark {
+                kind: "I".into(),
+                reference: String::new(),
+                origin: String::new(),
+                gain: None,
+                block: None,
+            })
+        })
+        .collect();
+    let frames: Vec<Picture> = ids.iter().filter_map(|id| cel_shot(art, id)).collect();
+    if frames.len() != ids.len() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    (frames, marks, ids)
+}
+
+/// One cel's picture: a layer's pixels, or a folder flattened once, as it is.
+fn cel_shot(art: &mut Art, id: &str) -> Option<Picture> {
+    let width = art.width;
+    let height = art.height;
+    let node = find_mut(&mut art.layers, id)?;
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    let target = Target { buf: &mut rgba, w: width, h: height, ox: 0, oy: 0 };
+    if node.kind == NodeKind::Layer {
+        blit_layer(node, target, width, height);
+    } else {
+        let ctx = Ctx {
+            width,
+            height,
+            playhead: 0,
+            gated: false,
+            solo_on: false,
+            roots: &[],
+            solo: false,
+            frame: 0,
+            live: None,
+            jobs: None,
+        };
+        paint_list(&mut node.children, target, &ctx);
+    }
+    Some(Picture { width, height, rgba })
+}
+
+/// Run a row's stack on its painted plate. The plate is the region being
+/// composited; with a stack on the picture that is the whole plate.
+fn run_effects(plate: &mut [u8], target_w: u32, target_h: u32, id: &str, ctx: &Ctx<'_>) {
+    let Some(jobs) = ctx.jobs else {
+        return;
+    };
+    let Some(job) = jobs.get(id) else {
+        return;
+    };
+    let out = kosv::apply_effects(plate, target_w, target_h, &job.effects, ctx.frame, &job.maps, ctx.live);
+    if out.len() == plate.len() {
+        plate.copy_from_slice(&out);
+    }
+}
+
+/// A stack on this row, or on the folder this cel stands in for.
+fn has_job(node: &Node, item: &Item, ctx: &Ctx<'_>) -> bool {
+    ctx.jobs.map(|jobs| jobs.contains_key(&actual(node, item).id)).unwrap_or(false)
 }
 
 /// How the picture reads one row. The same rules as `document.gate_of`.
@@ -446,6 +678,12 @@ struct Ctx<'a> {
     roots: &'a [String],
     /// An ancestor is soloed, so this branch is in.
     solo: bool,
+    /// The KOSV frame for keyed knobs: the playhead.
+    frame: i64,
+    /// The KOSV grain clock, when a live effect is on the picture.
+    live: Option<i64>,
+    /// The stacks that run this frame, by painted row id. None runs none.
+    jobs: Option<&'a HashMap<String, Job>>,
 }
 
 impl Ctx<'_> {
@@ -566,12 +804,16 @@ fn paint_stack(nodes: &mut [Node], index: usize, item: &Item, clips: &[(usize, I
         (node.kind, node.opacity, node.blend.clone())
     };
     let inner = ctx.child(item.solo);
-    if kind == NodeKind::Group && is_pass(&blend) && clips.is_empty() && opacity == 255 {
+    // A row with a stack is flattened first. Pass-through would paint the
+    // children raw and skip the folder look; a plain blit would skip a
+    // layer's. The stack then covers everything that was inside.
+    let styled = has_job(&nodes[index], item, ctx);
+    if kind == NodeKind::Group && is_pass(&blend) && clips.is_empty() && opacity == 255 && !styled {
         let node = actual_mut(&mut nodes[index], item);
         paint_list(&mut node.children, Target { buf: dst, w, h, ox, oy }, &inner);
         return;
     }
-    if kind == NodeKind::Layer && clips.is_empty() && opacity == 255 && is_normal(&blend) {
+    if kind == NodeKind::Layer && clips.is_empty() && opacity == 255 && is_normal(&blend) && !styled {
         let node = actual_mut(&mut nodes[index], item);
         blit_layer(node, Target { buf: dst, w, h, ox, oy }, ctx.width, ctx.height);
         return;
@@ -585,13 +827,16 @@ fn paint_stack(nodes: &mut [Node], index: usize, item: &Item, clips: &[(usize, I
 }
 
 /// This row's paint before its blend hits the parent: a flattened folder, or a
-/// layer's pixels with its strokes on top, at full opacity.
+/// layer's pixels with its strokes on top, at full opacity. The row's KOSV
+/// stack runs on that paint (Python's `_kosv_paint`).
 fn appearance(node: &mut Node, target: Target<'_>, inner: &Ctx<'_>) {
+    let Target { buf, w, h, ox, oy } = target;
     if node.kind == NodeKind::Group {
-        paint_list(&mut node.children, target, inner);
+        paint_list(&mut node.children, Target { buf: &mut *buf, w, h, ox, oy }, inner);
     } else {
-        blit_layer(node, target, inner.width, inner.height);
+        blit_layer(node, Target { buf: &mut *buf, w, h, ox, oy }, inner.width, inner.height);
     }
+    run_effects(buf, w, h, &node.id, inner);
 }
 
 /// Paint one row onto `target` with its own blend and opacity. `clip` keeps
@@ -632,6 +877,9 @@ fn cel_plate(art: &mut Art, id: &str, w: u32, h: u32, ox: i32, oy: i32) -> Vec<f
         solo_on: false,
         roots: &[],
         solo: false,
+        frame: i64::from(art.playhead),
+        live: None,
+        jobs: None,
     };
     let Some(node) = find_mut(&mut art.layers, id) else {
         return out;
@@ -1150,5 +1398,64 @@ mod tests {
         find_mut(&mut art.layers, "anim").unwrap().clip = true;
         art.layers.remove(0);
         assert_eq!(present(&mut art), CLEAR.to_vec(), "a clipping animation folder needs a base too");
+    }
+
+    #[test]
+    fn a_stack_gathers_its_reference_plates_and_the_datamosh_cels_first() {
+        let mut art = Art::blank(3, 1);
+        let mut loose = Node::layer("loose", "Loose", 3, 1);
+        paint(&mut loose, 3, 1, 0, YELLOW);
+        art.layers = vec![
+            solid(3, 1, "paper", "Paper", WHITE),
+            folder("one", 3, 0, &[("a", RED), ("b", GREEN), ("c", BLUE)], &[0, 2, 5]),
+            loose,
+        ];
+        assert!(effect_jobs(&mut art).is_empty(), "no stack, no work");
+
+        // A datamosh on the animation folder: the cel at the playhead paints
+        // with the folder's stack and reads every cel in timeline order, with
+        // the folder's marks (I when it has none).
+        let datamosh = kosv::make_effect("datamosh", &[], "", true).unwrap();
+        {
+            let one = find_mut(&mut art.layers, "one").unwrap();
+            one.effects.push(datamosh.clone());
+            one.cel_marks.insert(
+                "b".into(),
+                CelMark { kind: "P".into(), reference: String::new(), origin: String::new(), gain: Some(1.0), block: None },
+            );
+        }
+        art.playhead = 3;
+        let jobs = effect_jobs(&mut art);
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.get("b").expect("the cel held at frame 3 runs the folder's stack");
+        assert_eq!(job.effects.len(), 1);
+        assert_eq!(job.effects[0].id, "datamosh");
+        assert_eq!(job.maps.ids, ["a", "b", "c"]);
+        assert_eq!(job.maps.index, 1);
+        assert_eq!(job.maps.frames.len(), 3);
+        assert_eq!(px(&job.maps.frames[2].rgba, 3, 0, 0), BLUE);
+        let kinds: Vec<&str> = job.maps.marks.iter().map(|mark| mark.kind.as_str()).collect();
+        assert_eq!(kinds, ["I", "P", "I"]);
+
+        // A reference slot names a layer: its picture rides along. A folder
+        // in a slot gives nothing. The cel's own stack runs after the folder's.
+        let mut grain = kosv::make_effect("grain-plate", &[], "", true).unwrap();
+        grain.params.insert("plate".into(), Param::Text("loose".into()));
+        grain.params.insert("shape".into(), Param::Text("one".into()));
+        find_mut(&mut art.layers, "b").unwrap().effects.push(grain);
+        let jobs = effect_jobs(&mut art);
+        let job = jobs.get("b").unwrap();
+        assert_eq!(job.effects.iter().map(|effect| effect.id.as_str()).collect::<Vec<_>>(), ["datamosh", "grain-plate"]);
+        let plate = job.maps.plate.as_ref().expect("the loose layer is the plate");
+        assert_eq!((plate.width, plate.height), (3, 1));
+        assert_eq!(px(&plate.rgba, 3, 1, 0), YELLOW);
+        assert!(job.maps.shape.is_none());
+
+        // With a stack on the picture a pen move's region still comes from
+        // the whole plate, and reads the same.
+        let full = present(&mut art);
+        let part = present_region(&mut art, [1, 0, 3, 1]);
+        assert_eq!(part.len(), 2 * 4);
+        assert_eq!(&part[..], &full[4..12]);
     }
 }

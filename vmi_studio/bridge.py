@@ -87,6 +87,8 @@ def dump_art(art, manifest, rasters):
         "height": int(art.height),
         "file_name": art.file_name or "",
         "path": art.path or "",
+        "kind": getattr(art, "kind", "") or "",
+        "note": getattr(art, "note", "") or "",
         "rasters_dir": rasters,
         "layers": [_node(node, rasters, used) for node in art.layers],
     }
@@ -108,7 +110,12 @@ def main(argv=None):
     try:
         from vmi_studio.openers import open_drawing
 
-        art = open_drawing(args.file)
+        # The Rust desk reads these lines while the file opens and shows them
+        # on its load gate, the way the window hears LoadThread's notes.
+        def progress(text):
+            print("note %s" % text, flush=True)
+
+        art = open_drawing(args.file, progress=progress)
         dump_art(art, args.manifest, args.rasters)
     except Exception as exc:
         print(str(exc), file=sys.stderr)

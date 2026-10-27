@@ -1,11 +1,15 @@
 //! Desk actions. The window calls these. A raster release writes pixels and
 //! drops the path. A vector release keeps the stroke and rebuilds its cache.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use vmi_core::anim;
 use vmi_core::doc::blit_into;
+use vmi_core::newpage::{blank_picture, opened_note};
+use vmi_core::tabs::{default_export_parent, same_export};
 use vmi_core::{
     clamp_rect, cut_folder, erase_folder, export_png, find, find_mut, hex_of, hit_stroke, load_manifest, load_session,
     load_vmib, palette_action, parent_of, parse_hex, point_inside, present_region, rect_points, save_session,
@@ -58,6 +62,78 @@ pub struct SheetPick {
     pub folder: String,
     pub start: u32,
     pub count: u32,
+}
+
+/// One open drawing, one export folder. Tabs do not share an output path.
+/// An empty path is a picture that has not been saved yet.
+#[derive(Debug)]
+pub struct OpenTab {
+    pub path: String,
+    pub export_dir: PathBuf,
+    pub loaded: bool,
+    /// Low res fits the plate to the view. High res keeps every document pixel.
+    pub low_res: bool,
+    /// The drawing and its desk state while another tab is on the desk.
+    stash: Option<Box<Stash>>,
+}
+
+impl OpenTab {
+    fn at(path: &Path) -> Self {
+        let path = absolute(path);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self {
+            export_dir: default_export_parent(&path, &cwd),
+            path: path.display().to_string(),
+            loaded: false,
+            low_res: false,
+            stash: None,
+        }
+    }
+
+    fn unsaved() -> Self {
+        Self { path: String::new(), export_dir: home_dir(), loaded: false, low_res: true, stash: None }
+    }
+}
+
+/// What leaves the desk when another tab comes up, and returns with the tab.
+#[derive(Debug)]
+struct Stash {
+    art: Art,
+    history: History,
+    selected: Option<String>,
+    camera: Camera,
+    fitted: bool,
+    cut_points: Vec<[f32; 2]>,
+    cut_closed: bool,
+    warp_draft: Vec<[f32; 2]>,
+    warp_layer: Option<String>,
+    sheet_pick: Option<SheetPick>,
+}
+
+enum LoadMsg {
+    Note(String),
+    Done(Result<Art, String>),
+}
+
+/// A file being read on its own thread, for the tab at `index`.
+struct Loading {
+    index: usize,
+    rx: Receiver<LoadMsg>,
+}
+
+/// What the desk tells the window about reads and tab changes, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadEvent {
+    /// A read began for this file name. The gate opens.
+    Started(String),
+    /// A loaded tab came up. The gate opens in catch-up mode until the plate is painted.
+    Catchup(String),
+    /// A stage note: "Reading x", "Converting Clip Studio paint"...
+    Note(String),
+    /// The picture is on the desk. The gate can leave once it is painted.
+    Shown,
+    /// The read failed. The gate leaves at once; the text goes to the status bar.
+    Failed(String),
 }
 
 enum Gesture {
@@ -129,6 +205,15 @@ pub struct Desk {
     pub loop_wrap: bool,
     /// Ones, twos, or threes: how long a new cel holds.
     pub hold: u32,
+    /// Every open drawing, left to right after the browser tab.
+    pub tabs: Vec<OpenTab>,
+    /// The tab whose drawing is on the desk. None with no tab shown.
+    pub shown: Option<usize>,
+    /// The launcher page is up instead of the editor.
+    pub on_browser: bool,
+    /// Events the loading thread sent since the window last asked.
+    load_events: Vec<LoadEvent>,
+    loading: Option<Loading>,
     /// Seconds owed to the next frame while playing.
     play_clock: f64,
     /// Play was just pressed: the first tick's frame time is the idle gap
@@ -179,6 +264,11 @@ impl Desk {
             loop_play: true,
             loop_wrap: false,
             hold: 2,
+            tabs: Vec::new(),
+            shown: None,
+            on_browser: true,
+            load_events: Vec::new(),
+            loading: None,
             play_clock: 0.0,
             play_armed: false,
             history: History::default(),
@@ -198,17 +288,15 @@ impl Desk {
         desk
     }
 
+    /// The desk comes up on the browser tab, like the Python window. The
+    /// session's path seeds the launcher; nothing opens by itself.
     pub fn launch() -> Self {
         let mut desk = Self::new(load_session());
         desk.persist = true;
-        if !desk.session.path.is_empty() {
-            let path = PathBuf::from(&desk.session.path);
-            if path.is_file() {
-                if let Err(err) = desk.open_path(&path) {
-                    desk.status = err;
-                }
-            }
-        }
+        desk.art = Art::blank(1, 1);
+        desk.selected = None;
+        desk.ensure_overlay();
+        desk.status = "Open a .clip, .psd, .kra, .xcf, or .vmib file.".into();
         desk
     }
 
@@ -451,39 +539,499 @@ impl Desk {
         self.history.push(before);
     }
 
+    /// A plain 1280×720 drawing in a new unsaved tab.
     pub fn new_document(&mut self) {
-        self.finish_new(Art::new(1280, 720));
-        self.session.path.clear();
-        self.session_dirty = true;
+        let mut art = Art::new(1280, 720);
+        art.file_name = self.fresh_title(1280, 720);
+        self.begin_blank(art, false);
         self.status = "New 1280×720 drawing.".into();
     }
 
+    /// Read a file on this thread and show it in its tab. The window uses
+    /// `begin_open`, which reads on another thread behind the load gate.
     pub fn open_path(&mut self, path: &Path) -> Result<(), String> {
         if !path.is_file() {
             return Err("That file is missing.".into());
         }
-        let art = if extension_is(path, "vmib") {
-            load_vmib(path)?
-        } else {
-            open_with_python(path)?
-        };
-        self.finish_new(art);
-        self.session.path = path.display().to_string();
-        self.session_dirty = true;
-        self.status = format!("Opened {}.", path.display());
+        let path = absolute(path);
+        if let Some(index) = self.tab_at(&path) {
+            self.select_tab(Some(index));
+            return Ok(());
+        }
+        let art = read_drawing(&path, &|_| {})?;
+        self.stash_shown();
+        let index = self.begin_tab(&path, false);
+        self.land(index, art);
         Ok(())
     }
 
+    /// Ctrl+S. An open blueprint is overwritten. A drawing is saved beside it.
     pub fn save_blueprint(&mut self, path: &Path) -> Result<(), String> {
-        write_vmib(&mut self.art, path)?;
+        let path = absolute(path);
+        write_vmib(&mut self.art, &path)?;
         self.art.path = path.display().to_string();
+        self.art.kind = "vmib".into();
         if let Some(name) = path.file_name() {
             self.art.file_name = name.to_string_lossy().to_string();
         }
+        if let Some(tab) = self.shown.and_then(|index| self.tabs.get_mut(index)) {
+            tab.path = self.art.path.clone();
+        }
         self.session.path = self.art.path.clone();
         self.session_dirty = true;
-        self.status = format!("Saved {}.", path.display());
+        self.status = format!("Saved {}.", self.art.file_name);
         Ok(())
+    }
+
+    /// The blueprint path Ctrl+S writes without asking: an open blueprint's own.
+    pub fn blueprint_path(&self) -> Option<PathBuf> {
+        if self.art.kind == "vmib" && !self.art.path.is_empty() {
+            Some(PathBuf::from(&self.art.path))
+        } else {
+            None
+        }
+    }
+
+    /// Where Save blueprint as starts: beside the drawing, as `<stem>.vmib`.
+    pub fn suggested_blueprint(&self) -> PathBuf {
+        let start = if self.art.path.is_empty() {
+            home_dir()
+        } else {
+            Path::new(&self.art.path).parent().map(Path::to_path_buf).unwrap_or_else(home_dir)
+        };
+        let name = if self.art.file_name.is_empty() { "project" } else { self.art.file_name.as_str() };
+        let stem = match name.rfind('.') {
+            Some(dot) if dot > 0 => &name[..dot],
+            _ => name,
+        };
+        start.join(format!("{stem}.vmib"))
+    }
+
+    /// File → New picture, and the launcher button. The plate comes from the
+    /// New picture dialog; Paper sits under Ink, the 2kool grid on top.
+    pub fn open_blank(
+        &mut self,
+        width: i64,
+        height: i64,
+        background: &str,
+        texture: Option<&Path>,
+        grid: bool,
+    ) -> Result<(), String> {
+        if self.loading.is_some() {
+            self.status = "Still reading.".into();
+            return Ok(());
+        }
+        let (wide, high) = vmi_core::newpage::parse_plate(width, height)?;
+        let title = self.fresh_title(wide, high);
+        let art = blank_picture(width, height, &title, background, texture, grid)?;
+        let note = opened_note(&art);
+        self.begin_blank(art, true);
+        let ink = self
+            .art
+            .layers
+            .iter()
+            .find(|node| node.name == "Ink")
+            .or_else(|| self.art.layers.first())
+            .map(|node| node.id.clone());
+        if let Some(id) = ink {
+            self.selected = Some(id);
+        }
+        let tool = self.session.tool;
+        self.edit_preset(tool, |slot| slot.color = [255, 255, 255]);
+        self.status = note;
+        Ok(())
+    }
+
+    /// "Untitled W×H", then "Untitled W×H 2"... past every open drawing's name.
+    fn fresh_title(&self, width: u32, height: u32) -> String {
+        let base = format!("Untitled {width}×{height}");
+        let mut names: Vec<&str> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.stash.as_ref().map(|stash| stash.art.file_name.as_str()))
+            .collect();
+        if !self.art.file_name.is_empty() && self.shown.is_some() {
+            names.push(self.art.file_name.as_str());
+        }
+        if !names.contains(&base.as_str()) {
+            return base;
+        }
+        let mut number = 2;
+        while names.contains(&format!("{base} {number}").as_str()) {
+            number += 1;
+        }
+        format!("{base} {number}")
+    }
+
+    /// A tab with no path. Save blueprint asks where the file goes.
+    fn begin_blank(&mut self, art: Art, low_res: bool) {
+        self.stash_shown();
+        let mut tab = OpenTab::unsaved();
+        tab.low_res = low_res;
+        self.tabs.push(tab);
+        let index = self.tabs.len() - 1;
+        self.shown = Some(index);
+        self.on_browser = false;
+        self.land(index, art);
+    }
+
+    /// Add a project tab to the right of the browser. Returns the tab index.
+    fn begin_tab(&mut self, path: &Path, low_res: bool) -> usize {
+        let mut tab = OpenTab::at(path);
+        tab.low_res = low_res;
+        self.tabs.push(tab);
+        let index = self.tabs.len() - 1;
+        self.shown = Some(index);
+        self.on_browser = false;
+        index
+    }
+
+    /// The read drawing lands on the desk in its tab.
+    fn land(&mut self, index: usize, mut art: Art) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if art.path.is_empty() && !tab.path.is_empty() {
+            art.path = tab.path.clone();
+        }
+        tab.loaded = true;
+        tab.stash = None;
+        let low_res = tab.low_res;
+        self.stop();
+        self.finish_new(art);
+        self.place_picture(low_res);
+        self.shown = Some(index);
+        self.on_browser = false;
+        self.session.path = self.art.path.clone();
+        self.session_dirty = true;
+        self.status = self.opened_text();
+    }
+
+    /// "name  W×H  note", plus the warp counts when the drawing has any.
+    fn opened_text(&self) -> String {
+        let note = if self.art.note.is_empty() { "Opened." } else { self.art.note.as_str() };
+        let mut text = format!("{}  {}×{}  {}", self.art.file_name, self.art.width, self.art.height, note);
+        let (targets, windows) = warp_counts(&self.art.layers);
+        if targets > 0 || windows > 0 {
+            text.push_str(&format!("  Warp targets: {targets}. Windows: {windows}."));
+        }
+        text
+    }
+
+    /// High res keeps every document pixel. Low res fits a smaller plate.
+    fn place_picture(&mut self, low_res: bool) {
+        if low_res {
+            self.fitted = false;
+        } else {
+            self.actual();
+        }
+    }
+
+    /// Open from the launcher or a path: the file is read on its own thread
+    /// while the load gate holds the desk. True when a read began.
+    pub fn begin_open(&mut self, path: &Path, low_res: bool) -> bool {
+        if self.loading.is_some() {
+            self.status = "Still reading.".into();
+            return false;
+        }
+        let path = absolute(path);
+        let name = basename(&path);
+        if let Some(index) = self.tab_at(&path) {
+            if low_res {
+                self.tabs[index].low_res = true;
+            }
+            self.select_tab(Some(index));
+            self.status = format!("{name} is already open.");
+            return false;
+        }
+        self.stash_shown();
+        let index = self.begin_tab(&path, low_res);
+        self.status = format!("Reading {name}");
+        self.load_events.push(LoadEvent::Started(name));
+        let (tx, rx): (Sender<LoadMsg>, Receiver<LoadMsg>) = mpsc::channel();
+        std::thread::spawn(move || {
+            let notes = tx.clone();
+            let result = read_drawing(&path, &|text| {
+                let _ = notes.send(LoadMsg::Note(text.to_string()));
+            });
+            let _ = tx.send(LoadMsg::Done(result));
+        });
+        self.loading = Some(Loading { index, rx });
+        true
+    }
+
+    /// A file is being read.
+    pub fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// Hear the loading thread. Call once per frame; the events come out of
+    /// `take_load_events`.
+    pub fn poll_load(&mut self) {
+        let Some(loading) = self.loading.as_ref() else {
+            return;
+        };
+        let index = loading.index;
+        let finished = loop {
+            match loading.rx.try_recv() {
+                Ok(LoadMsg::Note(text)) => {
+                    self.status = text.clone();
+                    self.load_events.push(LoadEvent::Note(text));
+                }
+                Ok(LoadMsg::Done(result)) => break result,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => break Err("The file could not be read.".into()),
+            }
+        };
+        self.loading = None;
+        match finished {
+            Ok(art) => {
+                self.land(index, art);
+                self.load_events.push(LoadEvent::Shown);
+            }
+            Err(message) => self.open_failed(index, message),
+        }
+    }
+
+    pub fn take_load_events(&mut self) -> Vec<LoadEvent> {
+        std::mem::take(&mut self.load_events)
+    }
+
+    /// The read failed. Its tab leaves; the next one comes up, or the browser.
+    fn open_failed(&mut self, index: usize, message: String) {
+        if index < self.tabs.len() && !self.tabs[index].loaded {
+            self.tabs.remove(index);
+            self.shown = None;
+            if self.tabs.is_empty() {
+                self.clear_editor();
+                self.on_browser = true;
+            } else {
+                let next = index.min(self.tabs.len() - 1);
+                if self.tabs[next].loaded {
+                    self.show_tab(next);
+                } else {
+                    self.shown = Some(next);
+                    self.on_browser = false;
+                }
+            }
+        }
+        self.status = message.clone();
+        self.load_events.push(LoadEvent::Failed(message));
+    }
+
+    /// The tab that holds `path`, when one does.
+    pub fn tab_at(&self, path: &Path) -> Option<usize> {
+        let path = absolute(path).display().to_string();
+        self.tabs.iter().position(|tab| tab.loaded && tab.path == path)
+    }
+
+    /// The tab bar: None is the browser, Some is a project tab.
+    pub fn select_tab(&mut self, index: Option<usize>) {
+        if self.loading.is_some() {
+            self.status = "Still reading.".into();
+            return;
+        }
+        match index {
+            None => {
+                self.stash_shown();
+                self.on_browser = true;
+                self.stop();
+            }
+            Some(index) => {
+                if index >= self.tabs.len() {
+                    return;
+                }
+                self.on_browser = false;
+                if self.shown != Some(index) {
+                    self.stash_shown();
+                }
+                if self.tabs[index].loaded && (self.shown != Some(index) || self.tabs[index].stash.is_some()) {
+                    self.show_tab(index);
+                } else {
+                    self.shown = Some(index);
+                }
+            }
+        }
+    }
+
+    /// File → Launcher. The leftmost tab stays, and File → Open selects it.
+    pub fn show_browser(&mut self) {
+        self.select_tab(None);
+    }
+
+    /// The close mark on a tab.
+    pub fn close_tab(&mut self, index: usize) {
+        if self.loading.is_some() {
+            self.status = "Still reading.".into();
+            return;
+        }
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.stash_shown();
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.shown = None;
+            self.clear_editor();
+            self.on_browser = true;
+            return;
+        }
+        let next = index.min(self.tabs.len() - 1);
+        self.shown = None;
+        if self.on_browser {
+            // The browser stays up; the next tab comes up when it is picked.
+            return;
+        }
+        if self.tabs[next].loaded {
+            self.show_tab(next);
+        } else {
+            self.shown = Some(next);
+        }
+    }
+
+    /// Put the shown drawing away in its tab, so another can come up.
+    fn stash_shown(&mut self) {
+        let Some(index) = self.shown else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !tab.loaded || tab.stash.is_some() {
+            return;
+        }
+        if !self.art.path.is_empty() && self.art.path != tab.path {
+            return;
+        }
+        self.cancel_gesture();
+        let art = std::mem::replace(&mut self.art, Art::blank(1, 1));
+        let tab = &mut self.tabs[index];
+        tab.stash = Some(Box::new(Stash {
+            art,
+            history: std::mem::take(&mut self.history),
+            selected: self.selected.take(),
+            camera: self.camera,
+            fitted: self.fitted,
+            cut_points: std::mem::take(&mut self.cut_points),
+            cut_closed: std::mem::replace(&mut self.cut_closed, false),
+            warp_draft: std::mem::take(&mut self.warp_draft),
+            warp_layer: self.warp_layer.take(),
+            sheet_pick: self.sheet_pick.take(),
+        }));
+        self.overlay_live = false;
+        self.ensure_overlay();
+        self.dirty = true;
+    }
+
+    /// Bring a tab's drawing back onto the desk.
+    fn show_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let Some(stash) = tab.stash.take() else {
+            self.shown = Some(index);
+            self.on_browser = false;
+            return;
+        };
+        let name = stash.art.file_name.clone();
+        let low_res = tab.low_res;
+        self.stop();
+        self.cancel_gesture();
+        let Stash { art, history, selected, camera, fitted, cut_points, cut_closed, warp_draft, warp_layer, sheet_pick } =
+            *stash;
+        self.art = art;
+        self.history = history;
+        self.selected = selected;
+        self.camera = camera;
+        self.fitted = fitted;
+        self.cut_points = cut_points;
+        self.cut_closed = cut_closed;
+        self.warp_draft = warp_draft;
+        self.warp_layer = warp_layer;
+        self.sheet_pick = sheet_pick;
+        self.layer_window = None;
+        self.stroke_window = None;
+        self.object_window = None;
+        self.overlay_live = false;
+        self.ensure_overlay();
+        self.overlay.fill(0);
+        self.dirty = true;
+        self.place_picture(low_res);
+        self.shown = Some(index);
+        self.on_browser = false;
+        self.session.path = self.art.path.clone();
+        self.session_dirty = true;
+        self.status = format!("{}  {}×{}", self.art.file_name, self.art.width, self.art.height);
+        // Dim the studio until this plate is ready, like the Python's catch-up gate.
+        self.load_events.push(LoadEvent::Catchup(name));
+        self.load_events.push(LoadEvent::Shown);
+    }
+
+    fn clear_editor(&mut self) {
+        self.stop();
+        self.finish_new(Art::blank(1, 1));
+        self.selected = None;
+        self.status = "Open a .clip, .psd, .kra, .xcf, or .vmib file.".into();
+    }
+
+    /// The export parent folder of the shown tab.
+    pub fn export_dir(&self) -> PathBuf {
+        if let Some(tab) = self.shown.and_then(|index| self.tabs.get(index)) {
+            return tab.export_dir.clone();
+        }
+        if !self.art.path.is_empty() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            return default_export_parent(Path::new(&self.art.path), &cwd);
+        }
+        home_dir()
+    }
+
+    /// Remember this tab's export parent. Refuse another tab's output folder.
+    pub fn claim_export_dir(&mut self, parent: &Path) -> bool {
+        let Some(index) = self.shown else {
+            return true;
+        };
+        if index >= self.tabs.len() {
+            return true;
+        }
+        let name = if self.art.file_name.is_empty() {
+            basename(Path::new(&self.tabs[index].path))
+        } else {
+            self.art.file_name.clone()
+        };
+        for (other_index, tab) in self.tabs.iter().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            let other_name = match &tab.stash {
+                Some(stash) => stash.art.file_name.clone(),
+                None => basename(Path::new(&tab.path)),
+            };
+            if same_export(parent, &name, &tab.export_dir, &other_name) {
+                let who = if other_name == name { tab.path.clone() } else { other_name };
+                self.status = format!("That folder is the export for {who}. This tab needs its own path.");
+                return false;
+            }
+        }
+        self.tabs[index].export_dir = absolute(parent);
+        true
+    }
+
+    /// The tab bar's labels: the file name of each drawing, left to right.
+    pub fn tab_names(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                if Some(index) == self.shown && tab.stash.is_none() && tab.loaded {
+                    self.art.file_name.clone()
+                } else if let Some(stash) = &tab.stash {
+                    stash.art.file_name.clone()
+                } else {
+                    basename(Path::new(&tab.path))
+                }
+            })
+            .collect()
     }
 
     pub fn export_png_file(&mut self, path: &Path) -> Result<(), String> {
@@ -1860,6 +2408,69 @@ fn extension_is(path: &Path, expect: &str) -> bool {
     path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case(expect)).unwrap_or(false)
 }
 
+/// `os.path.abspath`: against the working folder, without touching the disk.
+fn absolute(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn basename(path: &Path) -> String {
+    path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// Warp targets and windows in the drawing, for the opened line.
+fn warp_counts(nodes: &[Node]) -> (usize, usize) {
+    let mut targets = 0;
+    let mut windows = 0;
+    for node in nodes {
+        match node.marker.as_str() {
+            "target" => targets += 1,
+            "window" => windows += 1,
+            _ => {}
+        }
+        let (below_targets, below_windows) = warp_counts(&node.children);
+        targets += below_targets;
+        windows += below_windows;
+    }
+    (targets, windows)
+}
+
+/// Read one drawing, telling `progress` each stage the way the Python
+/// `open_drawing` does. Blueprints read here; the other kinds read through
+/// the Python studio next to this program.
+fn read_drawing(path: &Path, progress: &dyn Fn(&str)) -> Result<Art, String> {
+    if !path.is_file() {
+        return Err("That file is missing.".into());
+    }
+    progress(&format!("Reading {}", basename(path)));
+    if extension_is(path, "vmib") {
+        load_vmib(path)
+    } else {
+        open_with_python(path, progress)
+    }
+}
+
 fn studio_root() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(current) = std::env::current_dir() {
@@ -1884,7 +2495,9 @@ fn studio_root() -> Option<PathBuf> {
     None
 }
 
-fn open_with_python(path: &Path) -> Result<Art, String> {
+/// The bridge prints `note <text>` on stdout at each stage; those lines feed
+/// the load gate while the file converts.
+fn open_with_python(path: &Path, progress: &dyn Fn(&str)) -> Result<Art, String> {
     let root = studio_root().ok_or_else(|| "The Python studio is not next to this program.".to_string())?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1893,7 +2506,8 @@ fn open_with_python(path: &Path) -> Result<Art, String> {
     let dir = std::env::temp_dir().join(format!("vmi-open-{stamp}"));
     std::fs::create_dir_all(dir.join("rasters")).map_err(|err| err.to_string())?;
     let manifest = dir.join("manifest.json");
-    let output = Command::new("python3")
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let mut child = Command::new(python)
         .arg("-m")
         .arg("vmi_studio.bridge")
         .arg("open")
@@ -1903,8 +2517,19 @@ fn open_with_python(path: &Path) -> Result<Art, String> {
         .arg("--rasters")
         .arg(dir.join("rasters"))
         .current_dir(&root)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| format!("Python could not start ({err})."))?;
+    if let Some(stdout) = child.stdout.take() {
+        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(note) = line.strip_prefix("note ") {
+                progress(note.trim());
+            }
+        }
+    }
+    let output = child.wait_with_output().map_err(|err| format!("Python did not finish ({err})."))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         let line = err.lines().find(|line| !line.trim().is_empty()).unwrap_or("Python could not open that file.");
@@ -2256,5 +2881,160 @@ mod tests {
         assert_eq!(&sheet.slots[..3], ["001", "000", "000"]);
         assert_eq!(&sheet.slots[3..], ["001", "001", "002", "002", "002"]);
         assert_eq!(node.frames, vec![0, 2, 5]);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("vmi-desk-{name}-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tabs_keep_their_own_drawing_history_and_export_folder() {
+        let mut desk = Desk::new(Session::default());
+        desk.art = Art::blank(1, 1);
+        desk.selected = None;
+        assert!(desk.on_browser);
+        assert!(desk.tabs.is_empty());
+
+        // New picture: an unsaved tab, Paper under Ink, Ink selected, white pen.
+        desk.open_blank(1920, 1080, "#FFFFFF", None, false).unwrap();
+        assert_eq!(desk.tabs.len(), 1);
+        assert_eq!(desk.shown, Some(0));
+        assert!(!desk.on_browser);
+        assert_eq!(desk.art.file_name, "Untitled 1920×1080");
+        assert_eq!(desk.tab_names(), ["Untitled 1920×1080"]);
+        let ink = desk.art.layers.iter().find(|node| node.name == "Ink").unwrap().id.clone();
+        assert_eq!(desk.selected.as_deref(), Some(ink.as_str()));
+        assert_eq!(desk.preset().color, [255, 255, 255]);
+        assert_eq!(desk.status, "New picture 1920×1080. Draw on Ink. Save blueprint writes the file.");
+        assert_eq!(desk.export_dir(), home_dir());
+        let ink_alpha = |desk: &Desk| {
+            let ink = desk.art.layers.iter().find(|node| node.name == "Ink").unwrap();
+            ink.pixels[((3 * desk.art.width + 3) * 4 + 3) as usize]
+        };
+        desk.history.push(desk.art.clone());
+        let width = desk.art.width;
+        let ink_node = desk.art.layers.iter_mut().find(|node| node.name == "Ink").unwrap();
+        ink_node.pixels[((3 * width + 3) * 4) as usize] = 255;
+        ink_node.pixels[((3 * width + 3) * 4 + 3) as usize] = 255;
+
+        // A second new picture of the same size takes the next number.
+        desk.open_blank(1920, 1080, "#808080", None, false).unwrap();
+        assert_eq!(desk.tab_names(), ["Untitled 1920×1080", "Untitled 1920×1080 2"]);
+        assert_eq!(desk.shown, Some(1));
+        assert_eq!(desk.undo_depth(), 0, "the new tab starts its own history");
+        assert_eq!(ink_alpha(&desk), 0);
+
+        // Back to the first: its pixels and history return.
+        desk.select_tab(Some(0));
+        assert_eq!(desk.shown, Some(0));
+        assert_eq!(desk.art.file_name, "Untitled 1920×1080");
+        assert_eq!(ink_alpha(&desk), 255);
+        assert_eq!(desk.undo_depth(), 1);
+        let events = desk.take_load_events();
+        assert_eq!(events, [LoadEvent::Catchup("Untitled 1920×1080".into()), LoadEvent::Shown]);
+
+        // The browser tab stashes the drawing; the editor's state stays put.
+        desk.select_tab(None);
+        assert!(desk.on_browser);
+        assert_eq!(desk.shown, Some(0));
+        assert_eq!(desk.tab_names(), ["Untitled 1920×1080", "Untitled 1920×1080 2"]);
+
+        // Save as: the tab takes the path, the export folder stays its own.
+        desk.select_tab(Some(0));
+        let dir = scratch("tabs");
+        let path = dir.join("first.vmib");
+        desk.save_blueprint(&path).unwrap();
+        assert_eq!(desk.art.kind, "vmib");
+        assert_eq!(desk.tabs[0].path, absolute(&path).display().to_string());
+        assert_eq!(desk.blueprint_path(), Some(absolute(&path)));
+        assert_eq!(desk.tab_names()[0], "first.vmib");
+        assert_eq!(desk.status, "Saved first.vmib.");
+
+        // Another tab cannot claim this tab's export folder.
+        let mine = dir.join("out");
+        assert!(desk.claim_export_dir(&mine));
+        assert_eq!(desk.export_dir(), absolute(&mine));
+        desk.select_tab(Some(1));
+        desk.save_blueprint(&dir.join("first.vmib")).unwrap_or_default();
+        assert!(!desk.claim_export_dir(&mine), "two tabs with one scene folder");
+        assert!(desk.status.contains("This tab needs its own path."));
+
+        // Closing the shown tab brings up the neighbor; closing the last one
+        // goes back to the browser.
+        desk.close_tab(1);
+        assert_eq!(desk.tabs.len(), 1);
+        assert_eq!(desk.shown, Some(0));
+        assert_eq!(desk.art.file_name, "first.vmib");
+        desk.close_tab(0);
+        assert!(desk.tabs.is_empty());
+        assert!(desk.on_browser);
+        assert_eq!(desk.shown, None);
+        assert_eq!(desk.status, "Open a .clip, .psd, .kra, .xcf, or .vmib file.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blueprint_reads_on_its_own_thread_behind_the_gate() {
+        let dir = scratch("load");
+        let path = dir.join("shot.vmib");
+        let mut art = Art::new(64, 48);
+        write_vmib(&mut art, &path).unwrap();
+
+        let mut desk = Desk::new(Session::default());
+        desk.art = Art::blank(1, 1);
+        assert!(desk.begin_open(&path, false));
+        assert!(desk.is_loading());
+        assert_eq!(desk.status, "Reading shot.vmib");
+        assert_eq!(desk.tabs.len(), 1);
+        assert!(!desk.tabs[0].loaded);
+        assert_eq!(desk.tab_names(), ["shot.vmib"]);
+        assert_eq!(desk.take_load_events(), [LoadEvent::Started("shot.vmib".into())]);
+        // A second open while reading is refused.
+        assert!(!desk.begin_open(&path, false));
+        assert_eq!(desk.status, "Still reading.");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while desk.is_loading() && std::time::Instant::now() < deadline {
+            desk.poll_load();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!desk.is_loading(), "the read finished");
+        let events = desk.take_load_events();
+        assert_eq!(events.first(), Some(&LoadEvent::Note("Reading shot.vmib".into())));
+        assert_eq!(events.last(), Some(&LoadEvent::Shown));
+        assert!(desk.tabs[0].loaded);
+        assert_eq!(desk.art.width, 64);
+        assert_eq!(desk.art.path, absolute(&path).display().to_string());
+        assert_eq!(desk.status, "shot.vmib  64×48  Opened.");
+        assert!(desk.fitted, "a high-res open keeps every document pixel");
+        assert_eq!(desk.camera.zoom, 1.0);
+        assert_eq!(desk.tabs[0].export_dir, absolute(&dir.join("shot-vmi")));
+
+        // The same file again selects its tab instead of reading twice.
+        assert!(!desk.begin_open(&path, true));
+        assert_eq!(desk.status, "shot.vmib is already open.");
+        assert!(desk.tabs[0].low_res);
+
+        // A missing file: the tab leaves and the text lands in the status bar.
+        let missing = dir.join("gone.vmib");
+        assert!(desk.begin_open(&missing, false));
+        assert_eq!(desk.tabs.len(), 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while desk.is_loading() && std::time::Instant::now() < deadline {
+            desk.poll_load();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(desk.tabs.len(), 1);
+        assert_eq!(desk.shown, Some(0));
+        assert_eq!(desk.art.file_name, "shot.vmib");
+        assert_eq!(desk.status, "That file is missing.");
+        assert!(desk.take_load_events().contains(&LoadEvent::Failed("That file is missing.".into())));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

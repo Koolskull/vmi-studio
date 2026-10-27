@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::desk::{Button, Desk, Display};
+use crate::desk::{Button, Desk, Display, LoadEvent};
 use crate::fingers::{Fingers, Tap};
 use crate::gpu::{Frame, PictureFilter, PICTURE_FILTER};
 use crate::icons;
@@ -328,6 +328,48 @@ impl StudioApp {
         // egui 0.29 reports any focused widget, including the canvas and the tool
         // cells, as wanting the keyboard. Undo still has to run after a stroke.
         let typing = self.text_focused;
+        let mut new_picture = false;
+        let mut open = false;
+        let mut save = false;
+        let mut quit = false;
+        let mut export_png = false;
+        ctx.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::COMMAND, egui::Key::N) {
+                new_picture = true;
+            }
+            if input.consume_key(egui::Modifiers::COMMAND, egui::Key::O) {
+                open = true;
+            }
+            if input.consume_key(egui::Modifiers::COMMAND, egui::Key::S) {
+                save = true;
+            }
+            if input.consume_key(egui::Modifiers::COMMAND, egui::Key::Q) {
+                quit = true;
+            }
+            if !typing && input.consume_key(egui::Modifiers::SHIFT, egui::Key::E) {
+                export_png = true;
+            }
+        });
+        if new_picture {
+            self.new_picture();
+        }
+        if open {
+            self.desk.show_browser();
+        }
+        if save {
+            self.save_blueprint();
+        }
+        if quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if export_png && !self.desk.on_browser {
+            self.path_text = "drawing.png".into();
+            self.prompt = Some(Prompt::Export);
+        }
+        // The editor's keys sleep while the launcher page is up.
+        if self.desk.on_browser {
+            return;
+        }
         let mut undo = false;
         let mut redo = false;
         let mut fit = false;
@@ -703,6 +745,109 @@ impl StudioApp {
         }
     }
 
+    /// The loading thread's notes and the tab changes, once per frame.
+    fn hear_loader(&mut self, ctx: &egui::Context) {
+        self.desk.poll_load();
+        if self.desk.is_loading() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        }
+        for event in self.desk.take_load_events() {
+            match event {
+                LoadEvent::Started(_) | LoadEvent::Catchup(_) | LoadEvent::Note(_) | LoadEvent::Shown => {}
+                LoadEvent::Failed(message) => self.desk.status = message,
+            }
+        }
+    }
+
+    /// File → New picture, and the launcher button.
+    fn new_picture(&mut self) {
+        let (_, width, height) = vmi_core::newpage::PRESETS[0];
+        if let Err(err) =
+            self.desk.open_blank(i64::from(width), i64::from(height), vmi_core::newpage::PAPER_WHITE, None, false)
+        {
+            self.desk.status = err;
+        }
+    }
+
+    /// Ctrl+S. An open blueprint is overwritten. A drawing is saved beside it.
+    fn save_blueprint(&mut self) {
+        if self.desk.on_browser {
+            self.desk.status = "Open a drawing first.".into();
+            return;
+        }
+        match self.desk.blueprint_path() {
+            Some(path) => {
+                if let Err(err) = self.desk.save_blueprint(&path) {
+                    self.desk.status = err;
+                }
+            }
+            None => self.save_blueprint_as(),
+        }
+    }
+
+    fn save_blueprint_as(&mut self) {
+        if self.desk.on_browser {
+            self.desk.status = "Open a drawing first.".into();
+            return;
+        }
+        self.path_text = self.desk.suggested_blueprint().display().to_string();
+        self.prompt = Some(Prompt::Save);
+    }
+
+    /// The tab row: `browser` first, then one short tab per drawing with its
+    /// close mark, and the shown tab's export folder in white at the right.
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.desk.theme();
+        let names = self.desk.tab_names();
+        let shown = if self.desk.on_browser { None } else { self.desk.shown };
+        let mut pick: Option<Option<usize>> = None;
+        let mut close: Option<usize> = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if project_tab(ui, theme, "browser", shown.is_none(), false).on_hover_text("Projects, tasks, and drawings").clicked() {
+                pick = Some(None);
+            }
+            for (index, name) in names.iter().enumerate() {
+                let export_dir = self.desk.tabs[index].export_dir.display().to_string();
+                let (tab, mark) = project_tab_with_close(ui, theme, name, shown == Some(index));
+                if tab.on_hover_text(export_dir).clicked() {
+                    pick = Some(Some(index));
+                }
+                if mark.on_hover_text("Close this tab").clicked() {
+                    close = Some(index);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.desk.on_browser && self.desk.shown.is_some() {
+                    let path = self.desk.export_dir().display().to_string();
+                    ui.add(egui::Label::new(egui::RichText::new(&path).color(egui::Color32::WHITE)).truncate())
+                        .on_hover_text(path);
+                }
+            });
+        });
+        if let Some(index) = close {
+            self.desk.close_tab(index);
+        } else if let Some(choice) = pick {
+            self.desk.select_tab(choice);
+        }
+    }
+
+    /// The launcher page, in the window where the editor otherwise is.
+    fn browser_page(&mut self, ui: &mut egui::Ui) {
+        let theme = self.desk.theme();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("New picture").clicked() {
+                self.new_picture();
+            }
+            if ui.button("Open…").clicked() {
+                self.path_text = self.desk.session.path.clone();
+                self.prompt = Some(Prompt::Open);
+            }
+        });
+        ui.label(egui::RichText::new("Open a .clip, .psd, .kra, .xcf, or .vmib file.").color(rgb(theme.soft)));
+    }
+
     fn windows(&mut self, ctx: &egui::Context) {
         if let Some(tool) = self.desk.tool_window {
             let mut open = true;
@@ -767,8 +912,23 @@ impl StudioApp {
                 if ui.button("OK").clicked() {
                     let path = std::path::PathBuf::from(self.path_text.trim());
                     let result = match prompt {
-                        Prompt::Open => self.desk.open_path(&path),
-                        Prompt::Save => self.desk.save_blueprint(&path),
+                        Prompt::Open => {
+                            if path.is_file() {
+                                self.desk.begin_open(&path, false);
+                                Ok(())
+                            } else {
+                                Err("That file is missing.".to_string())
+                            }
+                        }
+                        Prompt::Save => {
+                            let is_vmib = path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .map(|ext| ext.eq_ignore_ascii_case("vmib"))
+                                .unwrap_or(false);
+                            let path = if is_vmib { path } else { PathBuf::from(format!("{}.vmib", path.display())) };
+                            self.desk.save_blueprint(&path)
+                        }
                         Prompt::Export => self.desk.export_png_file(&path),
                     };
                     if let Err(err) = result {
@@ -1774,6 +1934,78 @@ const PANEL_INNER: f32 = CELL_SIDE * 2.0 + CELL_GAP;
 const PANEL_MARGIN: f32 = 4.0;
 
 /// A name that acts as a tab. The chosen one is white; the rest are quiet.
+/// Tabs are 20 tall and at most 240 wide. A long name ends in an ellipsis
+/// before the close mark.
+const TAB_HEIGHT: f32 = 20.0;
+const TAB_MAX_WIDTH: f32 = 240.0;
+const TAB_PAD_LEFT: f32 = 8.0;
+/// 6px before the mark, the mark, 6px after it so the stroke stays off the border.
+const TAB_CLOSE: egui::Vec2 = egui::vec2(18.0, 12.0);
+
+/// Cut `text` so it fits `width` in the tab's font, with an ellipsis at the end.
+fn elide_right(ui: &egui::Ui, font: &egui::FontId, text: &str, width: f32) -> String {
+    let measure = |candidate: &str| ui.fonts(|fonts| fonts.layout_no_wrap(candidate.to_owned(), font.clone(), egui::Color32::WHITE).size().x);
+    if measure(text) <= width {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = chars.len();
+    while keep > 0 {
+        keep -= 1;
+        let mut candidate: String = chars[..keep].iter().collect();
+        candidate.push('…');
+        if measure(&candidate) <= width {
+            return candidate;
+        }
+    }
+    "…".into()
+}
+
+/// One tab in the K-OS tab sheet: field fill, quiet text inside a rule
+/// border; ink text and border when selected.
+fn project_tab(ui: &mut egui::Ui, theme: &Theme, name: &str, selected: bool, with_close: bool) -> egui::Response {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let close_width = if with_close { TAB_CLOSE.x } else { TAB_PAD_LEFT };
+    let room = TAB_MAX_WIDTH - TAB_PAD_LEFT - close_width;
+    let text = elide_right(ui, &font, name, room);
+    let text_width = ui.fonts(|fonts| fonts.layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE).size().x);
+    let width = (TAB_PAD_LEFT + text_width + close_width).min(TAB_MAX_WIDTH);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, TAB_HEIGHT), egui::Sense::click());
+    let color = rgb(if selected { theme.ink } else { theme.quiet });
+    let border = rgb(if selected { theme.ink } else { theme.rule });
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, rgb(theme.field));
+    painter.rect_stroke(rect.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, border));
+    painter.text(
+        egui::pos2(rect.left() + TAB_PAD_LEFT, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
+    response
+}
+
+/// A project tab and its close mark. The mark is the same grey as mute and
+/// solo, ink under the pointer.
+fn project_tab_with_close(ui: &mut egui::Ui, theme: &Theme, name: &str, selected: bool) -> (egui::Response, egui::Response) {
+    let tab = project_tab(ui, theme, name, selected, true);
+    let rect = tab.rect;
+    let mark_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - TAB_CLOSE.x, rect.center().y - TAB_CLOSE.y / 2.0),
+        TAB_CLOSE,
+    );
+    let mark = ui.interact(mark_rect, tab.id.with("close"), egui::Sense::click());
+    let lit = mark.hovered() || mark.is_pointer_button_down_on();
+    let color = rgb(if lit { theme.ink } else { theme.quiet });
+    let stroke = egui::Stroke::new(1.0_f32, color);
+    let origin = mark_rect.min;
+    let painter = ui.painter();
+    painter.line_segment([origin + egui::vec2(6.0, 3.0), origin + egui::vec2(11.0, 8.0)], stroke);
+    painter.line_segment([origin + egui::vec2(11.0, 3.0), origin + egui::vec2(6.0, 8.0)], stroke);
+    (tab, mark)
+}
+
 fn tab_label(ui: &mut egui::Ui, theme: &Theme, text: &str, chosen: bool) -> egui::Response {
     let color = if chosen { rgb(theme.ink) } else { rgb(theme.soft) };
     let label = egui::Label::new(egui::RichText::new(text).monospace().color(color)).sense(egui::Sense::click());
@@ -2261,28 +2493,33 @@ impl eframe::App for StudioApp {
         if self.desk.tick(dt) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(self.desk.next_frame_in().max(0.001)));
         }
+        self.hear_loader(ctx);
         let layers_default = self.desk.session.layers_width;
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() {
-                        self.desk.new_document();
+                    if ui.button("New picture    Ctrl+N").clicked() {
+                        self.new_picture();
                     }
-                    if ui.button("Open…").clicked() {
-                        self.path_text = self.desk.session.path.clone();
-                        self.prompt = Some(Prompt::Open);
+                    if ui.button("Open    Ctrl+O").on_hover_text("Project files are chosen from the browser tab.").clicked() {
+                        self.desk.show_browser();
                     }
-                    if ui.button("Save blueprint…").clicked() {
-                        self.path_text = if self.desk.session.path.is_empty() {
-                            "drawing.vmib".into()
-                        } else {
-                            self.desk.session.path.clone()
-                        };
-                        self.prompt = Some(Prompt::Save);
+                    if ui.button("Save blueprint    Ctrl+S").clicked() {
+                        self.save_blueprint();
                     }
-                    if ui.button("Export PNG…").clicked() {
+                    if ui.button("Save blueprint as").clicked() {
+                        self.save_blueprint_as();
+                    }
+                    if ui.button("Export PNG    Shift+E").clicked() {
                         self.path_text = "drawing.png".into();
                         self.prompt = Some(Prompt::Export);
+                    }
+                    ui.separator();
+                    if ui.button("Launcher").clicked() {
+                        self.desk.show_browser();
+                    }
+                    if ui.button("Quit    Ctrl+Q").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -2358,13 +2595,28 @@ impl eframe::App for StudioApp {
                 });
             });
         });
+        egui::TopBottomPanel::top("tabs")
+            .frame(egui::Frame::none().fill(rgb(self.desk.theme().field)).inner_margin(egui::Margin {
+                left: 8.0,
+                right: 8.0,
+                top: 2.0,
+                bottom: 0.0,
+            }))
+            .show(ctx, |ui| self.tab_bar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(self.desk.art.file_name.as_str());
-                ui.separator();
+                if !self.desk.on_browser {
+                    ui.label(self.desk.art.file_name.as_str());
+                    ui.separator();
+                }
                 ui.label(self.desk.status.as_str());
             });
         });
+        if self.desk.on_browser {
+            egui::CentralPanel::default().show(ctx, |ui| self.browser_page(ui));
+            self.desk.flush_session();
+            return;
+        }
         let left = egui::SidePanel::left("layers")
             .resizable(true)
             .default_width(layers_default)

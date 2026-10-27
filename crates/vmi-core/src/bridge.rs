@@ -38,6 +38,7 @@ pub fn load_manifest(path: &Path) -> Result<Art, String> {
     art.next_id = max_id + 1;
     art.next_stroke = max_stroke(&art.layers) + 1;
     art.kind = document.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+    art.note = document.get("note").and_then(Value::as_str).unwrap_or("").to_string();
     if let Some(objects) = document.get("objects").and_then(Value::as_array) {
         for row in objects {
             let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();

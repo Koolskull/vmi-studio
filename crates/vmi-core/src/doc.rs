@@ -200,6 +200,8 @@ pub struct Art {
     /// The drawing a blueprint was made from, when it was not a blueprint.
     pub source_file: String,
     pub source_kind: String,
+    /// What the opener said about the file: "Opened." when it had nothing to add.
+    pub note: String,
     /// Playback rate. Python's `clip_time.fps`.
     pub fps: u32,
     /// The current frame, 0-based. Python's `clip_time.current` and the
@@ -240,6 +242,7 @@ impl Art {
             kosv: Kosv::default(),
             source_file: String::new(),
             source_kind: String::new(),
+            note: String::new(),
             fps: DEFAULT_FPS,
             playhead: 0,
             onion: false,

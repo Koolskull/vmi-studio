@@ -9,6 +9,7 @@
 //! whenever the drawing has a cut to keep. Each raster is the layer's own
 //! picture, composited without onion skin.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -21,27 +22,55 @@ use crate::anim::{animation_folders, cut_end, ExposureSheet, DEFAULT_FPS};
 use crate::color::hex_of;
 use crate::coverage::Edge;
 use crate::doc::{expand_raster, present_plain, tight_pixels, Art, ClipTime, DeskObject, Node, NodeKind};
+use crate::kosv::{clean_effects, clean_kosv, clean_marks, effects_value, kosv_value, marks_value};
+use crate::tasks::{colors_value, pack_colors, pack_tasks, tasks_value};
 use crate::tool::{CurveKind, GrainKind};
 use crate::vector::{Bone, Raster, VectorStroke, Vertex};
 
 const FORMAT: &str = "vmib";
 const VERSION: u64 = 1;
 
+/// Python's `CLOUD` block: a note for the reader, not a setting.
+const CLOUD_SERVICE: &str = "2kool.tv";
+
+/// The name without its extension, the way Python writes `name`.
+fn stem_name(file_name: &str) -> String {
+    let name = if file_name.trim().is_empty() { "project" } else { file_name };
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => name[..dot].to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Python's `_source`: a blueprint keeps the drawing it came from; a
+/// drawing that is not yet a blueprint is its own source.
+fn source_row(art: &Art) -> Value {
+    if art.kind == FORMAT {
+        return json!({"file": art.source_file, "kind": art.source_kind});
+    }
+    json!({"file": art.file_name, "kind": art.kind})
+}
+
 pub fn save(art: &mut Art, path: &Path) -> Result<(), String> {
     let mut document = json!({
         "format": FORMAT,
         "version": VERSION,
-        "name": art.file_name,
+        "name": stem_name(&art.file_name),
         "width": art.width,
         "height": art.height,
-        "playlist": "",
-        "arrange_locked": true,
-        "source": {"file": "", "kind": ""},
-        "cloud": {"service": "2kool.tv", "upload": "later"},
+        "playlist": art.playlist,
+        "arrange_locked": art.arrange_locked,
+        "source": source_row(art),
+        "cloud": {
+            "service": CLOUD_SERVICE,
+            "upload": "later",
+            "note": "One zip per project. A later upload sends this file to the signed-in user on 2kool.tv. The studio opens that same zip.",
+        },
         "layers": [],
         "objects": art.objects.iter().map(object_row).collect::<Vec<_>>(),
-        "tasks": [],
-        "task_colors": {},
+        "tasks": tasks_value(&art.tasks),
+        "task_colors": colors_value(&art.task_colors),
+        "kosv": kosv_value(&art.kosv),
     });
     let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
     document["layers"] = Value::Array(art.layers.iter().map(|node| layer_row(art, node, &mut blobs)).collect());
@@ -100,6 +129,12 @@ fn layer_row(art: &Art, node: &Node, blobs: &mut Vec<(String, Vec<u8>)>) -> Valu
     });
     if let Some(sheet) = &node.exposure {
         row["exposure"] = sheet.to_row();
+    }
+    if !node.effects.is_empty() {
+        row["effects"] = effects_value(&node.effects);
+    }
+    if !node.cel_marks.is_empty() {
+        row["cel_marks"] = marks_value(&node.cel_marks);
     }
     if !node.strokes.is_empty() {
         row["strokes"] = Value::Array(node.strokes.iter().map(stroke_row).collect());
@@ -172,15 +207,99 @@ fn grain_name(grain: GrainKind) -> &'static str {
     }
 }
 
-fn object_row(object: &DeskObject) -> Value {
+/// Python's `_object_row`.
+pub fn object_row(object: &DeskObject) -> Value {
+    let assign: serde_json::Map<String, Value> = object
+        .assign
+        .iter()
+        .map(|(id, (state, frame))| (id.clone(), json!([state & 0xFFF, frame & 0xFFF])))
+        .collect();
+    let labels: serde_json::Map<String, Value> = object
+        .labels
+        .iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
     json!({
         "id": object.id,
         "name": object.name,
+        "layer_ids": object.layer_ids,
+        "assign": Value::Object(assign),
+        "origin": object.origin,
+        "labels": Value::Object(labels),
+        "explicit": object.explicit,
+        "parent": object.parent,
+        "stack": object.stack,
+        "role": object.role,
         "kind": object.kind,
-        "layer_ids": [],
-        "assign": {},
-        "explicit": true,
+        "warp_layer": object.warp_layer,
+        "sound": object.sound,
     })
+}
+
+/// Python's `_objects_from`. Layer ids the drawing no longer has are dropped.
+pub fn objects_from(rows: Option<&Value>, known: &HashSet<String>) -> Vec<DeskObject> {
+    let mut objects: Vec<DeskObject> = Vec::new();
+    let Some(rows) = rows.and_then(Value::as_array) else {
+        return objects;
+    };
+    for row in rows {
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        if id.is_empty() || objects.iter().any(|object| object.id == id) {
+            continue;
+        }
+        let layer_ids: Vec<String> = row
+            .get("layer_ids")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().filter_map(Value::as_str).filter(|id| known.contains(*id)).map(str::to_string).collect())
+            .unwrap_or_default();
+        let mut assign = BTreeMap::new();
+        if let Some(rows) = row.get("assign").and_then(Value::as_object) {
+            for (layer, pos) in rows {
+                let Some(pos) = pos.as_array().filter(|pos| pos.len() >= 2) else {
+                    continue;
+                };
+                if !known.contains(layer) {
+                    continue;
+                }
+                let state = pos[0].as_f64().unwrap_or(0.0) as i64 & 0xFFF;
+                let frame = pos[1].as_f64().unwrap_or(0.0) as i64 & 0xFFF;
+                assign.insert(layer.clone(), (state as u16, frame as u16));
+            }
+        }
+        let mut labels = BTreeMap::new();
+        if let Some(rows) = row.get("labels").and_then(Value::as_object) {
+            for (key, value) in rows {
+                if let Some(text) = value.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+                    labels.insert(key.clone(), text.to_string());
+                }
+            }
+        }
+        let text = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+        objects.push(DeskObject {
+            id,
+            name: row.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()).unwrap_or("object").to_string(),
+            kind: text("kind"),
+            layer_ids,
+            assign,
+            origin: text("origin"),
+            labels,
+            explicit: row.get("explicit").and_then(Value::as_bool).unwrap_or(true),
+            parent: text("parent"),
+            stack: row.get("stack").and_then(Value::as_f64).unwrap_or(0.0) as i64,
+            role: text("role"),
+            warp_layer: text("warp_layer"),
+            sound: text("sound"),
+        });
+    }
+    objects
+}
+
+fn collect_ids(nodes: &[Node], known: &mut HashSet<String>) {
+    for node in nodes {
+        known.insert(node.id.clone());
+        collect_ids(&node.children, known);
+    }
 }
 
 fn write_zip(path: &Path, document: &Value, blobs: &[(String, Vec<u8>)]) -> Result<(), String> {
@@ -222,8 +341,14 @@ pub fn load(path: &Path) -> Result<Art, String> {
         return Err("This blueprint has no canvas.".into());
     }
     let mut art = Art::blank(width, height);
-    art.file_name = document.get("name").and_then(Value::as_str).unwrap_or("project").to_string();
+    // Python names the open drawing after the file on disk. The document's
+    // `name` is the stem it was saved under.
+    art.file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| document.get("name").and_then(Value::as_str).unwrap_or("project").to_string());
     art.path = path.display().to_string();
+    art.kind = FORMAT.to_string();
     let mut max_id = 0u64;
     if let Some(layers) = document.get("layers").and_then(Value::as_array) {
         for row in layers {
@@ -232,6 +357,21 @@ pub fn load(path: &Path) -> Result<Art, String> {
     }
     art.next_id = max_id + 1;
     art.next_stroke = max_stroke(&art.layers) + 1;
+    let mut known = HashSet::new();
+    collect_ids(&art.layers, &mut known);
+    art.objects = objects_from(document.get("objects"), &known);
+    art.playlist = match document.get("playlist").and_then(Value::as_str) {
+        Some(name @ ("menu" | "battle")) => name.to_string(),
+        _ => String::new(),
+    };
+    art.arrange_locked = document.get("arrange_locked").and_then(Value::as_bool).unwrap_or(true);
+    if let Some(source) = document.get("source").and_then(Value::as_object) {
+        art.source_file = source.get("file").and_then(Value::as_str).unwrap_or("").to_string();
+        art.source_kind = source.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+    }
+    art.tasks = pack_tasks(document.get("tasks").unwrap_or(&Value::Null));
+    art.task_colors = pack_colors(document.get("task_colors").unwrap_or(&Value::Null));
+    art.kosv = clean_kosv(document.get("kosv").unwrap_or(&Value::Null));
     if let Some(clip_time) = document.get("clip_time").and_then(Value::as_object) {
         let number = |key: &str| clip_time.get(key).and_then(Value::as_f64).unwrap_or(0.0).max(0.0).round() as u32;
         let fps = number("fps");
@@ -243,19 +383,6 @@ pub fn load(path: &Path) -> Result<Art, String> {
             start: number("start"),
             end: number("end"),
         });
-    }
-    if let Some(objects) = document.get("objects").and_then(Value::as_array) {
-        for row in objects {
-            let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-            if id.is_empty() {
-                continue;
-            }
-            art.objects.push(DeskObject {
-                id,
-                name: row.get("name").and_then(Value::as_str).unwrap_or("Object").to_string(),
-                kind: row.get("kind").and_then(Value::as_str).unwrap_or("static").to_string(),
-            });
-        }
     }
     Ok(art)
 }
@@ -319,6 +446,9 @@ fn node_from(row: &Value, archive: &mut ZipArchive<File>, width: u32, height: u3
         .map(|frames| frames.iter().filter_map(Value::as_f64).map(|frame| frame.max(0.0) as u32).collect())
         .unwrap_or_default();
     node.exposure = load_sheet(row.get("exposure"));
+    node.effects = clean_effects(row.get("effects").unwrap_or(&Value::Null));
+    let kids: HashSet<String> = node.children.iter().map(|child| child.id.clone()).collect();
+    node.cel_marks = clean_marks(row.get("cel_marks").unwrap_or(&Value::Null), Some(&kids));
     Ok(node)
 }
 
@@ -501,6 +631,82 @@ mod tests {
     fn temp_path(tag: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("vmi-vmib-{tag}-{stamp}.vmib"))
+    }
+
+    #[test]
+    fn effects_marks_tasks_objects_and_the_kosv_block_round_trip() {
+        use crate::kosv::{make_stack, CelMark, Preset};
+        use crate::tasks::{Task, TaskColors};
+        let mut art = Art::blank(8, 8);
+        art.file_name = "shop.vmib".into();
+        let door = art.add_layer(None, "door");
+        let folder = art.add_group(None, "wave");
+        let cel = art.add_layer(Some(&folder), "a");
+        crate::find_mut(&mut art.layers, &door).unwrap().effects = make_stack("tape");
+        let wave = crate::find_mut(&mut art.layers, &folder).unwrap();
+        wave.animation = true;
+        wave.cel_marks.insert(
+            cel.clone(),
+            CelMark { kind: "P".into(), reference: "".into(), origin: cel.clone(), gain: Some(1.5), block: None },
+        );
+        wave.cel_marks.insert("ghost".into(), CelMark { kind: "I".into(), reference: "".into(), origin: "".into(), gain: None, block: None });
+        art.playlist = "battle".into();
+        art.arrange_locked = false;
+        art.tasks = vec![Task { id: "t1".into(), text: "ink the door".into(), done: true }];
+        art.task_colors = TaskColors { background: "#101010".into(), text: "#FFEEDD".into() };
+        art.kosv.presets.push(Preset { name: "mine".into(), stack: make_stack("glow") });
+        let mut object = DeskObject::new("o1", "door", vec![door.clone(), "gone".into()]);
+        object.kind = "button".into();
+        object.assign.insert(door.clone(), (1, 0));
+        object.assign.insert("gone".into(), (2, 0));
+        object.labels.insert("001000".into(), "lit".into());
+        object.parent = "o9".into();
+        object.stack = 3;
+        object.warp_layer = "mask".into();
+        object.sound = "sfx:tik".into();
+        object.origin = "slots:n1".into();
+        art.objects.push(object);
+        let path = temp_path("kosv");
+        save(&mut art, &path).unwrap();
+        let document = blueprint(&path);
+        assert_eq!(document["name"], "shop");
+        assert_eq!(document["playlist"], "battle");
+        assert_eq!(document["arrange_locked"], false);
+        assert_eq!(document["source"]["file"], "");
+        assert_eq!(document["tasks"][0]["text"], "ink the door");
+        assert_eq!(document["kosv"]["product"], "KOSV");
+        assert_eq!(document["kosv"]["plate"], json!([1920, 1080]));
+        assert_eq!(document["objects"][0]["assign"][&door], json!([1, 0]));
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.file_name, path.file_name().unwrap().to_string_lossy());
+        assert_eq!(loaded.kind, "vmib");
+        let door_node = crate::find(&loaded.layers, &door).unwrap();
+        assert_eq!(door_node.effects.len(), 2);
+        assert_eq!(door_node.effects[0].id, "vhs");
+        assert_eq!(door_node.effects[0].preset, "tape");
+        let wave = crate::find(&loaded.layers, &folder).unwrap();
+        assert_eq!(wave.cel_marks.len(), 1, "a mark on a cel the folder lacks is dropped");
+        assert_eq!(wave.cel_marks[&cel].gain, Some(1.5));
+        assert_eq!(loaded.playlist, "battle");
+        assert!(!loaded.arrange_locked);
+        assert_eq!(loaded.tasks, art.tasks);
+        assert_eq!(loaded.task_colors, art.task_colors);
+        assert_eq!(loaded.kosv.presets.len(), 1);
+        assert_eq!(loaded.kosv.presets[0].stack[0].id, "color-glow");
+        assert_eq!(loaded.objects.len(), 1);
+        let object = &loaded.objects[0];
+        assert_eq!(object.layer_ids, vec![door.clone()], "a layer the drawing lacks is dropped");
+        assert_eq!(object.assign.len(), 1);
+        assert_eq!(object.assign[&door], (1, 0));
+        assert_eq!(object.labels["001000"], "lit");
+        assert_eq!(object.kind, "button");
+        assert_eq!(object.parent, "o9");
+        assert_eq!(object.stack, 3);
+        assert_eq!(object.warp_layer, "mask");
+        assert_eq!(object.sound, "sfx:tik");
+        assert_eq!(object.origin, "slots:n1");
+        assert!(object.explicit);
     }
 
     fn blueprint(path: &Path) -> Value {

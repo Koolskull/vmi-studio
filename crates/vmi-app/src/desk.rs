@@ -433,7 +433,9 @@ impl Desk {
         let before = self.art.clone();
         let id = self.art.alloc_id();
         let name = format!("Object {}", self.art.objects.len() + 1);
-        self.art.objects.push(DeskObject { id: id.clone(), name, kind: "static".into() });
+        let mut object = DeskObject::new(id.clone(), name, Vec::new());
+        object.kind = "static".into();
+        self.art.objects.push(object);
         self.history.push(before);
         self.object_window = Some(id);
         self.object_edit_saved = false;

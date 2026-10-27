@@ -2,13 +2,24 @@
 
 pub mod anim;
 pub mod blend;
+pub mod catalog;
+pub mod cloud;
 pub mod color;
-pub mod palette;
 pub mod coverage;
 pub mod cut;
 pub mod doc;
 pub mod export;
+pub mod fonts;
+pub mod icloud;
+pub mod koolgrid;
+pub mod kosv;
+pub mod naming;
+pub mod newpage;
+pub mod palette;
+pub mod scene;
 pub mod session;
+pub mod tabs;
+pub mod tasks;
 pub mod theme;
 pub mod tip;
 pub mod tool;
@@ -33,7 +44,10 @@ pub use tip::{fbm, tip_sample, value_noise, Grain, Tip, TipSample};
 pub use cut::{cut_folder, erase_folder, point_inside, rect_points, Marquee};
 pub use doc::{clamp_rect, find, find_mut, parent_of, present, present_region, reorder_objects, Art, DeskObject, History, Node, NodeKind};
 pub use export::{export_png, scale_nearest};
+pub use kosv::{CelMark, Effect, Kosv, Param, Preset};
+pub use newpage::blank_picture;
 pub use session::{load as load_session, save as save_session, session_path, Session};
+pub use tasks::{Task, TaskColors};
 pub use theme::{theme_or_studio, Theme, THEMES};
 pub use tool::{
     ink_spacing, palette_action, palette_matching, CurveKind, Field, GrainKind, PaletteAction, Release, Section, Tool,

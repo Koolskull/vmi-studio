@@ -8,6 +8,8 @@
 //! skin (`vmi_studio/onion.py`) is a view: `present` tints the neighbour cels
 //! when `Art::onion` is on, `present_plain` never does.
 
+use std::collections::BTreeMap;
+
 use crate::anim::{
     animation_folder_ids, cel_at, onion_neighbors, onion_strength, ExposureSheet, DEFAULT_FPS, FUTURE, ONION_LIMIT,
     ONION_TINT, PAST,
@@ -15,6 +17,8 @@ use crate::anim::{
 use crate::blend::{mix, mix_hsl};
 use crate::color::Rgba;
 use crate::coverage::source_over;
+use crate::kosv::{CelMark, Effect, Kosv};
+use crate::tasks::{Task, TaskColors};
 use crate::vector::{Raster, VectorStroke};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +55,11 @@ pub struct Node {
     pub frames: Vec<u32>,
     /// OpenToonz style exposure column. None when the layer has no sheet.
     pub exposure: Option<ExposureSheet>,
+    /// The KOSV stack on this layer or folder. A folder's stack runs after
+    /// the layers inside it.
+    pub effects: Vec<Effect>,
+    /// Datamosh I and P marks keyed by cel id, on an animation folder.
+    pub cel_marks: BTreeMap<String, CelMark>,
 }
 
 impl Node {
@@ -76,6 +85,8 @@ impl Node {
             timeline: Vec::new(),
             frames: Vec::new(),
             exposure: None,
+            effects: Vec::new(),
+            cel_marks: BTreeMap::new(),
         }
     }
 
@@ -101,6 +112,8 @@ impl Node {
             timeline: Vec::new(),
             frames: Vec::new(),
             exposure: None,
+            effects: Vec::new(),
+            cel_marks: BTreeMap::new(),
         }
     }
 
@@ -129,11 +142,39 @@ impl Default for ClipTime {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One thing in the work: a door, a beetle, a shop, a word. The same row
+/// Python's `desk.DeskObject` keeps and the blueprint's `objects` carry.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct DeskObject {
     pub id: String,
     pub name: String,
+    /// Chosen on the outliner: "", "static", "button", "sequence", or
+    /// "warp target". Empty follows the layers.
     pub kind: String,
+    /// Paint layers in the object.
+    pub layer_ids: Vec<String>,
+    /// (state, frame) per layer id when the name does not say it.
+    pub assign: BTreeMap<String, (u16, u16)>,
+    /// "anim:<stem>", "folder:<id>", "slots:<id>", or empty for a hand-made object.
+    pub origin: String,
+    /// Custom position names keyed by SSSXXX.
+    pub labels: BTreeMap<String, String>,
+    pub explicit: bool,
+    /// The object this one stacks in front of. Empty is a root.
+    pub parent: String,
+    /// Low stack is the back.
+    pub stack: i64,
+    pub role: String,
+    /// "", "mask", or "warp map".
+    pub warp_layer: String,
+    /// A Beetle Game battlefx id, or empty.
+    pub sound: String,
+}
+
+impl DeskObject {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, layer_ids: Vec<String>) -> Self {
+        Self { id: id.into(), name: name.into(), layer_ids, explicit: true, ..Self::default() }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -142,10 +183,23 @@ pub struct Art {
     pub height: u32,
     pub file_name: String,
     pub path: String,
+    /// "vmib", "clip", "psd", "kra", "xcf". Python's `ArtFile.kind`.
+    pub kind: String,
     pub layers: Vec<Node>,
     pub next_id: u64,
     pub next_stroke: u64,
     pub objects: Vec<DeskObject>,
+    /// Webamp playlist for the scene: "", "menu", or "battle".
+    pub playlist: String,
+    pub arrange_locked: bool,
+    /// The drawing's task board, written into the blueprint.
+    pub tasks: Vec<Task>,
+    pub task_colors: TaskColors,
+    /// Saved KOSV presets and the plate size.
+    pub kosv: Kosv,
+    /// The drawing a blueprint was made from, when it was not a blueprint.
+    pub source_file: String,
+    pub source_kind: String,
     /// Playback rate. Python's `clip_time.fps`.
     pub fps: u32,
     /// The current frame, 0-based. Python's `clip_time.current` and the
@@ -174,10 +228,18 @@ impl Art {
             height,
             file_name: "untitled".into(),
             path: String::new(),
+            kind: "vmib".into(),
             layers: Vec::new(),
             next_id: 1,
             next_stroke: 1,
             objects: Vec::new(),
+            playlist: String::new(),
+            arrange_locked: true,
+            tasks: Vec::new(),
+            task_colors: TaskColors::default(),
+            kosv: Kosv::default(),
+            source_file: String::new(),
+            source_kind: String::new(),
             fps: DEFAULT_FPS,
             playhead: 0,
             onion: false,
@@ -891,10 +953,7 @@ mod tests {
 
     #[test]
     fn objects_reorder() {
-        let mut objects = vec![
-            DeskObject { id: "a".into(), name: "A".into(), kind: "static".into() },
-            DeskObject { id: "b".into(), name: "B".into(), kind: "static".into() },
-        ];
+        let mut objects = vec![DeskObject::new("a", "A", Vec::new()), DeskObject::new("b", "B", Vec::new())];
         reorder_objects(&mut objects, 1, 0);
         assert_eq!(objects[0].id, "b");
     }

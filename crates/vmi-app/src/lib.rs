@@ -8,7 +8,23 @@ pub mod icons;
 pub mod tablet;
 
 #[cfg(feature = "window")]
+mod cloudui;
+#[cfg(feature = "window")]
+mod effects;
+#[cfg(feature = "window")]
+mod exportui;
+#[cfg(feature = "window")]
+mod gate;
+#[cfg(feature = "window")]
+mod launch;
+#[cfg(feature = "window")]
+mod newpage;
+#[cfg(feature = "window")]
+mod settings;
+#[cfg(feature = "window")]
 mod sheet;
+#[cfg(feature = "window")]
+mod taskboard;
 #[cfg(feature = "window")]
 mod ui;
 

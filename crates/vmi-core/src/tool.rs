@@ -447,7 +447,8 @@ impl ToolSettings {
             rev: SETTINGS_REV,
             tool,
             color: [0xFF, 0x3E, 0xB8],
-            size: 16.0,
+            // Python's Brush starts at 24. The pen keeps that, not a smaller default.
+            size: 24.0,
             size_min: 1.0,
             size_max: 128.0,
             softness: 0.0,

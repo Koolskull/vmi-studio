@@ -17,7 +17,7 @@ use crate::sheet::{self, Act, SheetState};
 use crate::tablet;
 use vmi_core::palette::Palette;
 use vmi_core::{
-    blend_label, palette_matching, parse_hex, CurveKind, Edge, Field, GrainKind, Section, Theme, Tip, Tool,
+    blend_label, palette_matching, parse_hex, CurveKind, Edge, Field, GrainKind, Release, Section, Theme, Tip, Tool,
     ToolSettings, BLENDS, THEMES,
 };
 
@@ -71,6 +71,23 @@ struct StudioApp {
     settings: SettingsBar,
     /// The face id last handed to egui. Empty until the first apply.
     applied_font: String,
+    /// Folder the browser is listing.
+    browse_path: String,
+    browse_back: Vec<String>,
+    browse_filter: String,
+    list_filter: String,
+    /// 0 recent, 1 projects, 2 tasks.
+    browse_mode: usize,
+    project_index: usize,
+    /// A layer-opacity dial drag. One undo step when the pointer lets go.
+    opacity_drag: Option<OpacityDrag>,
+}
+
+struct OpacityDrag {
+    id: String,
+    start_y: f32,
+    start: u8,
+    before: Option<vmi_core::Art>,
 }
 
 /// One rotary on the panel. Every value is 0..=1 on the dial.
@@ -102,7 +119,7 @@ impl Dial {
         match self {
             Self::Size => "Size. Drag up for a bigger brush. Double-click resets.",
             Self::Soft => "Softness. Drag up to soften the edge.",
-            Self::Opacity => "Opacity.",
+            Self::Opacity => "Opacity of the whole stroke. Dabs inside one stroke do not stack past it.",
             Self::Texture => "Texture. How much of the generated tip shows.",
             Self::Tolerance => "Fill tolerance.",
             Self::Pick => "Pick radius for points and handles.",
@@ -329,6 +346,13 @@ impl StudioApp {
             newpage: NewPage::new(),
             settings: SettingsBar::new(),
             applied_font: String::new(),
+            browse_path: String::new(),
+            browse_back: Vec::new(),
+            browse_filter: String::new(),
+            list_filter: String::new(),
+            browse_mode: 0,
+            project_index: 0,
+            opacity_drag: None,
         }
     }
 
@@ -401,6 +425,9 @@ impl StudioApp {
         let mut zoom_in = false;
         let mut zoom_out = false;
         let mut step: i64 = 0;
+        let mut size_step: i32 = 0;
+        let mut swap_inks = false;
+        let mut clear_ink = false;
         let mut first = false;
         let mut last = false;
         let mut onion = false;
@@ -465,6 +492,20 @@ impl StudioApp {
             if !typing && input.key_pressed(egui::Key::Backspace) && plain {
                 backspace = true;
             }
+            // Python's draw bar: [ ] step the size, Shift+[ ] by ten, X trades the two inks,
+            // C clears. Repeat is allowed on the brackets. Shift+X stays the cut.
+            if !typing && plain && input.key_pressed(egui::Key::OpenBracket) {
+                size_step = if shift { -10 } else { -1 };
+            }
+            if !typing && plain && input.key_pressed(egui::Key::CloseBracket) {
+                size_step = if shift { 10 } else { 1 };
+            }
+            if !typing && plain && !shift && input.key_pressed(egui::Key::X) {
+                swap_inks = true;
+            }
+            if !typing && plain && !shift && input.key_pressed(egui::Key::C) {
+                clear_ink = true;
+            }
             // `=`, `+`, Ctrl+`=`, and Ctrl+`+` zoom in; `-` and Ctrl+`-` zoom out.
             let zoom_keys = !typing && !input.modifiers.alt;
             if zoom_keys && (input.key_pressed(egui::Key::Equals) || input.key_pressed(egui::Key::Plus)) {
@@ -477,7 +518,6 @@ impl StudioApp {
                 for (key, name) in [
                     (egui::Key::P, "P"),
                     (egui::Key::N, "N"),
-                    (egui::Key::C, "C"),
                     (egui::Key::B, "B"),
                     (egui::Key::A, "A"),
                     (egui::Key::E, "E"),
@@ -531,6 +571,15 @@ impl StudioApp {
         if !shortcut.is_empty() {
             self.desk.shortcut(&shortcut);
         }
+        if size_step != 0 {
+            self.desk.nudge_size(size_step);
+        }
+        if swap_inks {
+            self.desk.swap_inks();
+        }
+        if clear_ink {
+            self.desk.toggle_clear();
+        }
         if step != 0 {
             self.desk.step_frame(step);
         }
@@ -554,6 +603,7 @@ impl StudioApp {
     fn tool_settings(&mut self, ui: &mut egui::Ui, tool: Tool) {
         let theme = self.desk.theme();
         let mut settings = self.desk.preset_of(tool).clone();
+        settings.color = self.desk.ink;
         let before = settings.clone();
         ui.label(egui::RichText::new(tool.usage()).color(rgb(theme.soft)));
         ui.label(egui::RichText::new(tool.release_note()).color(rgb(theme.ink)));
@@ -568,7 +618,9 @@ impl StudioApp {
             settings = ToolSettings::default_for(tool);
         }
         if settings != before {
+            let color = settings.color;
             self.desk.edit_preset(tool, |slot| *slot = settings);
+            self.desk.set_ink(color);
         }
     }
 
@@ -588,7 +640,7 @@ impl StudioApp {
         let animation0 = node.animation;
         let before = (name.clone(), opacity, blend.clone(), clip, visible, mute, solo);
         ui.label(if is_group { "Folder" } else { "Layer" });
-        self.watch_text(ui.text_edit_singleline(&mut name));
+        self.watch_text(field_edit(ui, &mut name));
         ui.add(egui::Slider::new(&mut opacity, 0..=255).text("Opacity"));
         egui::ComboBox::from_label("Blend")
             .selected_text(blend_label(&blend))
@@ -753,9 +805,9 @@ impl StudioApp {
         let mut kind = object.kind.clone();
         let before = (name.clone(), kind.clone());
         ui.label("Object");
-        self.watch_text(ui.text_edit_singleline(&mut name));
+        self.watch_text(field_edit(ui, &mut name));
         ui.label("Kind");
-        self.watch_text(ui.text_edit_singleline(&mut kind));
+        self.watch_text(field_edit(ui, &mut kind));
         if (name.clone(), kind.clone()) != before {
             self.desk.edit_object(|object| {
                 object.name = name;
@@ -923,10 +975,18 @@ impl StudioApp {
         }
     }
 
-    /// The launcher page, in the window where the editor otherwise is.
+    /// Projects, recent files, and a folder browser. Nothing loads until a drawing is opened.
     fn browser_page(&mut self, ui: &mut egui::Ui) {
         let theme = self.desk.theme();
-        ui.add_space(8.0);
+        let book = vmi_core::catalog::load_book(&vmi_core::catalog::book_path());
+        if self.browse_path.is_empty() {
+            self.browse_path = vmi_core::catalog::default_browse(&book).display().to_string();
+        }
+        if self.project_index >= book.projects.len() {
+            self.project_index = 0;
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Pick a drawing. Nothing loads until you open it.").color(rgb(theme.quiet)));
         ui.horizontal(|ui| {
             if ui.button("New picture").clicked() {
                 self.new_picture();
@@ -936,7 +996,128 @@ impl StudioApp {
                 self.prompt = Some(Prompt::Open);
             }
         });
-        ui.label(egui::RichText::new("Open a .clip, .psd, .kra, .xcf, or .vmib file.").color(rgb(theme.soft)));
+        let mut open_path: Option<String> = None;
+        let mut enter: Option<String> = None;
+        let mut up = false;
+        let mut back = false;
+        let places = vmi_core::catalog::places();
+        ui.columns(3, |columns| {
+            columns[0].label(egui::RichText::new("LISTS").color(rgb(theme.quiet)));
+            columns[0].horizontal(|ui| {
+                if ui.selectable_label(self.browse_mode == 0, "Recent").clicked() {
+                    self.browse_mode = 0;
+                }
+                if ui.selectable_label(self.browse_mode == 1, "Projects").clicked() {
+                    self.browse_mode = 1;
+                }
+            });
+            egui::ScrollArea::vertical().id_salt("browser-projects").auto_shrink([false, false]).max_height(220.0).show(&mut columns[0], |ui| {
+                for (index, project) in book.projects.iter().enumerate() {
+                    if ui.selectable_label(self.browse_mode == 1 && index == self.project_index, &project.title).clicked() {
+                        self.browse_mode = 1;
+                        self.project_index = index;
+                    }
+                }
+                if book.projects.is_empty() {
+                    ui.label(egui::RichText::new("No projects yet.").color(rgb(theme.quiet)));
+                }
+            });
+
+            let title = if self.browse_mode == 1 {
+                book.projects.get(self.project_index).map(|project| project.title.as_str()).unwrap_or("PROJECT")
+            } else {
+                "RECENTLY USED"
+            };
+            columns[1].label(egui::RichText::new(title).color(rgb(theme.quiet)));
+            let filter = field_edit(&mut columns[1], &mut self.list_filter);
+            self.watch_text(filter);
+            let files: Vec<(String, String)> = if self.browse_mode == 1 {
+                book.projects.get(self.project_index).map(|project| project.files.clone()).unwrap_or_default()
+            } else {
+                book.recent.clone()
+            }
+            .into_iter()
+            .map(|file| (file.label, file.path))
+            .filter(|(label, path)| list_match(&self.list_filter, label, path))
+            .collect();
+            egui::ScrollArea::vertical().id_salt("browser-files").auto_shrink([false, false]).show(&mut columns[1], |ui| {
+                for (label, path) in &files {
+                    let name = if label.is_empty() { path.clone() } else { label.clone() };
+                    if ui.button(name).on_hover_text(path).clicked() {
+                        open_path = Some(path.clone());
+                    }
+                }
+                if files.is_empty() {
+                    ui.label(egui::RichText::new("No drawings in this list.").color(rgb(theme.quiet)));
+                }
+            });
+
+            columns[2].label(egui::RichText::new("BROWSER").color(rgb(theme.quiet)));
+            columns[2].horizontal_wrapped(|ui| {
+                for (label, path) in &places {
+                    if ui.button(*label).clicked() {
+                        enter = Some(path.display().to_string());
+                    }
+                }
+            });
+            columns[2].horizontal(|ui| {
+                if ui.button("Back").clicked() {
+                    back = true;
+                }
+                if ui.button("Up").clicked() {
+                    up = true;
+                }
+                let path_edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.browse_path)
+                        .desired_width(ui.available_width())
+                        .text_color(rgb(theme.ink)),
+                );
+                self.watch_text(path_edit);
+            });
+            let folder_filter = field_edit(&mut columns[2], &mut self.browse_filter);
+            self.watch_text(folder_filter);
+            let rows = folder_rows(std::path::Path::new(&self.browse_path), &self.browse_filter);
+            egui::ScrollArea::vertical().id_salt("browser-folders").auto_shrink([false, false]).show(&mut columns[2], |ui| {
+                for row in &rows {
+                    let mark = if row.dir { "+ " } else { "" };
+                    if ui.button(format!("{mark}{}", row.name)).on_hover_text(row.path.display().to_string()).clicked() {
+                        if row.dir {
+                            enter = Some(row.path.display().to_string());
+                        } else {
+                            open_path = Some(row.path.display().to_string());
+                        }
+                    }
+                }
+                if rows.is_empty() {
+                    ui.label(egui::RichText::new("No folders or drawings here.").color(rgb(theme.quiet)));
+                }
+            });
+        });
+        if back {
+            if let Some(previous) = self.browse_back.pop() {
+                self.browse_path = previous;
+            }
+        } else if up {
+            if let Some(parent) = std::path::Path::new(&self.browse_path).parent() {
+                if parent != std::path::Path::new(&self.browse_path) {
+                    self.browse_back.push(self.browse_path.clone());
+                    self.browse_path = parent.display().to_string();
+                }
+            }
+        } else if let Some(path) = enter {
+            if path != self.browse_path {
+                self.browse_back.push(self.browse_path.clone());
+                self.browse_path = path;
+            }
+        }
+        if let Some(path) = open_path {
+            let file = std::path::PathBuf::from(&path);
+            if file.is_file() {
+                self.desk.begin_open(&file, false);
+            } else {
+                self.desk.status = "That file is missing.".into();
+            }
+        }
     }
 
     fn windows(&mut self, ctx: &egui::Context) {
@@ -991,7 +1172,7 @@ impl StudioApp {
             let mut open = true;
             egui::Window::new(title).open(&mut open).resizable(true).show(ctx, |ui| {
                 ui.label("Path");
-                let path_edit = ui.text_edit_singleline(&mut self.path_text);
+                let path_edit = field_edit(ui, &mut self.path_text);
                 self.watch_text(path_edit);
                 if matches!(prompt, Prompt::Export) {
                     let mut percent = i32::try_from(self.desk.session.export_percent).unwrap_or(100);
@@ -1404,11 +1585,9 @@ impl StudioApp {
         }
     }
 
-    /// Set the color of the tool that owns one, and remember it.
+    /// One ink for every tool. Remember it.
     fn pick_color(&mut self, color: [u8; 3]) {
-        let tool = color_tool_for(self.desk.tool());
-        self.desk.edit_preset(tool, |slot| slot.color = color);
-        self.desk.session.note_recent_color(color);
+        self.desk.set_ink(color);
     }
 
     /// The rotaries. 7 o'clock is 0, the long way around to 5 o'clock is 1.
@@ -1564,58 +1743,108 @@ impl StudioApp {
 
     fn layers(&mut self, ui: &mut egui::Ui) {
         let theme = self.desk.theme();
-        ui.horizontal(|ui| {
-            if ui.button("Layer").clicked() {
-                self.desk.add_layer();
-            }
-            if ui.button("Group").clicked() {
-                self.desk.add_group();
-            }
-        });
-        ui.label(egui::RichText::new("Front is on top. Right-click a row for its settings.").color(rgb(theme.soft)).small());
         let rows = self.desk.layer_rows();
         let selected = self.desk.selected.clone();
-        let mut toggle_animation: Option<String> = None;
+        let chip = blend_chip_width(ui);
+        let mut toggle_folder: Option<String> = None;
+        let mut mark: Option<(String, &'static str)> = None;
+        let mut blend_pick: Option<(String, String)> = None;
+        let mut opacity_start: Option<OpacityDrag> = None;
         egui::ScrollArea::vertical().id_salt("layer-rows").auto_shrink([false, false]).show(ui, |ui| {
-            for row in rows {
-                ui.horizontal(|ui| {
-                    ui.add_space(row.depth as f32 * 12.0);
-                    let mut visible = row.visible;
-                    if ui.checkbox(&mut visible, "").changed() {
-                        self.desk.update_layer(&row.id, |node| node.visible = visible);
-                    }
-                    if row.group {
-                        // A, like M, S, and C on the Python rows: this folder is a sequence.
-                        if letter_cell(ui, theme, egui::vec2(16.0, 16.0), "A", row.animation)
-                            .on_hover_text("Animation: this folder is one sequence. Its layers are its cels.")
-                            .clicked()
-                        {
-                            toggle_animation = Some(row.id.clone());
+            for row in &rows {
+                let width = ui.available_width();
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::click_and_drag());
+                let active = selected.as_deref() == Some(row.id.as_str());
+                let geom = row_geom(rect, row.depth, row.group, chip);
+                paint_layer_row(ui, theme, row, active, &geom, rect);
+                let pointer = response.interact_pointer_pos();
+                if response.secondary_clicked() {
+                    self.desk.open_layer_window(row.id.clone());
+                }
+                if response.clicked() {
+                    if let Some(pos) = pointer {
+                        if geom.disclosure.is_some_and(|box_| box_.contains(pos)) {
+                            toggle_folder = Some(row.id.clone());
+                        } else if geom.eye.contains(pos) {
+                            let visible = !row.visible;
+                            self.desk.update_layer(&row.id, |node| node.visible = visible);
+                        } else if geom.mute.contains(pos) {
+                            mark = Some((row.id.clone(), "mute"));
+                        } else if geom.solo.contains(pos) {
+                            mark = Some((row.id.clone(), "solo"));
+                        } else if geom.clip.contains(pos) {
+                            mark = Some((row.id.clone(), "clip"));
+                        } else if geom.blend.is_some_and(|box_| box_.contains(pos)) {
+                            let popup = ui.make_persistent_id(("blend", row.id.as_str()));
+                            ui.memory_mut(|memory| memory.toggle_popup(popup));
+                        } else if !geom.opacity.contains(pos) {
+                            self.desk.select_layer(row.id.clone());
                         }
                     }
-                    let active = selected.as_deref() == Some(row.id.as_str());
-                    let prefix = if row.group { "▸ " } else { "" };
-                    let suffix = match row.frame {
-                        Some(frame) => format!("  f{frame}"),
-                        None => String::new(),
-                    };
-                    let fill = if active { rgb(theme.ink) } else { rgb(theme.row) };
-                    let text = if active { rgb(theme.field) } else { rgb(theme.ink) };
-                    let response = ui.add_sized(
-                        [ui.available_width(), 24.0],
-                        egui::Button::new(egui::RichText::new(format!("{prefix}{}{suffix}", row.name)).color(text)).fill(fill),
+                }
+                if response.drag_started() {
+                    if let Some(pos) = pointer {
+                        if geom.opacity.contains(pos) {
+                            opacity_start = Some(OpacityDrag {
+                                id: row.id.clone(),
+                                start_y: pos.y,
+                                start: row.opacity,
+                                before: None,
+                            });
+                        }
+                    }
+                }
+                if let Some(blend) = geom.blend {
+                    let popup = ui.make_persistent_id(("blend", row.id.as_str()));
+                    let mut anchor = response.clone();
+                    anchor.rect = blend;
+                    let picked = egui::popup::popup_below_widget(
+                        ui,
+                        popup,
+                        &anchor,
+                        egui::popup::PopupCloseBehavior::CloseOnClick,
+                        |ui| {
+                            let mut chosen = None;
+                            for mode in BLENDS {
+                                if ui.button(blend_label(mode)).clicked() {
+                                    chosen = Some((*mode).to_string());
+                                }
+                            }
+                            chosen
+                        },
                     );
-                    if response.clicked() {
-                        self.desk.select_layer(row.id.clone());
+                    if let Some(Some(mode)) = picked {
+                        blend_pick = Some((row.id.clone(), mode));
                     }
-                    if response.secondary_clicked() {
-                        self.desk.open_layer_window(row.id.clone());
-                    }
-                });
+                }
             }
         });
-        if let Some(id) = toggle_animation {
-            self.desk.toggle_animation(&id);
+        if opacity_start.is_some() {
+            self.opacity_drag = opacity_start;
+        }
+        if let Some(drag) = self.opacity_drag.as_mut() {
+            if let Some(pos) = ui.input(|input| input.pointer.interact_pos()) {
+                let delta = drag.start_y - pos.y;
+                let value = (f32::from(drag.start) + delta * 255.0 / 100.0).round().clamp(0.0, 255.0) as u8;
+                self.desk.preview_opacity(&drag.id, value, &mut drag.before);
+            }
+            if ui.input(|input| input.pointer.any_released()) {
+                let before = self.opacity_drag.take().and_then(|drag| drag.before);
+                self.desk.finish_opacity(before);
+            }
+        }
+        if let Some(id) = toggle_folder {
+            self.desk.toggle_folder(&id);
+        }
+        if let Some((id, which)) = mark {
+            self.desk.update_layer(&id, |node| match which {
+                "mute" => node.mute = !node.mute,
+                "solo" => node.solo = !node.solo,
+                _ => node.clip = !node.clip,
+            });
+        }
+        if let Some((id, mode)) = blend_pick {
+            self.desk.update_layer(&id, |node| node.blend = mode);
         }
     }
 
@@ -1819,10 +2048,65 @@ impl StudioApp {
 
     fn picture_bar(&mut self, ui: &mut egui::Ui) {
         let theme = self.desk.theme();
+        let tool = self.desk.tool();
         ui.horizontal_wrapped(|ui| {
-            let tool = self.desk.tool();
             ui.label(egui::RichText::new(tool.name()).color(rgb(theme.ink)).strong());
             ui.label(egui::RichText::new(tool.usage()).color(rgb(theme.soft)));
+            if brush_tool(tool) {
+                let preset = self.desk.preset().clone();
+                let mut size = preset.size.round() as i32;
+                let mut low = preset.size_min.round() as i32;
+                let mut high = preset.size_max.round() as i32;
+                ui.label(egui::RichText::new("Size").color(rgb(theme.soft)));
+                let size_box = ui.add(egui::DragValue::new(&mut size).range(1..=512).speed(1.0));
+                if size_box.changed() {
+                    self.desk.edit_preset(tool, |slot| slot.size = size as f32);
+                }
+                self.watch_text(size_box);
+                ui.label(egui::RichText::new("Min").color(rgb(theme.soft)));
+                if ui.add(egui::DragValue::new(&mut low).range(1..=512).speed(1.0)).changed() {
+                    self.desk.edit_preset(tool, |slot| slot.size_min = low as f32);
+                }
+                ui.label(egui::RichText::new("Max").color(rgb(theme.soft)));
+                if ui.add(egui::DragValue::new(&mut high).range(1..=512).speed(1.0)).changed() {
+                    self.desk.edit_preset(tool, |slot| slot.size_max = high as f32);
+                }
+                if ui.button(fringe_label(preset.fringe)).on_hover_text("Antialiasing. Click to cycle off, .5, 1, and 2.").clicked() {
+                    let next = cycle_fringe(preset.fringe);
+                    self.desk.edit_preset(tool, |slot| slot.fringe = next);
+                }
+                let mut size_pressure = preset.size_pressure;
+                if ui.checkbox(&mut size_pressure, "Pressure size").changed() {
+                    self.desk.edit_preset(tool, |slot| slot.size_pressure = size_pressure);
+                }
+                let mut opacity_pressure = preset.opacity_pressure;
+                if ui.checkbox(&mut opacity_pressure, "Flow").on_hover_text("Pressure changes how hard each dab is. Opacity stays the whole stroke.").changed() {
+                    self.desk.edit_preset(tool, |slot| slot.opacity_pressure = opacity_pressure);
+                }
+                let mut percent = (preset.opacity * 100.0).round() as i32;
+                if ui
+                    .add(egui::DragValue::new(&mut percent).range(0..=100).speed(1.0).suffix("%"))
+                    .on_hover_text("Opacity of the whole stroke. One pass, even where the stroke crosses itself.")
+                    .changed()
+                {
+                    self.desk.edit_preset(tool, |slot| slot.opacity = percent as f32 / 100.0);
+                }
+                let mut color = self.desk.ink;
+                if ui.color_edit_button_srgb(&mut color).on_hover_text("Ink for every tool. X trades it with the other color.").changed() {
+                    self.desk.set_ink(color);
+                }
+                let back = self.desk.ink_back;
+                let back_button = egui::Button::new("X").fill(rgb(back)).min_size(egui::vec2(28.0, 18.0));
+                if ui.add(back_button).on_hover_text("Other color. X trades the two inks.").clicked() {
+                    self.desk.swap_inks();
+                }
+                let mut clear = self.desk.clear_ink;
+                if ui.checkbox(&mut clear, "Clear").on_hover_text("C. Empty pixels, same size.").changed() {
+                    if clear != self.desk.clear_ink {
+                        self.desk.toggle_clear();
+                    }
+                }
+            }
             if ui.button("Warp target").clicked() {
                 self.desk.set_tool(Tool::WarpTarget);
             }
@@ -1962,8 +2246,14 @@ impl StudioApp {
         let space = ui.input(|input| input.key_down(egui::Key::Space));
         let shift = ui.input(|input| input.modifiers.shift);
         let middle = ui.input(|input| input.pointer.button_down(egui::PointerButton::Middle));
-        let navigating = response.hovered() && (space || middle || (shift && response.dragged()));
-        if navigating && (space || middle) && response.dragged() {
+        // Space pans. Space+Shift drags zoom about the view center. Shift rotates about that center.
+        if response.dragged() && space && shift {
+            let dy = ui.input(|input| input.pointer.delta().y);
+            let factor = (-dy * 0.008).exp();
+            let center = response.rect.center();
+            self.desk.zoom_at(frame, center.x, center.y, factor);
+            self.rotate_from = None;
+        } else if response.dragged() && (space || middle) {
             let delta = ui.input(|input| input.pointer.delta());
             self.desk.pan_by(delta.x, delta.y);
             self.rotate_from = None;
@@ -1973,12 +2263,13 @@ impl StudioApp {
                 if let Some(prev) = self.rotate_from {
                     let a0 = (prev.y - center.y).atan2(prev.x - center.x);
                     let a1 = (pos.y - center.y).atan2(pos.x - center.x);
-                    self.desk.rotate(a1 - a0);
+                    self.desk.rotate_about_view(a1 - a0);
                 }
                 self.rotate_from = Some(pos);
             }
         } else {
             self.rotate_from = None;
+            let already_painting = self.desk.is_painting();
             let camera = self.desk.camera;
             let doc_w = self.desk.art.width as f32;
             let doc_h = self.desk.art.height as f32;
@@ -2002,10 +2293,35 @@ impl StudioApp {
             }
             let painting = response.dragged() && !shift && !space && !middle && !self.fingers.many();
             if painting {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let (x, y) = doc_at(pos);
-                    self.desk.move_doc(x, y);
+                // One frame can hold a whole run of pen moves. The last point
+                // alone is the straight segment at the start of a slow stroke.
+                let continued = already_painting;
+                let positions: Vec<egui::Pos2> = ui.input(|input| {
+                    let mut after_press = continued;
+                    let mut points = Vec::new();
+                    for event in &input.events {
+                        match event {
+                            egui::Event::PointerButton { pressed: true, button: egui::PointerButton::Primary, .. } => {
+                                after_press = true;
+                            }
+                            egui::Event::PointerMoved(pos) if after_press => points.push(*pos),
+                            _ => {}
+                        }
+                    }
+                    points
+                });
+                if positions.is_empty() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let (x, y) = doc_at(pos);
+                        self.desk.move_doc(x, y);
+                    }
+                } else {
+                    for pos in positions {
+                        let (x, y) = doc_at(pos);
+                        self.desk.move_doc(x, y);
+                    }
                 }
+                ctx.request_repaint();
             }
             if response.drag_stopped() && !shift && !space {
                 if let Some(pos) = response.interact_pointer_pos() {
@@ -2182,6 +2498,42 @@ fn palette_files(folder: &Path) -> Vec<PathBuf> {
 }
 
 /// The tool whose color the color cell edits: this one, or the pen.
+fn list_match(filter: &str, label: &str, path: &str) -> bool {
+    let filter = filter.trim().to_lowercase();
+    filter.is_empty() || label.to_lowercase().contains(&filter) || path.to_lowercase().contains(&filter)
+}
+
+struct FolderRow {
+    name: String,
+    path: PathBuf,
+    dir: bool,
+}
+
+fn folder_rows(folder: &Path, filter: &str) -> Vec<FolderRow> {
+    let mut rows = Vec::new();
+    let Ok(read) = std::fs::read_dir(folder) else {
+        return rows;
+    };
+    let filter = filter.trim().to_lowercase();
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let dir = path.is_dir();
+        if !dir && !vmi_core::catalog::is_drawing(&path) {
+            continue;
+        }
+        if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
+            continue;
+        }
+        rows.push(FolderRow { name, path, dir });
+    }
+    rows.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    rows
+}
+
 fn color_tool_for(active: Tool) -> Tool {
     if active.fields().contains(&Field::Color) {
         active
@@ -2270,6 +2622,220 @@ fn sized_cell(
     response
 }
 
+const ROW_H: f32 = 22.0;
+const GUIDE: f32 = 16.0;
+const MARK: f32 = 11.0;
+const KNOB: f32 = 18.0;
+const ROW_GUTTER: f32 = 7.0;
+const BLEND_GAP: f32 = 8.0;
+const BLEND_TAIL: f32 = 4.0;
+const MIN_TREE: f32 = 160.0;
+
+struct RowGeom {
+    disclosure: Option<egui::Rect>,
+    eye: egui::Rect,
+    name_x: f32,
+    branch_x: f32,
+    mute: egui::Rect,
+    solo: egui::Rect,
+    clip: egui::Rect,
+    opacity: egui::Rect,
+    blend: Option<egui::Rect>,
+    split: f32,
+}
+
+fn blend_chip_width(ui: &egui::Ui) -> f32 {
+    let font = egui::FontId::monospace(12.0);
+    let mut widest = 0.0_f32;
+    for mode in BLENDS {
+        let width = ui.fonts(|fonts| {
+            fonts.layout_no_wrap(blend_label(mode).to_owned(), font.clone(), egui::Color32::WHITE).size().x
+        });
+        widest = widest.max(width);
+    }
+    widest + 18.0
+}
+
+/// Names on the left. Mute, solo, clip, and the dial stay. The blend chip
+/// drops first when the names would fall under 160 px, the same rule as Python.
+fn row_geom(rect: egui::Rect, depth: usize, group: bool, chip: f32) -> RowGeom {
+    let buttons = 6.0 + MARK + 6.0 + MARK + 6.0 + MARK + 6.0 + KNOB;
+    let full = ROW_GUTTER + buttons + BLEND_GAP + chip + BLEND_TAIL;
+    let show_blend = rect.width() >= MIN_TREE + full;
+    let x0 = rect.left() + 4.0;
+    let branch = x0 + depth as f32 * GUIDE + GUIDE / 2.0;
+    let top = rect.center().y - MARK / 2.0;
+    let disclosure = if group {
+        Some(egui::Rect::from_min_size(egui::pos2(branch - MARK / 2.0, top), egui::vec2(MARK, MARK)))
+    } else {
+        None
+    };
+    let eye = egui::Rect::from_min_size(egui::pos2(branch + GUIDE - MARK / 2.0, top), egui::vec2(MARK, MARK));
+    let end = rect.right();
+    let after_opacity = if show_blend { end - BLEND_TAIL - chip - BLEND_GAP } else { end - BLEND_TAIL };
+    let opacity = egui::Rect::from_min_size(
+        egui::pos2(after_opacity - KNOB, rect.center().y - KNOB / 2.0),
+        egui::vec2(KNOB, KNOB),
+    );
+    let clip = egui::Rect::from_min_size(egui::pos2(opacity.left() - 6.0 - MARK, top), egui::vec2(MARK, MARK));
+    let solo = egui::Rect::from_min_size(egui::pos2(clip.left() - 6.0 - MARK, top), egui::vec2(MARK, MARK));
+    let mute = egui::Rect::from_min_size(egui::pos2(solo.left() - 6.0 - MARK, top), egui::vec2(MARK, MARK));
+    let split = mute.left() - 6.0;
+    let blend = if show_blend {
+        Some(egui::Rect::from_min_size(
+            egui::pos2(end - BLEND_TAIL - chip, rect.top() + 2.0),
+            egui::vec2(chip, (rect.height() - 4.0).max(0.0)),
+        ))
+    } else {
+        None
+    };
+    RowGeom {
+        disclosure,
+        eye,
+        name_x: eye.right() + 8.0,
+        branch_x: branch,
+        mute,
+        solo,
+        clip,
+        opacity,
+        blend,
+        split,
+    }
+}
+
+fn paint_layer_row(ui: &egui::Ui, theme: &Theme, row: &crate::desk::LayerRow, active: bool, geom: &RowGeom, rect: egui::Rect) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, rgb(if active { theme.row } else { theme.field }));
+    let rule = egui::Stroke::new(1.0_f32, rgb(theme.rule));
+    let x0 = rect.left() + 4.0;
+    let mid = rect.center().y;
+    for level in 0..row.depth {
+        if row.guides & (1u32 << level.min(31)) == 0 {
+            continue;
+        }
+        let gx = x0 + level as f32 * GUIDE + GUIDE / 2.0;
+        painter.line_segment([egui::pos2(gx, rect.top()), egui::pos2(gx, rect.bottom())], rule);
+    }
+    painter.line_segment([egui::pos2(geom.branch_x, rect.top()), egui::pos2(geom.branch_x, mid)], rule);
+    if row.has_next {
+        painter.line_segment([egui::pos2(geom.branch_x, mid), egui::pos2(geom.branch_x, rect.bottom())], rule);
+    }
+    let hook = geom.disclosure.map(|box_| box_.left()).unwrap_or(geom.eye.left());
+    painter.line_segment([egui::pos2(geom.branch_x, mid), egui::pos2(hook, mid)], rule);
+    let mark_color = if active { rgb(theme.ink) } else { rgb(theme.quiet) };
+    let mark = egui::Stroke::new(1.0_f32, mark_color);
+    if let Some(box_) = geom.disclosure {
+        painter.rect_stroke(box_.shrink(0.5), 0.0, mark);
+        let y = box_.center().y;
+        painter.line_segment([egui::pos2(box_.left() + 2.0, y), egui::pos2(box_.right() - 2.0, y)], mark);
+        if !row.open {
+            let x = box_.center().x;
+            painter.line_segment([egui::pos2(x, box_.top() + 2.0), egui::pos2(x, box_.bottom() - 2.0)], mark);
+        }
+    }
+    if row.visible {
+        painter.rect_filled(geom.eye, 0.0, mark_color);
+    }
+    painter.rect_stroke(geom.eye.shrink(0.5), 0.0, mark);
+    let name_color = if active {
+        rgb(theme.ink)
+    } else if row.marker == "window" {
+        egui::Color32::from_rgb(0x8b, 0x6b, 0xb8)
+    } else if row.marker == "target" {
+        egui::Color32::from_rgb(0x5c, 0x3e, 0x4a)
+    } else {
+        rgb(theme.quiet)
+    };
+    let font = egui::FontId::monospace(12.0);
+    let mut label = row.name.clone();
+    if let Some(frame) = row.frame {
+        label.push_str(&format!("  f{frame}"));
+    }
+    let reserve = if row.animation { 36.0 } else { 6.0 };
+    let shown = elide_right(ui, &font, &label, (geom.split - geom.name_x - reserve).max(0.0));
+    painter.text(egui::pos2(geom.name_x, mid), egui::Align2::LEFT_CENTER, &shown, font.clone(), name_color);
+    if row.animation {
+        let ani = if active { rgb(theme.ink) } else { rgb(theme.quiet) };
+        painter.text(egui::pos2(geom.split - 4.0, mid), egui::Align2::RIGHT_CENTER, "ANI", font.clone(), ani);
+    }
+    let text_w = ui.fonts(|fonts| fonts.layout_no_wrap(shown, font, egui::Color32::WHITE).size().x);
+    let rule_start = geom.name_x + text_w + 8.0;
+    if rule_start < rect.right() - 2.0 {
+        painter.line_segment(
+            [egui::pos2(rule_start, rect.bottom() - 0.5), egui::pos2(rect.right(), rect.bottom() - 0.5)],
+            rule,
+        );
+    }
+    paint_square(ui, geom.mute, "M", row.mute, false, theme);
+    paint_square(ui, geom.solo, "S", row.solo, false, theme);
+    paint_square(ui, geom.clip, "C", row.clip, active, theme);
+    paint_opacity_dial(ui, geom.opacity, row.opacity, active, theme);
+    if let Some(box_) = geom.blend {
+        paint_blend(ui, box_, &row.blend, active, theme);
+    }
+}
+
+fn paint_square(ui: &egui::Ui, box_: egui::Rect, letter: &str, on: bool, lit: bool, theme: &Theme) {
+    if box_.width() < 4.0 {
+        return;
+    }
+    let painter = ui.painter();
+    let (frame, fill, text) = if letter == "C" {
+        if on && lit {
+            (rgb(theme.ink), Some(rgb(theme.ink)), rgb(theme.field))
+        } else if on {
+            (rgb(theme.quiet), Some(rgb(theme.quiet)), rgb(theme.field))
+        } else {
+            (rgb(theme.quiet), None, rgb(theme.quiet))
+        }
+    } else if on {
+        (rgb(theme.ink), Some(rgb(theme.ink)), rgb(theme.field))
+    } else {
+        (rgb(theme.quiet), None, rgb(theme.quiet))
+    };
+    if let Some(fill) = fill {
+        painter.rect_filled(box_, 0.0, fill);
+    }
+    painter.rect_stroke(box_.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, frame));
+    painter.text(box_.center(), egui::Align2::CENTER_CENTER, letter, egui::FontId::monospace(9.0), text);
+}
+
+fn paint_opacity_dial(ui: &egui::Ui, box_: egui::Rect, opacity: u8, lit: bool, theme: &Theme) {
+    if box_.width() < 8.0 {
+        return;
+    }
+    let color = if lit { rgb(theme.ink) } else { rgb(theme.quiet) };
+    let painter = ui.painter();
+    let center = box_.center();
+    let radius = box_.width().min(box_.height()) / 2.0 - 2.0;
+    painter.circle_stroke(center, radius, egui::Stroke::new(1.0_f32, color));
+    let amount = f32::from(opacity) / 255.0;
+    let angle = (2.0_f32 / 3.0) * std::f32::consts::PI + amount * (5.0_f32 / 3.0) * std::f32::consts::PI;
+    let bump = center + egui::vec2(angle.cos(), angle.sin()) * (radius - 0.5);
+    painter.rect_filled(egui::Rect::from_center_size(bump, egui::vec2(3.0, 2.0)), 0.0, color);
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        format!("{opacity:02X}"),
+        egui::FontId::monospace(7.0),
+        color,
+    );
+}
+
+fn paint_blend(ui: &egui::Ui, box_: egui::Rect, mode: &str, lit: bool, theme: &Theme) {
+    if box_.width() < 8.0 {
+        return;
+    }
+    let painter = ui.painter();
+    painter.rect_filled(box_, 0.0, rgb(theme.field));
+    painter.rect_stroke(box_.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, rgb(theme.rule)));
+    let color = if lit { rgb(theme.ink) } else { rgb(theme.quiet) };
+    let font = egui::FontId::monospace(12.0);
+    let label = elide_right(ui, &font, blend_label(mode), (box_.width() - 18.0).max(0.0));
+    painter.text(egui::pos2(box_.left() + 4.0, box_.center().y), egui::Align2::LEFT_CENTER, label, font, color);
+    painter.text(egui::pos2(box_.right() - 3.0, box_.center().y), egui::Align2::RIGHT_CENTER, "v", egui::FontId::monospace(12.0), color);
+}
+
 fn letter_cell(ui: &mut egui::Ui, theme: &Theme, size: egui::Vec2, letter: &str, lit: bool) -> egui::Response {
     let text = letter.to_string();
     sized_cell(ui, theme, size, lit, move |painter, rect, ink| {
@@ -2304,6 +2870,31 @@ fn paint_dial(painter: &egui::Painter, rect: egui::Rect, amount: f32, digits: &s
     let bump = egui::pos2((center.x + angle.cos() * radius).round(), (center.y + angle.sin() * radius).round());
     painter.rect_filled(egui::Rect::from_center_size(bump, egui::vec2(3.0, 3.0)), 0.0, color);
     painter.text(center, egui::Align2::CENTER_CENTER, digits, egui::FontId::monospace(8.0), color);
+}
+
+/// Python's brush row: size, the two limits, antialiasing, pressure, the two inks.
+fn brush_tool(tool: Tool) -> bool {
+    tool != Tool::Fill && matches!(tool.release(), Release::Pixels | Release::Stroke)
+}
+
+fn cycle_fringe(fringe: f32) -> f32 {
+    const STEPS: [f32; 4] = [0.0, 0.5, 1.0, 2.0];
+    let index = STEPS.iter().position(|step| (fringe - step).abs() < 0.05).unwrap_or(0);
+    STEPS[(index + 1) % STEPS.len()]
+}
+
+fn fringe_label(fringe: f32) -> &'static str {
+    if fringe <= 0.0 {
+        "AA off"
+    } else if (fringe - 0.5).abs() < 0.05 {
+        "AA .5"
+    } else if (fringe - 1.0).abs() < 0.05 {
+        "AA 1"
+    } else if (fringe - 2.0).abs() < 0.05 {
+        "AA 2"
+    } else {
+        "AA"
+    }
 }
 
 fn paint_plate(ui: &mut egui::Ui, texture: &egui::TextureHandle, desk: &Desk, frame: Frame) {
@@ -2357,7 +2948,7 @@ fn edit_field(ui: &mut egui::Ui, tool: Tool, field: Field, settings: &mut ToolSe
                 ui.label("Color");
                 ui.color_edit_button_srgb(&mut settings.color);
                 let mut hex = vmi_core::hex_of(settings.color);
-                let response = ui.text_edit_singleline(&mut hex);
+                let response = field_edit(ui, &mut hex);
                 if response.has_focus() {
                     *typing = true;
                 }
@@ -2492,6 +3083,24 @@ fn rgb(color: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(color[0], color[1], color[2])
 }
 
+fn widget_look(fill: egui::Color32, weak: egui::Color32, border: egui::Color32, text: egui::Color32) -> egui::style::WidgetVisuals {
+    egui::style::WidgetVisuals {
+        bg_fill: fill,
+        weak_bg_fill: weak,
+        bg_stroke: egui::Stroke::new(1.0_f32, border),
+        fg_stroke: egui::Stroke::new(1.0_f32, text),
+        rounding: 0.0.into(),
+        expansion: 0.0,
+    }
+}
+
+/// A line edit. Typed text stays the ink. The frame is the rule until focus,
+/// then the selection stroke (white on Studio).
+fn field_edit(ui: &mut egui::Ui, text: &mut String) -> egui::Response {
+    let ink = ui.visuals().selection.stroke.color;
+    ui.add(egui::TextEdit::singleline(text).text_color(ink))
+}
+
 fn apply_theme(ctx: &egui::Context, theme: &Theme) {
     let mut visuals = if theme.field[0] > 180 {
         egui::Visuals::light()
@@ -2500,39 +3109,39 @@ fn apply_theme(ctx: &egui::Context, theme: &Theme) {
     };
     let ink = rgb(theme.ink);
     let field = rgb(theme.field);
-    visuals.panel_fill = rgb(theme.gutter);
-    visuals.window_fill = rgb(theme.row);
+    let quiet = rgb(theme.quiet);
+    let rule = rgb(theme.rule);
+    let row = rgb(theme.row);
+    // Python Studio: black field, quiet text until hover or focus, then white
+    // text and a white border. A selected row is white on #111111.
+    visuals.panel_fill = field;
+    visuals.window_fill = field;
     visuals.extreme_bg_color = field;
     visuals.faint_bg_color = rgb(theme.grid);
-    visuals.override_text_color = Some(ink);
-    let stroke = egui::Stroke::new(1.0_f32, ink);
-    visuals.widgets.noninteractive.bg_fill = rgb(theme.gutter);
-    visuals.widgets.noninteractive.fg_stroke = stroke;
-    visuals.widgets.inactive.bg_fill = rgb(theme.row);
-    visuals.widgets.inactive.fg_stroke = stroke;
-    visuals.widgets.hovered.bg_fill = rgb(theme.frame);
-    visuals.widgets.hovered.fg_stroke = stroke;
-    visuals.widgets.active.bg_fill = rgb(theme.frame);
-    visuals.widgets.active.fg_stroke = stroke;
-    visuals.selection.bg_fill = rgb(theme.frame);
-    visuals.selection.stroke = stroke;
-    visuals.window_stroke = egui::Stroke::new(1.0_f32, rgb(theme.frame));
-    // K-OS chrome: square corners, no shadows, no hover swell.
+    visuals.code_bg_color = row;
+    visuals.override_text_color = None;
+    visuals.widgets.noninteractive = widget_look(field, field, rule, quiet);
+    visuals.widgets.inactive = widget_look(field, field, rule, quiet);
+    visuals.widgets.hovered = widget_look(field, row, ink, ink);
+    visuals.widgets.active = widget_look(field, row, ink, ink);
+    visuals.widgets.open = widget_look(field, row, ink, ink);
+    visuals.selection.bg_fill = row;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, ink);
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, ink);
     visuals.window_rounding = 0.0.into();
     visuals.menu_rounding = 0.0.into();
     visuals.window_shadow = egui::epaint::Shadow::NONE;
     visuals.popup_shadow = egui::epaint::Shadow::NONE;
-    for widget in [
-        &mut visuals.widgets.noninteractive,
-        &mut visuals.widgets.inactive,
-        &mut visuals.widgets.hovered,
-        &mut visuals.widgets.active,
-        &mut visuals.widgets.open,
-    ] {
-        widget.rounding = 0.0.into();
-        widget.expansion = 0.0;
-    }
+    visuals.text_cursor.stroke.color = ink;
+    visuals.text_cursor.stroke.width = 1.0_f32;
     ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        let mut scroll = egui::style::ScrollStyle::solid();
+        scroll.bar_width = 10.0;
+        scroll.foreground_color = true;
+        style.spacing.scroll = scroll;
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    });
 }
 
 /// The house face when the font cache has it, else one mono face for all
@@ -2731,7 +3340,7 @@ impl eframe::App for StudioApp {
                     ui.label(self.desk.art.file_name.as_str());
                     ui.separator();
                 }
-                ui.label(self.desk.status.as_str());
+                ui.label(egui::RichText::new(self.desk.status.as_str()).color(rgb(self.desk.theme().ink)));
             });
         });
         if self.desk.on_browser {

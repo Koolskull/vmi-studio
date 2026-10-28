@@ -14,7 +14,8 @@ use vmi_core::tabs::{default_export_parent, same_export};
 use vmi_core::{
     clamp_rect, column_of, cut_folder, erase_folder, export_png, find, find_mut, hex_of,
     hit_stroke, load_manifest, load_session, load_vmib, move_handle, move_vertex, palette_action,
-    parent_of, parse_hex, point_inside, present_proxy, present_region, rect_points, save_session,
+    parent_of, parse_hex, point_inside, present_proxy, present_region, present_region_plain,
+    rect_points, save_session,
     save_vmib as write_vmib, source_over, theme_or_studio, xsheet_columns, Art, Bone, ClipTime,
     DeskObject, HandleSide, History, Node, PaletteAction, Release, Rgba, Section, Session,
     StrokeHit, Tool, ToolSettings, XColumn,
@@ -493,6 +494,29 @@ impl Desk {
         });
         let size = self.preset().size.round() as i32;
         self.status = format!("Size {size}.");
+    }
+
+    /// The colour under the pen, over white paper. Checker and onion stay out.
+    /// Off the page leaves the ink alone.
+    pub fn sample_ink(&mut self, x: f32, y: f32) {
+        let px = x.floor() as i32;
+        let py = y.floor() as i32;
+        if px < 0 || py < 0 || px as u32 >= self.art.width || py as u32 >= self.art.height {
+            self.status = "Off the page.".into();
+            return;
+        }
+        let rgba = present_region_plain(&mut self.art, [px, py, px + 1, py + 1]);
+        if rgba.len() < 4 {
+            self.status = "Off the page.".into();
+            return;
+        }
+        let color = over_paper(rgba[0], rgba[1], rgba[2], rgba[3]);
+        self.set_ink(color);
+        self.status = if rgba[3] == 0 {
+            "Paper.".into()
+        } else {
+            format!("Ink {}.", hex_of(color))
+        };
     }
 
     /// The color every tool paints with.
@@ -1565,6 +1589,7 @@ impl Desk {
         }
         match self.tool() {
             Tool::Select => self.choose_at(x, y),
+            Tool::Dropper => self.sample_ink(x, y),
             Tool::Point => self.begin_point(x, y),
             Tool::Bone => self.begin_bone(x, y),
             Tool::WarpTarget => self.add_warp_corner(x, y),
@@ -3697,6 +3722,12 @@ fn walk_layers(
     }
 }
 
+/// Straight ink over white paper. Clear paper is white. The checker is not ink.
+fn over_paper(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
+    let out = source_over(Rgba::rgb(255, 255, 255), Rgba::new(r, g, b, a), 1.0);
+    [out.r, out.g, out.b]
+}
+
 /// Pens, the eraser, and the line. Smudge and blend read the pixels they stand on,
 /// so they stay per dab. Opacity here is the whole stroke, the way Photoshop and
 /// Clip Studio composite one pass.
@@ -4107,6 +4138,44 @@ mod tests {
         let mut desk = Desk::new(Session::default());
         desk.finish_new(Art::new(48, 32));
         desk
+    }
+
+    fn paint_pixel(art: &mut Art, x: u32, y: u32, rgba: [u8; 4]) {
+        let index = ((y * art.width + x) * 4) as usize;
+        art.layers[0].pixels[index..index + 4].copy_from_slice(&rgba);
+    }
+
+    #[test]
+    fn the_dropper_reads_the_pixel_and_does_not_draw() {
+        let mut desk = tiny();
+        paint_pixel(&mut desk.art, 4, 6, [10, 20, 30, 255]);
+        paint_pixel(&mut desk.art, 8, 6, [255, 0, 0, 128]);
+        let pixels = desk.art.layers[0].pixels.clone();
+        desk.set_tool(Tool::Dropper);
+        desk.down_doc(4.2, 6.8, Button::Primary);
+        desk.move_doc(8.0, 6.0);
+        desk.up_doc(8.0, 6.0);
+        assert!(desk.gesture.is_none());
+        assert_eq!(desk.undo_depth(), 0);
+        assert_eq!(desk.art.layers[0].pixels, pixels);
+        assert_eq!(desk.ink, [10, 20, 30]);
+        assert_eq!(desk.status, "Ink #0A141E.");
+        desk.status = "nope".into();
+        desk.down_doc(4.2, 6.2, Button::Primary);
+        assert_eq!(desk.status, "Ink #0A141E.");
+        desk.down_doc(8.4, 6.1, Button::Primary);
+        let over = source_over(Rgba::rgb(255, 255, 255), Rgba::new(255, 0, 0, 128), 1.0);
+        assert_eq!(desk.ink, [over.r, over.g, over.b]);
+        assert_ne!(desk.ink, [255, 0, 0]);
+        desk.down_doc(1.2, 1.2, Button::Primary);
+        assert_eq!(desk.ink, [255, 255, 255]);
+        assert_eq!(desk.status, "Paper.");
+        desk.down_doc(-1.0, 2.0, Button::Primary);
+        assert_eq!(desk.ink, [255, 255, 255]);
+        assert_eq!(desk.status, "Off the page.");
+        desk.down_doc(48.0, 0.0, Button::Primary);
+        assert_eq!(desk.status, "Off the page.");
+        assert_eq!(desk.art.layers[0].pixels, pixels);
     }
 
     #[test]

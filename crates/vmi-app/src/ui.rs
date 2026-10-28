@@ -57,6 +57,8 @@ struct StudioApp {
     dial_drag: Option<(Dial, f32)>,
     /// The palette window is up.
     palette_open: bool,
+    /// The Color window is up. It sits on the layers column, not over the picture.
+    color_open: bool,
     /// The folder the palette window lists. Aseprite's own, when it exists.
     palette_folder: String,
     /// A path typed into the palette window's load field.
@@ -380,6 +382,7 @@ impl StudioApp {
             fingers: Fingers::default(),
             dial_drag: None,
             palette_open: false,
+            color_open: false,
             palette_folder: palette_folder().to_string_lossy().into_owned(),
             palette_path: String::new(),
             areas,
@@ -587,6 +590,7 @@ impl StudioApp {
                     (egui::Key::V, "V"),
                     (egui::Key::T, "T"),
                     (egui::Key::M, "M"),
+                    (egui::Key::I, "I"),
                 ] {
                     if input.key_pressed(key) {
                         shortcut = name.to_string();
@@ -696,6 +700,7 @@ impl StudioApp {
                 &mut settings,
                 theme,
                 &mut self.text_focused,
+                &mut self.color_open,
             );
         }
         if ui.button("Reset").clicked() {
@@ -1677,6 +1682,7 @@ impl StudioApp {
                 self.desk.close_onion_window();
             }
         }
+        self.color_window(ctx);
         self.palette_window(ctx);
         if let Some(prompt) = self.prompt {
             let title = match prompt {
@@ -1739,6 +1745,58 @@ impl StudioApp {
             if !open {
                 self.prompt = None;
             }
+        }
+    }
+
+    /// One ink. The window opens on the layers column. A drag here is not a stroke.
+    fn color_window(&mut self, ctx: &egui::Context) {
+        if !self.color_open {
+            return;
+        }
+        let mut open = true;
+        let mut picked = None;
+        let mut typed = None;
+        let mut hex_focus = false;
+        let current = self.desk.ink;
+        egui::Window::new("Color")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_pos(egui::pos2(12.0, 40.0))
+            .default_width(220.0)
+            .max_width(240.0)
+            .show(ctx, |ui| {
+                ui.spacing_mut().slider_width = 168.0;
+                let mut color = egui::Color32::from_rgb(current[0], current[1], current[2]);
+                if egui::color_picker::color_picker_color32(
+                    ui,
+                    &mut color,
+                    egui::color_picker::Alpha::Opaque,
+                ) {
+                    picked = Some([color.r(), color.g(), color.b()]);
+                }
+                let shown = picked.unwrap_or(current);
+                let mut hex = vmi_core::hex_of(shown);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut hex)
+                        .desired_width(72.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                hex_focus = response.has_focus();
+                if response.changed() {
+                    if let Some(parsed) = parse_hex(&hex) {
+                        typed = Some(parsed);
+                    }
+                }
+            });
+        if let Some(color) = typed.or(picked) {
+            self.desk.set_ink(color);
+        }
+        if hex_focus {
+            self.text_focused = true;
+        }
+        if !open {
+            self.color_open = false;
         }
     }
 
@@ -1886,8 +1944,11 @@ impl StudioApp {
         // The current color, as hex, and the recent ones.
         ui.horizontal(|ui| {
             let mut color = current;
-            ui.spacing_mut().interact_size = egui::vec2(22.0, 18.0);
-            ui.color_edit_button_srgb(&mut color);
+            let chip = ink_chip(ui, current, egui::vec2(22.0, 18.0), theme.frame)
+                .on_hover_text("Opens the Color window.");
+            if chip.clicked() {
+                self.color_open = true;
+            }
             let mut hex = vmi_core::hex_of(color);
             let response = ui.add(
                 egui::TextEdit::singleline(&mut hex)
@@ -2138,24 +2199,26 @@ impl StudioApp {
         });
     }
 
-    /// The color cell and the palette cell. Click the color for the picker,
-    /// right-click it for the palette window. The palette cell shows the
-    /// first colors of the current palette and opens that window.
+    /// The color cell and the palette cell. Click the color for the Color
+    /// window, right-click it for the palette window. The palette cell shows
+    /// the first colors of the current palette and opens that window.
     fn color_row(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         // One ink. The swatch is not the tool's saved preset, so Pen and Pencil stay the same color.
-        let mut color = self.desk.ink;
-        let before = color;
+        let color = self.desk.ink;
         let height = 18.0;
         let half = (PANEL_INNER - CELL_GAP) / 2.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(CELL_GAP, 0.0);
-            ui.spacing_mut().interact_size = egui::vec2(half, height);
-            let response = ui.color_edit_button_srgb(&mut color).on_hover_text(format!(
-                "Color {}\nClick: picker. Right-click: palette window.\nOne ink for every tool. X trades it.",
-                vmi_core::hex_of(color)
-            ));
+            let response = ink_chip(ui, color, egui::vec2(half, height), theme.frame).on_hover_text(
+                format!(
+                    "Color {}\nClick: Color window. Right-click: palette window.\nOne ink for every tool. X trades it.",
+                    vmi_core::hex_of(color)
+                ),
+            );
             if response.secondary_clicked() {
                 self.palette_open = !self.palette_open;
+            } else if response.clicked() {
+                self.color_open = true;
             }
             let swatches: Vec<[u8; 3]> = self.current_palette().colors.iter().copied().take(18).collect();
             let (rect, response) = ui.allocate_exact_size(egui::vec2(half, height), egui::Sense::click());
@@ -2183,9 +2246,6 @@ impl StudioApp {
                 self.palette_open = !self.palette_open;
             }
         });
-        if color != before {
-            self.pick_color(color);
-        }
     }
 
     /// The palette the window has open.
@@ -2962,9 +3022,12 @@ impl StudioApp {
                 {
                     self.desk.edit_preset(tool, |slot| slot.opacity = percent as f32 / 100.0);
                 }
-                let mut color = self.desk.ink;
-                if ui.color_edit_button_srgb(&mut color).on_hover_text("Ink for every tool. X trades it with the other color.").changed() {
-                    self.desk.set_ink(color);
+                let ink = self.desk.ink;
+                if ink_chip(ui, ink, egui::vec2(28.0, 18.0), theme.frame)
+                    .on_hover_text("Ink for every tool. Opens the Color window on the layers column. X trades it with the other color.")
+                    .clicked()
+                {
+                    self.color_open = true;
                 }
                 let back = self.desk.ink_back;
                 let back_button = egui::Button::new("X").fill(rgb(back)).min_size(egui::vec2(28.0, 18.0));
@@ -3170,8 +3233,10 @@ impl StudioApp {
             let doc_at = |pos: egui::Pos2| camera.to_doc(frame, doc_w, doc_h, pos.x, pos.y);
             if response.secondary_clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let (x, y) = doc_at(pos);
-                    self.desk.down_doc(x, y, Button::Secondary);
+                    if pointer_on_picture(ui, &response, pos) {
+                        let (x, y) = doc_at(pos);
+                        self.desk.down_doc(x, y, Button::Secondary);
+                    }
                 }
             } else if self.desk.tool() == Tool::Select {
                 // Python's picture click is the release, and only when the
@@ -3186,6 +3251,38 @@ impl StudioApp {
                         }
                     }
                 }
+            } else if self.desk.tool() == Tool::Dropper && !self.fingers.many() {
+                // A drag reads each pixel. It does not start a stroke.
+                let primary = ui.input(|input| {
+                    input.pointer.button_down(egui::PointerButton::Primary)
+                });
+                if primary {
+                    let positions: Vec<egui::Pos2> = ui.input(|input| {
+                        let mut points = Vec::new();
+                        if input.pointer.primary_pressed() {
+                            if let Some(origin) = input.pointer.press_origin() {
+                                points.push(origin);
+                            }
+                        }
+                        for event in &input.events {
+                            if let egui::Event::PointerMoved(pos) = event {
+                                points.push(*pos);
+                            }
+                        }
+                        if points.is_empty() {
+                            if let Some(pos) = input.pointer.latest_pos() {
+                                points.push(pos);
+                            }
+                        }
+                        points
+                    });
+                    for pos in positions {
+                        if pointer_on_picture(ui, &response, pos) {
+                            let (x, y) = doc_at(pos);
+                            self.desk.sample_ink(x, y);
+                        }
+                    }
+                }
             } else if !shift && !space && !middle && !self.fingers.many() {
                 // The drag threshold is 6 px and the first decided frame only has
                 // the latest point. A thin line then starts as a straight chord.
@@ -3193,7 +3290,7 @@ impl StudioApp {
                 let pressed = ui.input(|input| input.pointer.primary_pressed());
                 if pressed && !self.desk.is_painting() {
                     if let Some(origin) = ui.input(|input| input.pointer.press_origin()) {
-                        if response.rect.contains(origin) {
+                        if pointer_on_picture(ui, &response, origin) {
                             let (x, y) = doc_at(origin);
                             self.desk.down_doc(x, y, Button::Primary);
                         }
@@ -4174,6 +4271,7 @@ fn edit_field(
     settings: &mut ToolSettings,
     theme: &Theme,
     typing: &mut bool,
+    color_open: &mut bool,
 ) {
     match field {
         Field::ReleaseNote => {
@@ -4182,7 +4280,11 @@ fn edit_field(
         Field::Color => {
             ui.horizontal(|ui| {
                 ui.label("Color");
-                ui.color_edit_button_srgb(&mut settings.color);
+                let chip = ink_chip(ui, settings.color, egui::vec2(22.0, 18.0), theme.frame)
+                    .on_hover_text("Opens the Color window.");
+                if chip.clicked() {
+                    *color_open = true;
+                }
                 let mut hex = vmi_core::hex_of(settings.color);
                 let response = field_edit(ui, &mut hex);
                 if response.has_focus() {
@@ -4414,6 +4516,20 @@ fn texture_options() -> egui::TextureOptions {
 
 fn rgb(color: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(color[0], color[1], color[2])
+}
+
+/// A flat ink cell. Click opens the Color window. It is not egui's popup.
+fn ink_chip(ui: &mut egui::Ui, color: [u8; 3], size: egui::Vec2, frame: [u8; 3]) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    ui.painter().rect_filled(rect, 0.0, rgb(color));
+    ui.painter()
+        .rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, rgb(frame)));
+    response
+}
+
+/// A press on a window that covers the picture is not a stroke.
+fn pointer_on_picture(ui: &egui::Ui, response: &egui::Response, pos: egui::Pos2) -> bool {
+    response.rect.contains(pos) && ui.ctx().layer_id_at(pos) == Some(response.layer_id)
 }
 
 fn widget_look(

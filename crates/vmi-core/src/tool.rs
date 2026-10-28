@@ -30,6 +30,8 @@ pub enum Tool {
     WarpMask,
     /// Click a painted pixel. The outliner selects that layer.
     Select,
+    /// Click a pixel. The shared ink becomes that colour.
+    Dropper,
     CutRect,
     CutLasso,
     CutPolygon,
@@ -291,6 +293,7 @@ impl Tool {
         Self::WarpTarget,
         Self::WarpMask,
         Self::Select,
+        Self::Dropper,
         Self::CutRect,
         Self::CutLasso,
         Self::CutPolygon,
@@ -317,6 +320,7 @@ impl Tool {
             Self::WarpTarget => "Warp target",
             Self::WarpMask => "Warp mask",
             Self::Select => "Select",
+            Self::Dropper => "Dropper",
             Self::CutRect => "Rect",
             Self::CutLasso => "Lasso",
             Self::CutPolygon => "Polygon",
@@ -344,6 +348,7 @@ impl Tool {
             Self::WarpTarget => "T",
             Self::WarpMask => "M",
             Self::Select => "",
+            Self::Dropper => "I",
             Self::CutRect => "",
             Self::CutLasso => "",
             Self::CutPolygon => "",
@@ -371,6 +376,7 @@ impl Tool {
             Self::WarpTarget => "Click corners. Enter keeps the polygon.",
             Self::WarpMask => "Paints a mask. Release writes pixels.",
             Self::Select => "Click painted ink. A drag stays put. The outliner selects that layer and opens the folders around it.",
+            Self::Dropper => "Click or drag a pixel. The ink becomes that color. Checker and onion stay out.",
             Self::CutRect => "A rectangle marquee for cut.",
             Self::CutLasso => "A freehand marquee for cut.",
             Self::CutPolygon => "Click corners for a cut.",
@@ -397,6 +403,7 @@ impl Tool {
             Self::Point
             | Self::Bone
             | Self::Select
+            | Self::Dropper
             | Self::CutRect
             | Self::CutLasso
             | Self::CutPolygon => Release::Edit,
@@ -407,7 +414,7 @@ impl Tool {
     pub fn section(self) -> Section {
         match self {
             Self::Vector | Self::Curve | Self::Point | Self::Bone | Self::Grain => Section::Vector,
-            Self::WarpTarget | Self::WarpMask | Self::Select => Section::Picture,
+            Self::WarpTarget | Self::WarpMask | Self::Select | Self::Dropper => Section::Picture,
             Self::CutRect | Self::CutLasso | Self::CutPolygon => Section::Cut,
             _ => Section::Raster,
         }
@@ -421,7 +428,7 @@ impl Tool {
             Self::Point => POINT,
             Self::Bone => BONE,
             Self::WarpTarget => TARGET,
-            Self::Select | Self::CutRect | Self::CutLasso | Self::CutPolygon => CUT,
+            Self::Select | Self::Dropper | Self::CutRect | Self::CutLasso | Self::CutPolygon => CUT,
             Self::Eraser | Self::Smudge => NO_COLOR,
             _ => SHAPE,
         }
@@ -750,6 +757,10 @@ mod tests {
         assert_eq!(Tool::WarpMask.release(), Release::Pixels);
         assert_eq!(Tool::WarpTarget.release(), Release::Polygon);
         assert_eq!(Tool::Point.release(), Release::Edit);
+        assert_eq!(Tool::Dropper.release(), Release::Edit);
+        assert_eq!(Tool::Dropper.section(), Section::Picture);
+        assert_eq!(Tool::by_shortcut("i"), Some(Tool::Dropper));
+        assert!(!Tool::Dropper.fields().contains(&Field::Color));
         assert!(Tool::Vector.fields().contains(&Field::Grain));
         assert!(Tool::Vector.fields().contains(&Field::Stabilize));
         assert!(Tool::Pen.fields().contains(&Field::Stabilize));

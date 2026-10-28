@@ -13,6 +13,9 @@ class BridgeTests(unittest.TestCase):
     def test_a_leaf_raster_is_written_beside_its_stroke(self):
         raster = Raster(1, 0, 1, 1, bytes([9, 0, 0, 255]))
         layer = Node("n1", "Ink", "layer", raster=raster)
+        layer.outline = True
+        layer.outline_px = 2.5
+        layer.outline_rgb = (1, 2, 3)
         layer.strokes = [{
             "color": "#FF3EB8",
             "size": 8,
@@ -34,6 +37,10 @@ class BridgeTests(unittest.TestCase):
             leaf = document["layers"][0]["children"][0]
             self.assertEqual(leaf["raster"]["file"], "n1.rgba")
             self.assertEqual(leaf["strokes"][0]["seed"], 9)
+            self.assertTrue(leaf["outline"])
+            self.assertEqual(leaf["outline_px"], 2.5)
+            self.assertEqual(leaf["outline_rgb"], [1, 2, 3])
+            self.assertFalse(document["layers"][0]["outline"])
             self.assertTrue(os.path.isabs(document["rasters_dir"]))
             with open(os.path.join(rasters, "n1.rgba"), "rb") as handle:
                 blob = handle.read()

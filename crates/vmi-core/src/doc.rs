@@ -4,8 +4,10 @@
 //! or muted row drops with everything inside it, solo keeps only soloed
 //! branches, a clipping mask stays inside the row it clips onto, a pass
 //! through folder paints its children on the picture below, and an animation
-//! folder shows one cel, the one `anim::cel_at` holds at the playhead. Onion
-//! skin (`vmi_studio/onion.py`) is a view: `present` tints the neighbour cels
+//! folder shows one cel, the one `anim::cel_at` holds at the playhead. A Clip
+//! Studio border edge sits under that paint, and under a folder once its
+//! children have merged. Onion skin (`vmi_studio/onion.py`) is a view:
+//! `present` tints the neighbour cels
 //! when `Art::onion` is on, `present_plain` never does.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -46,6 +48,11 @@ pub struct Node {
     pub pixels: Vec<u8>,
     /// When set, `pixels` already includes the baked strokes.
     pub embedded: bool,
+    /// Clip Studio's border edge. The paint keeps its color. The edge is drawn under it.
+    pub outline: bool,
+    /// Width in pixels, clamped to 250 when it is read from a file.
+    pub outline_px: f32,
+    pub outline_rgb: [u8; 3],
     pub children: Vec<Node>,
     /// A folder marked as a timeline. Each direct child is one cel.
     pub animation: bool,
@@ -85,6 +92,9 @@ impl Node {
                     .saturating_mul(4)
             ],
             embedded: false,
+            outline: false,
+            outline_px: 0.0,
+            outline_rgb: [0, 0, 0],
             children: Vec::new(),
             animation: false,
             timeline: Vec::new(),
@@ -112,6 +122,9 @@ impl Node {
             strokes: Vec::new(),
             pixels: Vec::new(),
             embedded: false,
+            outline: false,
+            outline_px: 0.0,
+            outline_rgb: [0, 0, 0],
             children: Vec::new(),
             animation: false,
             timeline: Vec::new(),
@@ -1592,6 +1605,31 @@ fn paint_stack(
     // layer's. The stack then covers everything that was inside.
     let styled = has_job(&nodes[index], item, ctx);
     if kind == NodeKind::Group && is_pass(&blend) && clips.is_empty() && opacity == 255 && !styled {
+        // The edge goes down first, then the children paint onto the picture,
+        // the way a pass-through folder keeps each child's blend.
+        let outlined = {
+            let node = actual(&nodes[index], item);
+            crate::outline::active(node.outline, node.outline_px)
+                .map(|px| (px, node.outline_rgb))
+        };
+        if let Some((px, rgb)) = outlined {
+            let mut plate = vec![0u8; dst.len()];
+            {
+                let node = actual_mut(&mut nodes[index], item);
+                paint_list(
+                    &mut node.children,
+                    Target {
+                        buf: &mut plate,
+                        w,
+                        h,
+                        ox,
+                        oy,
+                    },
+                    &inner,
+                );
+            }
+            crate::outline::disc_onto(dst, &plate, w, h, px, rgb, ctx.step);
+        }
         let node = actual_mut(&mut nodes[index], item);
         paint_list(
             &mut node.children,
@@ -1672,6 +1710,9 @@ fn appearance(node: &mut Node, target: Target<'_>, inner: &Ctx<'_>) {
             },
             inner,
         );
+        if let Some(px) = crate::outline::active(node.outline, node.outline_px) {
+            crate::outline::underlay(buf, w, h, px, node.outline_rgb, inner.step);
+        }
     } else {
         blit_layer(
             node,
@@ -1741,6 +1782,21 @@ fn blit_layer(node: &mut Node, target: Target<'_>, width: u32, height: u32, step
     } = target;
     node.pixels
         .resize((width as usize) * (height as usize) * 4, 0);
+    if let Some(px) = crate::outline::active(node.outline, node.outline_px) {
+        crate::outline::under_layer(
+            dst,
+            w,
+            h,
+            ox,
+            oy,
+            &node.pixels,
+            width,
+            height,
+            px,
+            node.outline_rgb,
+            step,
+        );
+    }
     blit_into(
         dst,
         w,
@@ -3287,5 +3343,58 @@ mod tests {
         assert!(!move_symbol(&mut objects, "f", "n", 0));
         assert!(!move_symbol(&mut objects, "m", "f", 0));
         assert_eq!(next_stack(&objects, "f", false), 1);
+    }
+
+    #[test]
+    fn a_clip_outline_sits_under_the_paint() {
+        let mut art = Art::blank(16, 16);
+        let id = art.add_layer(None, "Ink");
+        {
+            let node = find_mut(&mut art.layers, &id).unwrap();
+            paint(node, 16, 5, 5, [255, 0, 0, 255]);
+            node.outline = true;
+            node.outline_px = 1.0;
+            node.outline_rgb = [0, 0, 0];
+        }
+        let plate = present(&mut art);
+        assert_eq!(px(&plate, 16, 5, 5), [255, 0, 0, 255]);
+        assert_eq!(px(&plate, 16, 5, 4), [0, 0, 0, 255]);
+        assert_eq!(px(&plate, 16, 5, 3), [0, 0, 0, 0]);
+        let diagonal = px(&plate, 16, 4, 4);
+        assert_eq!(&diagonal[..3], &[0, 0, 0]);
+        assert!(diagonal[3] > 0 && diagonal[3] < 255);
+        // The source pixel is outside this one-pixel rect. The edge still arrives.
+        let edge = present_region(&mut art, [5, 4, 6, 5]);
+        assert_eq!(edge, vec![0, 0, 0, 255]);
+        find_mut(&mut art.layers, &id).unwrap().outline = false;
+        let plain = present(&mut art);
+        assert_eq!(px(&plain, 16, 5, 5), [255, 0, 0, 255]);
+        assert_eq!(px(&plain, 16, 5, 4), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_folder_outline_wraps_the_merged_paint() {
+        let mut art = Art::blank(30, 30);
+        let folder = art.add_group(None, "group");
+        let ink = art.add_layer(Some(&folder), "ink");
+        paint(find_mut(&mut art.layers, &ink).unwrap(), 30, 10, 10, [255, 0, 0, 255]);
+        {
+            let node = find_mut(&mut art.layers, &folder).unwrap();
+            node.outline = true;
+            node.outline_px = 2.0;
+            node.outline_rgb = [0, 0, 255];
+        }
+        let plate = present(&mut art);
+        assert_eq!(&px(&plate, 30, 10, 10)[..3], &[255, 0, 0]);
+        let edge = px(&plate, 30, 10, 8);
+        assert_eq!(&edge[..3], &[0, 0, 255]);
+        assert!(edge[3] > 200);
+        assert_eq!(px(&plate, 30, 10, 7)[3], 0);
+
+        find_mut(&mut art.layers, &folder).unwrap().blend = "pass through".into();
+        let passed = present(&mut art);
+        assert_eq!(&px(&passed, 30, 10, 10)[..3], &[255, 0, 0]);
+        assert_eq!(&px(&passed, 30, 10, 8)[..3], &[0, 0, 255]);
+        assert_eq!(px(&passed, 30, 10, 7)[3], 0);
     }
 }

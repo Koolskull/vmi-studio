@@ -19,6 +19,30 @@ def _safe(ident):
     return text
 
 
+def _outline_px(node):
+    try:
+        px = float(getattr(node, "outline_px", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if px != px or px <= 0.0:
+        return 0.0
+    return 250.0 if px > 250.0 else px
+
+
+def _outline_rgb(node):
+    raw = getattr(node, "outline_rgb", None) or (0, 0, 0)
+    channels = []
+    for channel in list(raw)[:3]:
+        try:
+            number = int(round(float(channel)))
+        except (TypeError, ValueError):
+            number = 0
+        channels.append(max(0, min(255, number)))
+    while len(channels) < 3:
+        channels.append(0)
+    return channels
+
+
 def _plain(value):
     if isinstance(value, tuple):
         return [_plain(item) for item in value]
@@ -44,6 +68,9 @@ def _node(node, rasters, used):
         "solo": bool(getattr(node, "solo", False)),
         "marker": getattr(node, "marker", "") or "",
         "color": getattr(node, "color", "") or "",
+        "outline": bool(getattr(node, "outline", False)),
+        "outline_px": _outline_px(node),
+        "outline_rgb": _outline_rgb(node),
         "vectors": _plain(getattr(node, "vectors", []) or []),
         "strokes": _plain(getattr(node, "strokes", []) or []),
         "children": [_node(child, rasters, used) for child in node.children],

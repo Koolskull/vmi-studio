@@ -92,6 +92,10 @@ fn node_from(row: &Value, rasters: &Path, width: u32, height: u32, max_id: &mut 
     let marker = row.get("marker").and_then(Value::as_str).unwrap_or("");
     node.marker = if marker == "target" || marker == "mask" { marker.to_string() } else { String::new() };
     node.color = row.get("color").and_then(Value::as_str).unwrap_or("").to_string();
+    node.outline = row.get("outline").and_then(Value::as_bool).unwrap_or(false);
+    node.outline_px =
+        crate::outline::clamp_px(row.get("outline_px").and_then(Value::as_f64).unwrap_or(0.0));
+    node.outline_rgb = crate::outline::rgb_from(row.get("outline_rgb"));
     node.vectors = read_vectors(row.get("vectors"));
     if let Some(strokes) = row.get("strokes") {
         node.strokes = strokes_from_value(strokes);
@@ -202,6 +206,9 @@ mod tests {
                         "id": "n1",
                         "name": "Ink",
                         "kind": "layer",
+                        "outline": true,
+                        "outline_px": 2.5,
+                        "outline_rgb": [1, 2, 3],
                         "raster": {{"file": "n1.rgba", "x": 1, "y": 0, "w": 1, "h": 1}},
                         "strokes": [{{
                             "id": 4,
@@ -229,6 +236,10 @@ mod tests {
         assert!(art.layers[0].children[0].embedded);
         assert_eq!(art.layers[0].children[0].strokes[0].id, 4);
         assert_eq!(art.layers[0].children[0].strokes[0].seed, 9);
+        assert!(art.layers[0].children[0].outline);
+        assert_eq!(art.layers[0].children[0].outline_px, 2.5);
+        assert_eq!(art.layers[0].children[0].outline_rgb, [1, 2, 3]);
+        assert!(!art.layers[0].outline);
         assert_eq!(art.next_id, 2);
         assert_eq!(art.next_stroke, 5);
     }

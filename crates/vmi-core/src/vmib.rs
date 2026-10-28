@@ -135,9 +135,9 @@ fn layer_row(art: &Art, node: &Node, blobs: &mut Vec<(String, Vec<u8>)>) -> Valu
         "color": node.color,
         "vectors": node.vectors,
         "frames": node.frames,
-        "outline": false,
-        "outline_px": 0,
-        "outline_rgb": [0, 0, 0],
+        "outline": node.outline,
+        "outline_px": node.outline_px,
+        "outline_rgb": node.outline_rgb,
         "raster": Value::Null,
         "children": node.children.iter().map(|child| layer_row(art, child, blobs)).collect::<Vec<_>>(),
         "traits": !node.strokes.is_empty(),
@@ -585,6 +585,10 @@ fn node_from(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    node.outline = row.get("outline").and_then(Value::as_bool).unwrap_or(false);
+    node.outline_px =
+        crate::outline::clamp_px(row.get("outline_px").and_then(Value::as_f64).unwrap_or(0.0));
+    node.outline_rgb = crate::outline::rgb_from(row.get("outline_rgb"));
     node.vectors = read_vectors(row.get("vectors"));
     node.strokes = read_strokes(row.get("strokes"));
     if let Some(ink) = row.get("ink") {
@@ -850,7 +854,26 @@ mod tests {
         assert_eq!(layer.strokes[0].vertices.len(), 2);
         assert_eq!(layer.pixels[0], 10);
         assert!(!layer.embedded);
+        assert!(!layer.outline);
         assert_eq!(loaded.objects.len(), 0);
+    }
+
+    #[test]
+    fn an_outline_round_trips() {
+        let mut art = Art::blank(4, 4);
+        let id = art.add_layer(None, "Ink");
+        let node = crate::find_mut(&mut art.layers, &id).unwrap();
+        node.outline = true;
+        node.outline_px = 5.0;
+        node.outline_rgb = [1, 2, 3];
+        let path = temp_path("outline");
+        save(&mut art, &path).unwrap();
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let layer = loaded.layers.iter().find(|node| node.id == id).unwrap();
+        assert!(layer.outline);
+        assert_eq!(layer.outline_px, 5.0);
+        assert_eq!(layer.outline_rgb, [1, 2, 3]);
     }
 
     fn temp_path(tag: &str) -> std::path::PathBuf {

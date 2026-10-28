@@ -15,6 +15,7 @@ pub mod koolgrid;
 pub mod kosv;
 pub mod naming;
 pub mod newpage;
+pub mod outline;
 pub mod palette;
 pub mod scene;
 pub mod session;

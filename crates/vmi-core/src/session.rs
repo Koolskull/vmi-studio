@@ -4,13 +4,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::palette::Palette;
 use crate::tool::{Tool, ToolSettings};
 
-/// How many picked colors the session remembers.
-pub const RECENT_COLORS: usize = 16;
+/// How many picked colors the session remembers. RGBA is four bytes, so
+/// this list is a few kilobytes in the session file. It is the desk's list,
+/// one for every project: a clip file is never written back.
+pub const RECENT_COLORS: usize = 512;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
@@ -28,8 +32,9 @@ pub struct Session {
     #[serde(default)]
     pub palette_tab: usize,
     /// Colors picked lately, most recent first. At most `RECENT_COLORS`.
-    #[serde(default)]
-    pub recent_colors: Vec<[u8; 3]>,
+    /// Each entry is R, G, B, A. Older sessions stored three channels.
+    #[serde(default, deserialize_with = "de_recent_colors")]
+    pub recent_colors: Vec<[u8; 4]>,
     /// The right area's width.
     #[serde(default = "default_right_width")]
     pub right_width: f32,
@@ -95,11 +100,53 @@ impl Default for Session {
 
 impl Session {
     /// Moves `color` to the front of the recent list, dropping the oldest past `RECENT_COLORS`.
-    pub fn note_recent_color(&mut self, color: [u8; 3]) {
+    /// False when it was already the newest.
+    pub fn note_recent_color(&mut self, color: [u8; 4]) -> bool {
+        if self.recent_colors.first() == Some(&color) {
+            return false;
+        }
         self.recent_colors.retain(|known| *known != color);
         self.recent_colors.insert(0, color);
         self.recent_colors.truncate(RECENT_COLORS);
+        true
     }
+}
+
+/// Three-channel history from older sessions gains alpha `FF`.
+fn de_recent_colors<'de, D>(deserializer: D) -> Result<Vec<[u8; 4]>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Visit;
+    impl<'de> Visitor<'de> for Visit {
+        type Value = Vec<[u8; 4]>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a list of RGB or RGBA colors")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = Vec::new();
+            while let Some(channels) = seq.next_element::<Vec<u8>>()? {
+                let color = match channels.len() {
+                    3 => [channels[0], channels[1], channels[2], 255],
+                    4 => [channels[0], channels[1], channels[2], channels[3]],
+                    _ => {
+                        return Err(de::Error::invalid_length(
+                            channels.len(),
+                            &"3 or 4 channels",
+                        ))
+                    }
+                };
+                out.push(color);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_seq(Visit)
 }
 
 pub fn session_path() -> PathBuf {
@@ -214,34 +261,61 @@ mod tests {
             .palettes
             .push(Palette::new("Mine", vec![[1, 2, 3], [4, 5, 6]]));
         session.palette_tab = 3;
-        session.note_recent_color([9, 9, 9]);
+        session.note_recent_color([9, 9, 9, 128]);
         save_to(&path, &session).unwrap();
         let loaded = load_from(&path).unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(loaded.palettes, session.palettes);
         assert_eq!(loaded.palette_tab, 3);
-        assert_eq!(loaded.recent_colors, vec![[9, 9, 9]]);
+        assert_eq!(loaded.recent_colors, vec![[9, 9, 9, 128]]);
+    }
+
+    #[test]
+    fn an_old_three_channel_history_gains_full_alpha() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("vmi-session-rgb-{stamp}.json"));
+        let mut value = serde_json::to_value(Session::default()).unwrap();
+        value["recent_colors"] = serde_json::json!([[1, 2, 3], [4, 5, 6, 7]]);
+        fs::write(&path, value.to_string()).unwrap();
+        let loaded = load_from(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(loaded.recent_colors, vec![[1, 2, 3, 255], [4, 5, 6, 7]]);
     }
 
     #[test]
     fn recent_colors_move_to_the_front_and_stay_capped() {
         let mut session = Session::default();
-        for step in 0..20u8 {
-            session.note_recent_color([step, 0, 0]);
+        for step in 0..(RECENT_COLORS + 20) {
+            let channel = (step % 256) as u8;
+            let high = (step / 256) as u8;
+            session.note_recent_color([channel, high, 0, 255]);
         }
         assert_eq!(session.recent_colors.len(), RECENT_COLORS);
-        assert_eq!(session.recent_colors[0], [19, 0, 0]);
-        assert_eq!(session.recent_colors[RECENT_COLORS - 1], [4, 0, 0]);
-        session.note_recent_color([10, 0, 0]);
+        let newest = RECENT_COLORS + 19;
+        assert_eq!(
+            session.recent_colors[0],
+            [(newest % 256) as u8, (newest / 256) as u8, 0, 255]
+        );
+        let oldest = newest - (RECENT_COLORS - 1);
+        assert_eq!(
+            session.recent_colors[RECENT_COLORS - 1],
+            [(oldest % 256) as u8, (oldest / 256) as u8, 0, 255]
+        );
+        let again = [10, 0, 0, 255];
+        assert!(session.note_recent_color(again));
         assert_eq!(session.recent_colors.len(), RECENT_COLORS);
-        assert_eq!(session.recent_colors[0], [10, 0, 0]);
+        assert_eq!(session.recent_colors[0], again);
         assert_eq!(
             session
                 .recent_colors
                 .iter()
-                .filter(|color| **color == [10, 0, 0])
+                .filter(|color| **color == again)
                 .count(),
             1
         );
+        assert!(!session.note_recent_color(again));
     }
 }

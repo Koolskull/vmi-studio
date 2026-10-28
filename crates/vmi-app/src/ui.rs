@@ -17,8 +17,9 @@ use crate::sheet::{self, Act, SheetState};
 use crate::tablet;
 use vmi_core::palette::Palette;
 use vmi_core::{
-    blend_label, palette_matching, parse_hex, CurveKind, DitherPattern, Edge, Field, GrainKind,
-    Release, Section, Theme, Tip, Tool, ToolSettings, BLENDS, THEMES,
+    blend_label, palette_matching, parse_channel_hex, parse_hex, parse_hex_rgba, CurveKind,
+    DitherPattern, Edge, Field, GrainKind, Release, Section, Theme, Tip, Tool, ToolSettings,
+    BLENDS, THEMES,
 };
 
 pub fn run() -> eframe::Result<()> {
@@ -57,8 +58,22 @@ struct StudioApp {
     dial_drag: Option<(Dial, f32)>,
     /// The palette window is up.
     palette_open: bool,
-    /// The Color window is up. It sits on the layers column, not over the picture.
+    /// The Color window is up. It sits beside the brushes color chip, off the picture.
     color_open: bool,
+    /// Move the Color window beside the chip on this frame.
+    color_snap: bool,
+    /// The Color window was open last frame. The first open snaps to the chip.
+    color_seen: bool,
+    /// The brushes color chip, from the last frame. Windows run before the panels.
+    color_chip: Option<egui::Rect>,
+    /// Right edge of the brushes panel. The picture starts here.
+    picture_edge: Option<f32>,
+    /// Hex drafts for R, G, B, and A. Refreshed from the ink while the box is idle.
+    color_hex: [String; 4],
+    /// Draft of `#RRGGBBAA`.
+    color_hex8: String,
+    /// Draft of the twelve-digit form, three digits a channel.
+    color_hex12: String,
     /// The folder the palette window lists. Aseprite's own, when it exists.
     palette_folder: String,
     /// A path typed into the palette window's load field.
@@ -383,6 +398,13 @@ impl StudioApp {
             dial_drag: None,
             palette_open: false,
             color_open: false,
+            color_snap: false,
+            color_seen: false,
+            color_chip: None,
+            picture_edge: None,
+            color_hex: [String::new(), String::new(), String::new(), String::new()],
+            color_hex8: String::new(),
+            color_hex12: String::new(),
             palette_folder: palette_folder().to_string_lossy().into_owned(),
             palette_path: String::new(),
             areas,
@@ -701,6 +723,7 @@ impl StudioApp {
                 theme,
                 &mut self.text_focused,
                 &mut self.color_open,
+                &mut self.color_snap,
             );
         }
         if ui.button("Reset").clicked() {
@@ -1748,49 +1771,164 @@ impl StudioApp {
         }
     }
 
-    /// One ink. The window opens on the layers column. A drag here is not a stroke.
+    /// One ink. The window opens beside the brushes color chip, off the picture.
+    /// A drag here is not a stroke.
     fn color_window(&mut self, ctx: &egui::Context) {
         if !self.color_open {
+            self.color_seen = false;
             return;
         }
+        let snap = self.color_snap || !self.color_seen;
+        self.color_snap = false;
+        self.color_seen = true;
+        let rgba = [
+            self.desk.ink[0],
+            self.desk.ink[1],
+            self.desk.ink[2],
+            self.desk.ink_alpha,
+        ];
+        let picture_left = self.picture_edge.unwrap_or_else(|| {
+            self.desk.session.layers_width + PANEL_INNER + PANEL_MARGIN * 2.0
+        });
+        let right = color_window_right(self.color_chip, picture_left);
+        let top = self
+            .color_chip
+            .map(|chip| chip.top().max(28.0))
+            .unwrap_or(40.0);
+        let anchor = egui::pos2(right, top);
+        let screen = ctx.screen_rect();
+        let limit = (picture_left - 2.0).max(48.0);
+        let constrain = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(limit, screen.bottom()));
+        let width_cap = (picture_left - 8.0).clamp(180.0, 280.0);
         let mut open = true;
         let mut picked = None;
-        let mut typed = None;
+        let mut channels = [None; 4];
+        let mut wide = None;
+        let mut short = None;
+        let mut from_history = None;
         let mut hex_focus = false;
-        let current = self.desk.ink;
-        egui::Window::new("Color")
+        let theme = self.desk.theme();
+        let mut window = egui::Window::new("Color")
             .open(&mut open)
-            .resizable(false)
+            .resizable(true)
             .collapsible(false)
-            .default_pos(egui::pos2(12.0, 40.0))
-            .default_width(220.0)
-            .max_width(240.0)
-            .show(ctx, |ui| {
-                ui.spacing_mut().slider_width = 168.0;
-                let mut color = egui::Color32::from_rgb(current[0], current[1], current[2]);
-                if egui::color_picker::color_picker_color32(
-                    ui,
-                    &mut color,
-                    egui::color_picker::Alpha::Opaque,
-                ) {
-                    picked = Some([color.r(), color.g(), color.b()]);
-                }
-                let shown = picked.unwrap_or(current);
-                let mut hex = vmi_core::hex_of(shown);
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut hex)
-                        .desired_width(72.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                hex_focus = response.has_focus();
-                if response.changed() {
-                    if let Some(parsed) = parse_hex(&hex) {
-                        typed = Some(parsed);
-                    }
+            .pivot(egui::Align2::RIGHT_TOP)
+            .default_pos(anchor)
+            .default_width(236.0_f32.min(width_cap))
+            .max_width(width_cap)
+            .constrain_to(constrain);
+        if snap {
+            window = window.current_pos(anchor);
+        }
+        let recent = self.desk.session.recent_colors.clone();
+        let color_hex = &mut self.color_hex;
+        let color_hex12 = &mut self.color_hex12;
+        let color_hex8 = &mut self.color_hex8;
+        window.show(ctx, |ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).clamp(120.0, 200.0);
+            let mut color =
+                egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
+            if egui::color_picker::color_picker_color32(
+                ui,
+                &mut color,
+                egui::color_picker::Alpha::OnlyBlend,
+            ) {
+                picked = Some([color.r(), color.g(), color.b(), color.a()]);
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+                for (label, index, salt) in [("R", 0, "r"), ("G", 1, "g"), ("B", 2, "b"), ("A", 3, "a")]
+                {
+                    ui.label(egui::RichText::new(label).color(rgb(theme.soft)));
+                    let (focus, parsed) = hex_channel(ui, &mut color_hex[index], rgba[index], salt);
+                    hex_focus |= focus;
+                    channels[index] = parsed;
                 }
             });
-        if let Some(color) = typed.or(picked) {
-            self.desk.set_ink(color);
+            let field_width = ui.available_width();
+            let (focus, parsed) = hex_group(
+                ui,
+                color_hex12,
+                &vmi_core::hex_rgba_wide(rgba),
+                "wide",
+                field_width,
+                12,
+                rgba[3],
+            );
+            hex_focus |= focus;
+            wide = parsed;
+            ui.add_space(1.0);
+            let field_width = ui.available_width();
+            let (focus, parsed) = hex_group(
+                ui,
+                color_hex8,
+                &vmi_core::hex_rgba(rgba),
+                "short",
+                field_width,
+                9,
+                rgba[3],
+            );
+            hex_focus |= focus;
+            short = parsed;
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("Recent {}", recent.len()))
+                    .color(rgb(theme.soft))
+                    .small(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("color-history")
+                .max_height(168.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if recent.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Recent colors show up here.")
+                                .color(rgb(theme.soft))
+                                .small(),
+                        );
+                        return;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(1.0, 1.0);
+                        for swatch in recent.iter().copied() {
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(14.0, 14.0),
+                                egui::Sense::click(),
+                            );
+                            paint_rgba_swatch(ui.painter(), rect, swatch, rgb(theme.frame));
+                            let hint = format!(
+                                "{}\n{}",
+                                vmi_core::hex_rgba(swatch),
+                                vmi_core::hex_rgba_wide(swatch)
+                            );
+                            if response.on_hover_text(hint).clicked() {
+                                from_history = Some(swatch);
+                            }
+                        }
+                    });
+                });
+        });
+        let mut next = rgba;
+        if let Some(color) = picked {
+            next = color;
+        }
+        for (index, channel) in channels.into_iter().enumerate() {
+            if let Some(value) = channel {
+                next[index] = value;
+            }
+        }
+        if let Some(color) = wide {
+            next = color;
+        }
+        if let Some(color) = short {
+            next = color;
+        }
+        if let Some(color) = from_history {
+            next = color;
+        }
+        if next != rgba {
+            self.desk.set_rgba(next);
         }
         if hex_focus {
             self.text_focused = true;
@@ -1948,6 +2086,7 @@ impl StudioApp {
                 .on_hover_text("Opens the Color window.");
             if chip.clicked() {
                 self.color_open = true;
+                self.color_snap = true;
             }
             let mut hex = vmi_core::hex_of(color);
             let response = ui.add(
@@ -1967,7 +2106,7 @@ impl StudioApp {
                 self.pick_color(color);
             }
             ui.label(egui::RichText::new("recent").color(rgb(theme.soft)).small());
-            let recent: Vec<[u8; 3]> = self
+            let recent: Vec<[u8; 4]> = self
                 .desk
                 .session
                 .recent_colors
@@ -1977,16 +2116,16 @@ impl StudioApp {
                 .collect();
             let mut pick = None;
             ui.spacing_mut().item_spacing = egui::vec2(1.0, 0.0);
-            for (index, swatch) in recent.iter().enumerate() {
+            for swatch in &recent {
                 let (rect, response) =
                     ui.allocate_exact_size(egui::vec2(cell, cell), egui::Sense::click());
-                ui.painter().rect_filled(rect, 0.0, rgb(*swatch));
-                if response.on_hover_text(vmi_core::hex_of(*swatch)).clicked() {
-                    pick = Some((index, *swatch));
+                paint_rgba_swatch(ui.painter(), rect, *swatch, rgb(theme.frame));
+                if response.on_hover_text(vmi_core::hex_rgba(*swatch)).clicked() {
+                    pick = Some(*swatch);
                 }
             }
-            if let Some((_, color)) = pick {
-                self.pick_color(color);
+            if let Some(color) = pick {
+                self.desk.set_rgba(color);
             }
         });
         ui.add_space(4.0);
@@ -2211,14 +2350,17 @@ impl StudioApp {
             ui.spacing_mut().item_spacing = egui::vec2(CELL_GAP, 0.0);
             let response = ink_chip(ui, color, egui::vec2(half, height), theme.frame).on_hover_text(
                 format!(
-                    "Color {}\nClick: Color window. Right-click: palette window.\nOne ink for every tool. X trades it.",
-                    vmi_core::hex_of(color)
+                    "Color {}{:02X}\nClick: Color window, beside this cell. Right-click: palette window.\nOne ink for every tool. X trades it.",
+                    vmi_core::hex_of(color),
+                    self.desk.ink_alpha
                 ),
             );
+            self.color_chip = Some(response.rect);
             if response.secondary_clicked() {
                 self.palette_open = !self.palette_open;
             } else if response.clicked() {
                 self.color_open = true;
+                self.color_snap = true;
             }
             let swatches: Vec<[u8; 3]> = self.current_palette().colors.iter().copied().take(18).collect();
             let (rect, response) = ui.allocate_exact_size(egui::vec2(half, height), egui::Sense::click());
@@ -3024,10 +3166,11 @@ impl StudioApp {
                 }
                 let ink = self.desk.ink;
                 if ink_chip(ui, ink, egui::vec2(28.0, 18.0), theme.frame)
-                    .on_hover_text("Ink for every tool. Opens the Color window on the layers column. X trades it with the other color.")
+                    .on_hover_text("Ink for every tool. Opens the Color window beside the color cell, off the picture. X trades it with the other color.")
                     .clicked()
                 {
                     self.color_open = true;
+                    self.color_snap = true;
                 }
                 let back = self.desk.ink_back;
                 let back_button = egui::Button::new("X").fill(rgb(back)).min_size(egui::vec2(28.0, 18.0));
@@ -4272,6 +4415,7 @@ fn edit_field(
     theme: &Theme,
     typing: &mut bool,
     color_open: &mut bool,
+    color_snap: &mut bool,
 ) {
     match field {
         Field::ReleaseNote => {
@@ -4284,6 +4428,7 @@ fn edit_field(
                     .on_hover_text("Opens the Color window.");
                 if chip.clicked() {
                     *color_open = true;
+                    *color_snap = true;
                 }
                 let mut hex = vmi_core::hex_of(settings.color);
                 let response = field_edit(ui, &mut hex);
@@ -4516,6 +4661,85 @@ fn texture_options() -> egui::TextureOptions {
 
 fn rgb(color: [u8; 3]) -> egui::Color32 {
     egui::Color32::from_rgb(color[0], color[1], color[2])
+}
+
+/// Right edge of the Color window: just left of the chip, and left of the picture.
+fn color_window_right(chip: Option<egui::Rect>, picture_left: f32) -> f32 {
+    let chip_left = chip.map(|rect| rect.left()).unwrap_or(picture_left);
+    (chip_left - 4.0).min(picture_left - 4.0).max(48.0)
+}
+
+/// One channel. Two or three digits commit immediately. One digit waits for focus to leave,
+/// so the first keystroke does not replace the color.
+fn hex_channel(ui: &mut egui::Ui, draft: &mut String, value: u8, salt: &str) -> (bool, Option<u8>) {
+    let id = egui::Id::new(("vmi-color-channel", salt));
+    let focused = ui.memory(|mem| mem.has_focus(id));
+    if !focused {
+        *draft = format!("{value:02X}");
+    }
+    let response = ui.add(
+        egui::TextEdit::singleline(draft)
+            .id(id)
+            .desired_width(30.0)
+            .char_limit(3)
+            .font(egui::TextStyle::Monospace),
+    );
+    let digits = draft.trim().trim_start_matches('#').len();
+    let parsed = if response.lost_focus() || (response.changed() && (2..=3).contains(&digits)) {
+        parse_channel_hex(draft)
+    } else {
+        None
+    };
+    // An untouched box must not write the old text back over a picker change.
+    let parsed = parsed.filter(|parsed| response.changed() || *parsed != value);
+    (response.has_focus(), parsed)
+}
+
+/// `#RRGGBB`, `#RRGGBBAA`, nine digits, or twelve. A short form keeps `alpha`.
+fn hex_group(
+    ui: &mut egui::Ui,
+    draft: &mut String,
+    canonical: &str,
+    salt: &str,
+    width: f32,
+    limit: usize,
+    alpha: u8,
+) -> (bool, Option<[u8; 4]>) {
+    let id = egui::Id::new(("vmi-color-group", salt));
+    let focused = ui.memory(|mem| mem.has_focus(id));
+    if !focused {
+        *draft = canonical.to_string();
+    }
+    let response = ui.add(
+        egui::TextEdit::singleline(draft)
+            .id(id)
+            .desired_width(width)
+            .char_limit(limit)
+            .font(egui::TextStyle::Monospace),
+    );
+    let raw_len = draft.trim().trim_start_matches('#').len();
+    let ready = matches!(raw_len, 6 | 8 | 9 | 12);
+    let parsed = if response.lost_focus() || (response.changed() && ready) {
+        parse_hex_rgba(draft, alpha)
+    } else {
+        None
+    };
+    let same = parse_hex_rgba(canonical, alpha);
+    let parsed = parsed.filter(|parsed| response.changed() || Some(*parsed) != same);
+    (response.has_focus(), parsed)
+}
+
+/// A swatch that still shows when alpha is 0. The frame is the cell. The checker sits under the ink.
+fn paint_rgba_swatch(painter: &egui::Painter, rect: egui::Rect, rgba: [u8; 4], frame: egui::Color32) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(32, 32, 32));
+    let right = egui::Rect::from_min_max(egui::pos2(rect.center().x, rect.min.y), rect.max);
+    painter.rect_filled(right, 0.0, egui::Color32::from_rgb(64, 64, 64));
+    painter.rect_filled(
+        rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3]),
+    );
+    painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, frame));
 }
 
 /// A flat ink cell. Click opens the Color window. It is not egui's popup.
@@ -4885,6 +5109,7 @@ impl eframe::App for StudioApp {
             }
             self.area_body(ui, ctx, Area::Center);
         });
+        self.picture_edge = Some(brushes.response.rect.right());
         self.desk
             .note_widths(left.response.rect.width(), brushes.response.rect.width());
         self.desk.note_areas(
@@ -4904,6 +5129,19 @@ impl eframe::App for StudioApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_color_window_sits_against_the_chip_and_off_the_picture() {
+        let chip = egui::Rect::from_min_size(egui::pos2(484.0, 70.0), egui::vec2(25.0, 18.0));
+        let picture_left = chip.left() + PANEL_INNER + PANEL_MARGIN;
+        let right = color_window_right(Some(chip), picture_left);
+        assert!((right - (chip.left() - 4.0)).abs() < 0.1);
+        assert!(right < picture_left - 2.0);
+        // A narrow layers column still stops at the picture, not on it.
+        let narrow = color_window_right(Some(chip), chip.left() - 10.0);
+        assert!((narrow - (chip.left() - 14.0)).abs() < 0.1);
+        assert!(narrow < chip.left() - 10.0);
+    }
 
     #[test]
     fn every_view_lives_in_one_area_and_the_picture_never_leaves() {

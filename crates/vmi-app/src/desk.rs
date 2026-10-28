@@ -12,7 +12,7 @@ use vmi_core::doc::blit_into;
 use vmi_core::newpage::{blank_picture, opened_note};
 use vmi_core::tabs::{default_export_parent, same_export};
 use vmi_core::{
-    clamp_rect, column_of, cut_folder, erase_folder, export_png, find, find_mut, hex_of,
+    clamp_rect, column_of, cut_folder, erase_folder, export_png, find, find_mut, hex_of, hex_rgba,
     hit_stroke, load_manifest, load_session, load_vmib, move_handle, move_vertex, palette_action,
     parent_of, parse_hex, point_inside, present_proxy, present_region, present_region_plain,
     rect_points, save_session,
@@ -276,8 +276,11 @@ pub struct Desk {
     object_edit_saved: bool,
     /// One ink for every tool. Switching tools does not change it.
     pub ink: [u8; 3],
+    /// Shared alpha, 0 through 255. It scales the stroke's own opacity.
+    pub ink_alpha: u8,
     /// The other ink. X trades it with `ink`, the way Clip Studio does.
     pub ink_back: [u8; 3],
+    pub ink_alpha_back: u8,
     /// C. The current brush stamps transparent pixels and stays selected.
     pub clear_ink: bool,
     /// Folders the outliner has closed. Absent means open, so a file shows its layers.
@@ -358,7 +361,9 @@ impl Desk {
             stroke_edit_saved: false,
             object_edit_saved: false,
             ink: [0xFF, 0x3E, 0xB8],
+            ink_alpha: 255,
             ink_back: [0, 0, 0],
+            ink_alpha_back: 255,
             clear_ink: false,
             collapsed: HashSet::new(),
             library_folder: String::new(),
@@ -496,8 +501,8 @@ impl Desk {
         self.status = format!("Size {size}.");
     }
 
-    /// The colour under the pen, over white paper. Checker and onion stay out.
-    /// Off the page leaves the ink alone.
+    /// The pixel under the pen, straight RGBA. Checker and onion stay out.
+    /// Off the page leaves the ink alone. Clear paper is alpha 0.
     pub fn sample_ink(&mut self, x: f32, y: f32) {
         let px = x.floor() as i32;
         let py = y.floor() as i32;
@@ -510,32 +515,43 @@ impl Desk {
             self.status = "Off the page.".into();
             return;
         }
-        let color = over_paper(rgba[0], rgba[1], rgba[2], rgba[3]);
-        self.set_ink(color);
-        self.status = if rgba[3] == 0 {
+        let color = [rgba[0], rgba[1], rgba[2], rgba[3]];
+        self.set_rgba(color);
+        self.status = if color[3] == 0 {
             "Paper.".into()
         } else {
-            format!("Ink {}.", hex_of(color))
+            format!("Ink {}.", hex_rgba(color))
         };
     }
 
-    /// The color every tool paints with.
+    /// The color every tool paints with. Alpha stays where it is.
     pub fn set_ink(&mut self, color: [u8; 3]) {
-        if self.ink == color {
-            return;
-        }
-        self.ink = color;
-        self.session.note_recent_color(color);
-        self.session_dirty = true;
-        self.status = format!("Ink {}.", hex_of(color));
+        self.set_rgba([color[0], color[1], color[2], self.ink_alpha]);
     }
 
-    /// X. The two inks trade places. The tool stays put.
+    /// R, G, B, and A. A scales every tool's own stroke opacity.
+    pub fn set_rgba(&mut self, rgba: [u8; 4]) {
+        let noted = self.session.note_recent_color(rgba);
+        let changed = self.ink != [rgba[0], rgba[1], rgba[2]] || self.ink_alpha != rgba[3];
+        if !changed && !noted {
+            return;
+        }
+        self.ink = [rgba[0], rgba[1], rgba[2]];
+        self.ink_alpha = rgba[3];
+        self.session_dirty = true;
+        if changed {
+            self.status = format!("Ink {}.", hex_rgba(rgba));
+        }
+    }
+
+    /// X. The two inks trade places, alpha included. The tool stays put.
     pub fn swap_inks(&mut self) {
         std::mem::swap(&mut self.ink, &mut self.ink_back);
-        self.session.note_recent_color(self.ink);
+        std::mem::swap(&mut self.ink_alpha, &mut self.ink_alpha_back);
+        let rgba = [self.ink[0], self.ink[1], self.ink[2], self.ink_alpha];
+        self.session.note_recent_color(rgba);
         self.session_dirty = true;
-        self.status = format!("Ink {}.", hex_of(self.ink));
+        self.status = format!("Ink {}.", hex_rgba(rgba));
     }
 
     /// C. Empty pixels, not a switch over to the eraser tool.
@@ -2192,6 +2208,8 @@ impl Desk {
         let mut settings = self.preset().clone();
         // One ink. The preset color is not consulted, so the tool cannot change it.
         settings.color = self.ink;
+        settings.opacity =
+            (settings.opacity * f32::from(self.ink_alpha) / 255.0).clamp(0.0, 1.0);
         let (width, height) = (self.art.width, self.art.height);
         if tool == Tool::Fill {
             let before = self.art.clone();
@@ -3722,12 +3740,6 @@ fn walk_layers(
     }
 }
 
-/// Straight ink over white paper. Clear paper is white. The checker is not ink.
-fn over_paper(r: u8, g: u8, b: u8, a: u8) -> [u8; 3] {
-    let out = source_over(Rgba::rgb(255, 255, 255), Rgba::new(r, g, b, a), 1.0);
-    [out.r, out.g, out.b]
-}
-
 /// Pens, the eraser, and the line. Smudge and blend read the pixels they stand on,
 /// so they stay per dab. Opacity here is the whole stroke, the way Photoshop and
 /// Clip Studio composite one pass.
@@ -4159,19 +4171,22 @@ mod tests {
         assert_eq!(desk.undo_depth(), 0);
         assert_eq!(desk.art.layers[0].pixels, pixels);
         assert_eq!(desk.ink, [10, 20, 30]);
-        assert_eq!(desk.status, "Ink #0A141E.");
+        assert_eq!(desk.ink_alpha, 255);
+        assert_eq!(desk.status, "Ink #0A141EFF.");
         desk.status = "nope".into();
         desk.down_doc(4.2, 6.2, Button::Primary);
-        assert_eq!(desk.status, "Ink #0A141E.");
+        assert_eq!(desk.status, "Ink #0A141EFF.");
         desk.down_doc(8.4, 6.1, Button::Primary);
-        let over = source_over(Rgba::rgb(255, 255, 255), Rgba::new(255, 0, 0, 128), 1.0);
-        assert_eq!(desk.ink, [over.r, over.g, over.b]);
-        assert_ne!(desk.ink, [255, 0, 0]);
+        assert_eq!(desk.ink, [255, 0, 0]);
+        assert_eq!(desk.ink_alpha, 128);
+        assert_eq!(desk.status, "Ink #FF000080.");
         desk.down_doc(1.2, 1.2, Button::Primary);
-        assert_eq!(desk.ink, [255, 255, 255]);
+        assert_eq!(desk.ink, [0, 0, 0]);
+        assert_eq!(desk.ink_alpha, 0);
         assert_eq!(desk.status, "Paper.");
         desk.down_doc(-1.0, 2.0, Button::Primary);
-        assert_eq!(desk.ink, [255, 255, 255]);
+        assert_eq!(desk.ink, [0, 0, 0]);
+        assert_eq!(desk.ink_alpha, 0);
         assert_eq!(desk.status, "Off the page.");
         desk.down_doc(48.0, 0.0, Button::Primary);
         assert_eq!(desk.status, "Off the page.");

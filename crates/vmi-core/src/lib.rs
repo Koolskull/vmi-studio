@@ -39,7 +39,7 @@ pub use anim::{
 };
 pub use blend::{blend_label, BLENDS};
 pub use bridge::load_manifest;
-pub use color::{hex_of, parse_hex, quiet_color, Rgba};
+pub use color::{hex_of, hex_rgba, hex_rgba_wide, parse_channel_hex, parse_hex, parse_hex_rgba, quiet_color, Rgba};
 pub use coverage::{
     coverage, dither_keeps, mix_half, pixel, shade, source_over, stamp, stroke_steps,
     DitherPattern, Edge, Stamp, StampMode,

@@ -5,7 +5,8 @@ pub use vmi_core::stroke_steps;
 
 use vmi_core::coverage::dither_keeps;
 use vmi_core::{
-    coverage, ink_spacing, pixel, stamp, Edge, Grain, Rgba, Stamp, StampMode, Tool, ToolSettings, VectorStroke,
+    coverage, ink_spacing, pixel, stamp, Edge, Grain, Rgba, Stabilizer, Stamp, StampMode, Tool,
+    ToolSettings, VectorStroke,
 };
 
 /// How many hairs a smudge drags across its width. Each one carries its own color.
@@ -36,17 +37,63 @@ impl Carry {
 pub struct StrokeSession {
     pub samples: Vec<(f32, f32, f32)>,
     pub carry: Carry,
+    stabilizer: Stabilizer,
+    cursor: (f32, f32, f32),
 }
 
 impl StrokeSession {
     pub fn begin(&mut self, x: f32, y: f32, pressure: f32) {
         self.samples.clear();
         self.carry.clear();
-        self.samples.push((x, y, pressure.clamp(0.0, 1.0)));
+        let pressure = pressure.clamp(0.0, 1.0);
+        self.samples.push((x, y, pressure));
+        self.cursor = (x, y, pressure);
+        self.stabilizer = Stabilizer::default();
+        self.stabilizer.start(x, y);
     }
 
     pub fn push(&mut self, x: f32, y: f32, pressure: f32) {
-        self.samples.push((x, y, pressure.clamp(0.0, 1.0)));
+        let pressure = pressure.clamp(0.0, 1.0);
+        self.cursor = (x, y, pressure);
+        self.samples.push((x, y, pressure));
+    }
+
+    /// Record the point the string allows. `None` means the pen is still inside it.
+    pub fn push_stable(
+        &mut self,
+        x: f32,
+        y: f32,
+        pressure: f32,
+        length: f32,
+    ) -> Option<(f32, f32, f32)> {
+        let pressure = pressure.clamp(0.0, 1.0);
+        self.cursor = (x, y, pressure);
+        let (sx, sy) = self.stabilizer.follow(x, y, length)?;
+        if let Some(last) = self.samples.last() {
+            if (last.0 - sx).hypot(last.1 - sy) < 0.2 {
+                return None;
+            }
+        }
+        let sample = (sx, sy, pressure);
+        self.samples.push(sample);
+        Some(sample)
+    }
+
+    /// Shrink the string onto the pen. The new samples are the tail.
+    pub fn release_stable(&mut self, length: f32) -> Vec<(f32, f32, f32)> {
+        let (x, y, pressure) = self.cursor;
+        let mut added = Vec::new();
+        for (px, py) in self.stabilizer.release(x, y, length) {
+            if let Some(last) = self.samples.last() {
+                if (last.0 - px).hypot(last.1 - py) < 0.25 {
+                    continue;
+                }
+            }
+            let sample = (px, py, pressure);
+            self.samples.push(sample);
+            added.push(sample);
+        }
+        added
     }
 
     /// A straight line keeps the first sample and the latest point.
@@ -60,7 +107,12 @@ impl StrokeSession {
         self.carry.clear();
     }
 
-    pub fn end_stroke(&mut self, id: u64, tool: Tool, settings: &ToolSettings) -> Option<VectorStroke> {
+    pub fn end_stroke(
+        &mut self,
+        id: u64,
+        tool: Tool,
+        settings: &ToolSettings,
+    ) -> Option<VectorStroke> {
         let points = std::mem::take(&mut self.samples);
         self.carry.clear();
         VectorStroke::from_gesture(id, tool, &points, settings)
@@ -76,7 +128,9 @@ pub fn replay(
     tool: Tool,
     settings: &ToolSettings,
 ) {
-    let count = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+    let count = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
     if base.len() == count && buf.len() == count {
         buf.copy_from_slice(base);
     }
@@ -98,13 +152,31 @@ pub fn paint_samples(
     }
     let mut changed = false;
     let mut previous = samples[0];
-    let first_angle = samples.get(1).map(|next| heading(previous, *next)).unwrap_or(0.0);
-    changed |= dab_at(buf, width, height, previous, first_angle, tool, settings, carry);
+    let first_angle = samples
+        .get(1)
+        .map(|next| heading(previous, *next))
+        .unwrap_or(0.0);
+    changed |= dab_at(
+        buf,
+        width,
+        height,
+        previous,
+        first_angle,
+        tool,
+        settings,
+        carry,
+    );
     for sample in samples.iter().skip(1) {
         let spacing = ink_spacing(settings.diameter_for(previous.2.max(sample.2)), tool);
         let angle = heading(previous, *sample);
-        let mut steps = stroke_steps(previous.0, previous.1, previous.2, sample.0, sample.1, sample.2, spacing);
-        if steps.last().map(|step| (step.0 - sample.0).abs() > 0.01 || (step.1 - sample.1).abs() > 0.01).unwrap_or(true) {
+        let mut steps = stroke_steps(
+            previous.0, previous.1, previous.2, sample.0, sample.1, sample.2, spacing,
+        );
+        if steps
+            .last()
+            .map(|step| (step.0 - sample.0).abs() > 0.01 || (step.1 - sample.1).abs() > 0.01)
+            .unwrap_or(true)
+        {
             steps.push(*sample);
         }
         for step in steps {
@@ -137,8 +209,10 @@ pub fn segment_bounds(
     if tool == Tool::Fill {
         return Some([0, 0, width as i32, height as i32]);
     }
-    let radius = settings.radius_for(from.2.max(to.2)).max(settings.radius_for(1.0).min(settings.size_max * 0.5));
-    let pad = radius + settings.fringe.max(1.0) + 2.0;
+    let radius = settings
+        .radius_for(from.2.max(to.2))
+        .max(settings.radius_for(1.0).min(settings.size_max * 0.5));
+    let pad = radius + settings.fringe.max(1.0) + settings.scatter.max(0.0) * settings.size + 2.0;
     let x0 = ((from.0.min(to.0) - pad).floor() as i32).max(0);
     let y0 = ((from.1.min(to.1) - pad).floor() as i32).max(0);
     let x1 = ((from.0.max(to.0) + pad).ceil() as i32 + 1).min(width as i32);
@@ -178,8 +252,32 @@ pub fn paint_segment(
     changed
 }
 
+/// A dab may step off the stroke. Zero scatter leaves the sample where it was.
+fn scatter_sample(sample: (f32, f32, f32), angle: f32, settings: &ToolSettings) -> (f32, f32, f32) {
+    let amount = settings.scatter.max(0.0);
+    if amount <= 0.001 {
+        return sample;
+    }
+    let (x, y, pressure) = sample;
+    let spin = (x * 12.9898 + y * 78.233).sin() * 43758.5453;
+    let across = spin.fract() - 0.5;
+    let along = ((x * 3.1 + y * 9.7).sin() * 23421.631).fract() - 0.5;
+    let reach = amount * settings.size.max(1.0);
+    let (sin, cos) = angle.sin_cos();
+    let dx = cos * along * reach - sin * across * reach;
+    let dy = sin * along * reach + cos * across * reach;
+    (x + dx, y + dy, pressure)
+}
+
 fn grain_for(settings: &ToolSettings, angle: f32, cx: f32, cy: f32) -> Grain {
-    Grain { tip: settings.tip, amount: settings.texture, seed: settings.seed, angle, index: 0 }.at(cx, cy)
+    Grain {
+        tip: settings.tip,
+        amount: settings.texture,
+        seed: settings.seed,
+        angle,
+        index: 0,
+    }
+    .at(cx, cy)
 }
 
 fn dab_at(
@@ -192,15 +290,35 @@ fn dab_at(
     settings: &ToolSettings,
     carry: &mut Carry,
 ) -> bool {
-    let (x, y, pressure) = sample;
+    let (x, y, pressure) = scatter_sample(sample, angle, settings);
     if tool == Tool::Fill {
-        return flood_fill(buf, width, height, x.round() as i32, y.round() as i32, settings);
+        return flood_fill(
+            buf,
+            width,
+            height,
+            x.round() as i32,
+            y.round() as i32,
+            settings,
+        );
     }
     let radius = settings.radius_for(pressure);
     let opacity = settings.opacity_for(pressure);
     let grain = grain_for(settings, angle, x, y);
     if tool == Tool::Smudge {
-        return smudge_dab(buf, width, height, SmudgeDab { cx: x, cy: y, radius, opacity, settings, grain }, carry);
+        return smudge_dab(
+            buf,
+            width,
+            height,
+            SmudgeDab {
+                cx: x,
+                cy: y,
+                radius,
+                opacity,
+                settings,
+                grain,
+            },
+            carry,
+        );
     }
     let mode = match tool {
         Tool::Eraser => StampMode::Erase,
@@ -215,20 +333,27 @@ fn dab_at(
         }
         color = under;
     }
-    stamp(buf, width, height, Stamp {
-        cx: x,
-        cy: y,
-        radius,
-        softness: settings.softness_for(tool),
-        fringe: settings.fringe,
-        opacity,
-        color,
-        edge: settings.edge,
-        chunk: settings.chunk,
-        tones: settings.tones || tool == Tool::Dither,
-        mode,
-        grain,
-    })
+    stamp(
+        buf,
+        width,
+        height,
+        Stamp {
+            cx: x,
+            cy: y,
+            radius,
+            softness: settings.softness_for(tool),
+            fringe: settings.fringe,
+            opacity,
+            color,
+            edge: settings.edge,
+            chunk: settings.chunk,
+            tones: settings.tones || tool == Tool::Dither,
+            pattern: settings.dither_pattern,
+            bias: settings.dither_bias,
+            mode,
+            grain,
+        },
+    )
 }
 
 struct SmudgeDab<'a> {
@@ -245,15 +370,29 @@ struct SmudgeDab<'a> {
 /// Each hair lifts the color under it through the tip mask, holds most of
 /// what it already carried, and lays that down. Streaks come out of the
 /// mask; two colors under one disc stay two colors.
-fn smudge_dab(buf: &mut [u8], width: u32, height: u32, dab: SmudgeDab<'_>, carry: &mut Carry) -> bool {
+fn smudge_dab(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    dab: SmudgeDab<'_>,
+    carry: &mut Carry,
+) -> bool {
     let settings = dab.settings;
     let radius = dab.radius.max(0.5);
     if width == 0 || height == 0 || dab.opacity <= 0.0 {
         return false;
     }
     let softness = settings.softness.clamp(0.0, 1.0);
-    let fringe = if settings.edge == Edge::Hard { 0.0 } else { settings.fringe.max(0.0) };
-    let pad = if fringe > 0.0 || softness > 0.0 { fringe.max(1.0) } else { 0.0 };
+    let fringe = if settings.edge == Edge::Hard {
+        0.0
+    } else {
+        settings.fringe.max(0.0)
+    };
+    let pad = if fringe > 0.0 || softness > 0.0 {
+        fringe.max(1.0)
+    } else {
+        0.0
+    };
     let reach = radius + pad;
     let x0 = (dab.cx - reach).floor().max(0.0) as i32;
     let y0 = (dab.cy - reach).floor().max(0.0) as i32;
@@ -351,7 +490,14 @@ fn smudge_dab(buf: &mut [u8], width: u32, height: u32, dab: SmudgeDab<'_>, carry
                 continue;
             }
             if settings.edge == Edge::Dither {
-                if dither_keeps(cover, x, y, settings.chunk) {
+                if dither_keeps(
+                    cover,
+                    x,
+                    y,
+                    settings.chunk,
+                    settings.dither_pattern,
+                    settings.dither_bias,
+                ) {
                     cover = 1.0;
                 } else {
                     continue;
@@ -379,7 +525,12 @@ fn smudge_dab(buf: &mut [u8], width: u32, height: u32, dab: SmudgeDab<'_>, carry
 fn lerp_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
     let t = t.clamp(0.0, 1.0);
     let ch = |p: u8, q: u8| (f32::from(p) + (f32::from(q) - f32::from(p)) * t).round() as u8;
-    Rgba { r: ch(a.r, b.r), g: ch(a.g, b.g), b: ch(a.b, b.b), a: ch(a.a, b.a) }
+    Rgba {
+        r: ch(a.r, b.r),
+        g: ch(a.g, b.g),
+        b: ch(a.b, b.b),
+        a: ch(a.a, b.a),
+    }
 }
 
 fn average_of(colors: &[Rgba]) -> Rgba {
@@ -449,10 +600,22 @@ fn mix_toward(held: Rgba, under: Rgba, amount: f32) -> Rgba {
         return Rgba::CLEAR;
     }
     let ch = |h: u8, u: u8| ((f32::from(h) * ha + f32::from(u) * ua) / total).round() as u8;
-    Rgba::new(ch(held.r, under.r), ch(held.g, under.g), ch(held.b, under.b), total.round() as u8)
+    Rgba::new(
+        ch(held.r, under.r),
+        ch(held.g, under.g),
+        ch(held.b, under.b),
+        total.round() as u8,
+    )
 }
 
-pub fn flood_fill(buf: &mut [u8], width: u32, height: u32, x: i32, y: i32, settings: &ToolSettings) -> bool {
+pub fn flood_fill(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    settings: &ToolSettings,
+) -> bool {
     let target = pixel(buf, width, height, x, y);
     let ink = Rgba::rgb(settings.color[0], settings.color[1], settings.color[2]);
     if same(target, ink, settings.fill_tolerance) || x < 0 || y < 0 {
@@ -529,6 +692,25 @@ mod tests {
     }
 
     #[test]
+    fn stabilize_holds_jitter_and_the_lift_still_lands() {
+        let mut session = StrokeSession::default();
+        session.begin(0.0, 0.0, 1.0);
+        for index in 1..=10 {
+            let y = if index % 2 == 0 { 6.0 } else { -6.0 };
+            session.push_stable(index as f32 * 6.0, y, 1.0, 10.0);
+        }
+        for sample in &session.samples {
+            assert!(sample.1.abs() < 10.0, "{sample:?}");
+        }
+        let tail = session.release_stable(10.0);
+        let end = session.samples.last().copied().unwrap();
+        assert!(
+            (end.0 - 60.0).abs() < 1.0 && (end.1 - 6.0).abs() < 0.5,
+            "end={end:?} tail={tail:?}"
+        );
+    }
+
+    #[test]
     fn smudge_carry_survives_the_next_segment() {
         let mut buf = vec![0u8; 16 * 8 * 4];
         buf[(4 * 16 + 4) * 4] = 255;
@@ -544,10 +726,26 @@ mod tests {
         settings.opacity_pressure = false;
         settings.texture = 0.0;
         let mut carry = Carry::default();
-        paint_samples(&mut buf, 16, 8, &[(4.0, 4.0, 1.0)], Tool::Smudge, &settings, &mut carry);
+        paint_samples(
+            &mut buf,
+            16,
+            8,
+            &[(4.0, 4.0, 1.0)],
+            Tool::Smudge,
+            &settings,
+            &mut carry,
+        );
         let picked = carry.color.unwrap();
         assert!(picked.r > 0, "{picked:?}");
-        paint_samples(&mut buf, 16, 8, &[(4.0, 4.0, 1.0), (12.0, 4.0, 1.0)], Tool::Smudge, &settings, &mut carry);
+        paint_samples(
+            &mut buf,
+            16,
+            8,
+            &[(4.0, 4.0, 1.0), (12.0, 4.0, 1.0)],
+            Tool::Smudge,
+            &settings,
+            &mut carry,
+        );
         assert!(carry.color.unwrap().r > 0, "{carry:?}");
         let carried = pixel(&buf, 16, 8, 10, 4);
         assert!(carried.r > 0, "{carried:?}");
@@ -574,7 +772,15 @@ mod tests {
         settings.size_pressure = false;
         settings.opacity_pressure = false;
         let mut carry = Carry::default();
-        paint_samples(&mut buf, w, h, &[(8.0, 12.0, 1.0), (40.0, 12.0, 1.0)], Tool::Smudge, &settings, &mut carry);
+        paint_samples(
+            &mut buf,
+            w,
+            h,
+            &[(8.0, 12.0, 1.0), (40.0, 12.0, 1.0)],
+            Tool::Smudge,
+            &settings,
+            &mut carry,
+        );
         assert_eq!(carry.hairs.len(), SMUDGE_HAIRS);
         let top = carry.hairs[0];
         let bottom = carry.hairs[SMUDGE_HAIRS - 1];
@@ -594,28 +800,67 @@ mod tests {
         settings.opacity_pressure = false;
         settings.texture = 0.0;
         let mut carry = Carry::default();
-        paint_samples(&mut flat, 64, 64, &[(32.0, 32.0, 1.0)], Tool::Paint, &settings, &mut carry);
+        paint_samples(
+            &mut flat,
+            64,
+            64,
+            &[(32.0, 32.0, 1.0)],
+            Tool::Paint,
+            &settings,
+            &mut carry,
+        );
         settings.texture = 1.0;
         settings.tip = Tip::Bristle;
-        paint_samples(&mut hairy, 64, 64, &[(32.0, 32.0, 1.0)], Tool::Paint, &settings, &mut carry);
-        let alphas = |buf: &[u8]| -> Vec<u8> { buf.chunks(4).map(|p| p[3]).filter(|a| *a > 0).collect() };
+        paint_samples(
+            &mut hairy,
+            64,
+            64,
+            &[(32.0, 32.0, 1.0)],
+            Tool::Paint,
+            &settings,
+            &mut carry,
+        );
+        let alphas =
+            |buf: &[u8]| -> Vec<u8> { buf.chunks(4).map(|p| p[3]).filter(|a| *a > 0).collect() };
         let flat_a = alphas(&flat);
         let hairy_a = alphas(&hairy);
         assert!(!hairy_a.is_empty());
         let weight = |v: &[u8]| v.iter().map(|a| u32::from(*a)).sum::<u32>();
         assert!(weight(&hairy_a) < weight(&flat_a));
         let distinct: std::collections::HashSet<u8> = hairy_a.iter().copied().collect();
-        assert!(distinct.len() > 8, "a bristle dab has many partial pixels: {}", distinct.len());
+        assert!(
+            distinct.len() > 8,
+            "a bristle dab has many partial pixels: {}",
+            distinct.len()
+        );
     }
 
     #[test]
     fn segment_bounds_cover_the_whole_dab() {
         let mut settings = ToolSettings::default_for(Tool::Pen);
         settings.size = 10.0;
-        let bounds = segment_bounds(100, 100, (20.0, 20.0, 1.0), (30.0, 25.0, 1.0), Tool::Pen, &settings).unwrap();
+        let bounds = segment_bounds(
+            100,
+            100,
+            (20.0, 20.0, 1.0),
+            (30.0, 25.0, 1.0),
+            Tool::Pen,
+            &settings,
+        )
+        .unwrap();
         assert!(bounds[0] <= 12 && bounds[1] <= 12, "{bounds:?}");
         assert!(bounds[2] >= 38 && bounds[3] >= 33, "{bounds:?}");
-        assert_eq!(segment_bounds(100, 100, (0.0, 0.0, 1.0), (1.0, 1.0, 1.0), Tool::Fill, &settings), Some([0, 0, 100, 100]));
+        assert_eq!(
+            segment_bounds(
+                100,
+                100,
+                (0.0, 0.0, 1.0),
+                (1.0, 1.0, 1.0),
+                Tool::Fill,
+                &settings
+            ),
+            Some([0, 0, 100, 100])
+        );
     }
 
     #[test]
@@ -629,7 +874,15 @@ mod tests {
         eraser.size_pressure = false;
         eraser.opacity_pressure = false;
         let mut carry = Carry::default();
-        paint_samples(&mut buf, 8, 8, &[(1.0, 1.0, 1.0)], Tool::Eraser, &eraser, &mut carry);
+        paint_samples(
+            &mut buf,
+            8,
+            8,
+            &[(1.0, 1.0, 1.0)],
+            Tool::Eraser,
+            &eraser,
+            &mut carry,
+        );
         assert_eq!(pixel(&buf, 8, 8, 1, 1).a, 0);
         assert_eq!(pixel(&buf, 8, 8, 7, 7).a, 255);
 

@@ -27,6 +27,7 @@ pub fn icon(tool: Tool) -> &'static Icon {
         Tool::Grain => &GRAIN,
         Tool::WarpTarget => &WARP_TARGET,
         Tool::WarpMask => &WARP_MASK,
+        Tool::Select => &SELECT,
         Tool::CutRect => &CUT_RECT,
         Tool::CutLasso => &CUT_LASSO,
         Tool::CutPolygon => &CUT_POLYGON,
@@ -35,9 +36,12 @@ pub fn icon(tool: Tool) -> &'static Icon {
 
 /// Every lit cell of an icon as `(column, row)`.
 pub fn cells(icon: &Icon) -> impl Iterator<Item = (usize, usize)> + '_ {
-    icon.iter()
-        .enumerate()
-        .flat_map(|(row, line)| line.bytes().enumerate().filter(|(_, b)| *b == b'#').map(move |(col, _)| (col, row)))
+    icon.iter().enumerate().flat_map(|(row, line)| {
+        line.bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'#')
+            .map(move |(col, _)| (col, row))
+    })
 }
 
 pub const UNDO: Icon = [
@@ -475,6 +479,25 @@ const CUT_LASSO: Icon = [
     "......#.........",
     ".....#..........",
     "....#...........",
+];
+
+const SELECT: Icon = [
+    "................",
+    "..#.............",
+    "..##............",
+    "..###...........",
+    "..####..........",
+    "..#####.........",
+    "..######........",
+    "..#######.......",
+    "..###.##........",
+    "..##..##........",
+    "..#....##.......",
+    ".......##.......",
+    "........#.......",
+    "................",
+    "................",
+    "................",
 ];
 
 const CUT_POLYGON: Icon = [

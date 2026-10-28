@@ -42,6 +42,20 @@ pub struct Session {
     /// The UI face id. `monospace` is the house stack.
     #[serde(default = "default_font")]
     pub font: String,
+    /// Onion skin colour for cels behind the playhead. A view, not part of a drawing.
+    #[serde(default = "default_onion_past")]
+    pub onion_past_color: [u8; 3],
+    /// Onion skin colour for cels ahead of the playhead.
+    #[serde(default = "default_onion_future")]
+    pub onion_future_color: [u8; 3],
+}
+
+fn default_onion_past() -> [u8; 3] {
+    crate::anim::PAST
+}
+
+fn default_onion_future() -> [u8; 3] {
+    crate::anim::FUTURE
 }
 
 fn default_font() -> String {
@@ -73,6 +87,8 @@ impl Default for Session {
             bottom_height: default_bottom_height(),
             areas: Vec::new(),
             font: default_font(),
+            onion_past_color: default_onion_past(),
+            onion_future_color: default_onion_future(),
         }
     }
 }
@@ -168,6 +184,8 @@ mod tests {
         fields.remove("palette_tab");
         fields.remove("recent_colors");
         fields.remove("font");
+        fields.remove("onion_past_color");
+        fields.remove("onion_future_color");
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -180,6 +198,8 @@ mod tests {
         assert_eq!(loaded.palette_tab, 0);
         assert!(loaded.recent_colors.is_empty());
         assert_eq!(loaded.font, "monospace");
+        assert_eq!(loaded.onion_past_color, crate::anim::PAST);
+        assert_eq!(loaded.onion_future_color, crate::anim::FUTURE);
     }
 
     #[test]

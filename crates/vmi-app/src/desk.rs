@@ -12,10 +12,12 @@ use vmi_core::doc::blit_into;
 use vmi_core::newpage::{blank_picture, opened_note};
 use vmi_core::tabs::{default_export_parent, same_export};
 use vmi_core::{
-    clamp_rect, cut_folder, erase_folder, export_png, find, find_mut, hex_of, hit_stroke, load_manifest, load_session,
-    load_vmib, palette_action, parent_of, parse_hex, point_inside, present_region, rect_points, save_session,
-    save_vmib as write_vmib, source_over, theme_or_studio, Art, Bone, ClipTime, DeskObject, History, Node,
-    PaletteAction, Release, Rgba, Section, Session, StrokeHit, Tool, ToolSettings,
+    clamp_rect, column_of, cut_folder, erase_folder, export_png, find, find_mut, hex_of,
+    hit_stroke, load_manifest, load_session, load_vmib, move_handle, move_vertex, palette_action,
+    parent_of, parse_hex, point_inside, present_proxy, present_region, rect_points, save_session,
+    save_vmib as write_vmib, source_over, theme_or_studio, xsheet_columns, Art, Bone, ClipTime,
+    DeskObject, HandleSide, History, Node, PaletteAction, Release, Rgba, Section, Session,
+    StrokeHit, Tool, ToolSettings, XColumn,
 };
 use vmi_paint::{flood_fill, paint_samples, paint_segment, segment_bounds, Carry, StrokeSession};
 
@@ -27,8 +29,19 @@ pub enum Display {
     /// The whole picture over its checker.
     Full(Vec<u8>),
     /// One rectangle of it. `rgba` is `w * h * 4`.
-    Part { x: u32, y: u32, w: u32, h: u32, rgba: Vec<u8> },
+    Part {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        rgba: Vec<u8>,
+    },
+    /// A playback plate. Large canvases are sampled so the long side stays near `PLAY_SIDE`.
+    Play { w: u32, h: u32, rgba: Vec<u8> },
 }
+
+/// Playback composites at this long-side cap. The view stretches the plate back over the page.
+const PLAY_SIDE: u32 = 1280;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -68,6 +81,8 @@ pub struct Mark {
     pub x: f32,
     pub y: f32,
     pub hot: bool,
+    /// When set, a handle line runs from this point to `(x, y)`.
+    pub line_to: Option<(f32, f32)>,
 }
 
 /// A picked range of cells in one column of the sheet.
@@ -105,7 +120,13 @@ impl OpenTab {
     }
 
     fn unsaved() -> Self {
-        Self { path: String::new(), export_dir: home_dir(), loaded: false, low_res: true, stash: None }
+        Self {
+            path: String::new(),
+            export_dir: home_dir(),
+            loaded: false,
+            low_res: true,
+            stash: None,
+        }
     }
 }
 
@@ -202,6 +223,8 @@ pub struct Desk {
     pub layer_window: Option<String>,
     pub stroke_window: Option<(String, u64)>,
     pub object_window: Option<String>,
+    /// Right-click on SKIN. The colours live on the session.
+    pub onion_window: bool,
     pub camera: Camera,
     pub fitted: bool,
     pub last_frame: Frame,
@@ -258,13 +281,22 @@ pub struct Desk {
     pub clear_ink: bool,
     /// Folders the outliner has closed. Absent means open, so a file shows its layers.
     collapsed: HashSet<String>,
+    /// The library folder a new object joins. Empty is the root.
+    pub library_folder: String,
+    /// The animation folder the sheet is inside. None is the whole cut.
+    pub clip_focus: Option<String>,
+    /// The layer a picture click should scroll into view. The outliner consumes it.
+    pub reveal: Option<String>,
     /// A raster stroke lives in `overlay` until the pen lifts, then composites once.
     stroke_live: bool,
     stroke_opacity: f32,
     stroke_erase: bool,
     stroke_layer: String,
-    /// Layer pixels at pen-down. The stroke buffer composites onto this.
-    stroke_backup: Vec<u8>,
+    /// Where `overlay` holds stroke ink. Clearing this rect is the whole wipe.
+    overlay_mark: Option<[i32; 4]>,
+    /// Clean layer pixels under the rect being shown, put back after the upload.
+    preview_snap: Vec<u8>,
+    preview_rect: [i32; 4],
 }
 
 impl Desk {
@@ -277,15 +309,23 @@ impl Desk {
             art,
             session,
             selected,
-            status: "Pick a cell in the tool grid. Color and size are on that panel. Ctrl+Z undoes.".into(),
+            status:
+                "Pick a cell in the tool grid. Color and size are on that panel. Ctrl+Z undoes."
+                    .into(),
             query: String::new(),
             tool_window: None,
             layer_window: None,
             stroke_window: None,
             object_window: None,
+            onion_window: false,
             camera: Camera::default(),
             fitted: false,
-            last_frame: Frame { x: 0.0, y: 0.0, w: 0.0, h: 0.0 },
+            last_frame: Frame {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            },
             dirty: true,
             dirty_rect: None,
             pressure: 1.0,
@@ -320,11 +360,16 @@ impl Desk {
             ink_back: [0, 0, 0],
             clear_ink: false,
             collapsed: HashSet::new(),
+            library_folder: String::new(),
+            clip_focus: None,
+            reveal: None,
             stroke_live: false,
             stroke_opacity: 1.0,
             stroke_erase: false,
             stroke_layer: String::new(),
-            stroke_backup: Vec::new(),
+            overlay_mark: None,
+            preview_snap: Vec::new(),
+            preview_rect: [0, 0, 0, 0],
         };
         desk.ensure_overlay();
         desk
@@ -378,7 +423,12 @@ impl Desk {
     }
 
     pub fn edit_preset<F: FnOnce(&mut ToolSettings)>(&mut self, tool: Tool, edit: F) {
-        if let Some(slot) = self.session.presets.iter_mut().find(|item| item.tool == tool) {
+        if let Some(slot) = self
+            .session
+            .presets
+            .iter_mut()
+            .find(|item| item.tool == tool)
+        {
             edit(slot);
             self.session_dirty = true;
         }
@@ -397,7 +447,11 @@ impl Desk {
             }
             PaletteAction::Edit(tool) => {
                 self.tool_window = Some(tool);
-                self.status = format!("Settings for {}. The current tool stays {}.", tool.name(), self.tool().name());
+                self.status = format!(
+                    "Settings for {}. The current tool stays {}.",
+                    tool.name(),
+                    self.tool().name()
+                );
             }
         }
     }
@@ -434,7 +488,8 @@ impl Desk {
         let current = self.preset().size.round() as i32;
         let next = (current + step).clamp(1, 512);
         self.edit_preset(tool, |slot| {
-            slot.size = (next as f32).clamp(slot.size_min.max(0.5), slot.size_max.max(slot.size_min));
+            slot.size =
+                (next as f32).clamp(slot.size_min.max(0.5), slot.size_max.max(slot.size_min));
         });
         let size = self.preset().size.round() as i32;
         self.status = format!("Size {size}.");
@@ -462,7 +517,11 @@ impl Desk {
     /// C. Empty pixels, not a switch over to the eraser tool.
     pub fn toggle_clear(&mut self) {
         self.clear_ink = !self.clear_ink;
-        self.status = if self.clear_ink { "Clear on.".into() } else { "Clear off.".into() };
+        self.status = if self.clear_ink {
+            "Clear on.".into()
+        } else {
+            "Clear off.".into()
+        };
     }
 
     /// Undo state for a raster stroke: this document with the target layer's old pixels.
@@ -491,6 +550,38 @@ impl Desk {
         if find(&self.art.layers, &id).is_some() {
             self.selected = Some(id);
         }
+    }
+
+    /// Select the layer painted at this document pixel and open the folders around it.
+    ///
+    /// Python's picture click (`choose_picture` / `select_only`). The window
+    /// calls this on a release that stayed inside the drag threshold. A drag
+    /// never reaches here, and a miss leaves the selection alone. The name
+    /// lands on the status line. Every ancestor opens. The outliner scrolls
+    /// to the row on the next pass. One click is one row.
+    pub fn choose_at(&mut self, x: f32, y: f32) {
+        let Some(id) = vmi_core::pick_layer(&self.art, x, y) else {
+            self.status = "No layer there.".into();
+            return;
+        };
+        let name = find(&self.art.layers, &id)
+            .map(|node| node.name.clone())
+            .unwrap_or_default();
+        let mut cursor = Some(id.clone());
+        let mut guard = 0;
+        while let Some(current) = cursor {
+            cursor = parent_of(&self.art.layers, &current);
+            if let Some(parent) = &cursor {
+                self.collapsed.remove(parent);
+            }
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        self.selected = Some(id.clone());
+        self.reveal = Some(id);
+        self.status = name;
     }
 
     pub fn open_layer_window(&mut self, id: String) {
@@ -536,6 +627,35 @@ impl Desk {
     pub fn close_object_window(&mut self) {
         self.object_window = None;
         self.object_edit_saved = false;
+    }
+
+    pub fn open_onion_window(&mut self) {
+        self.onion_window = true;
+    }
+
+    pub fn close_onion_window(&mut self) {
+        self.onion_window = false;
+    }
+
+    /// Past is behind the playhead. The colour is a view, stored with the session.
+    pub fn set_onion_color(&mut self, past: bool, color: [u8; 3]) {
+        if past {
+            self.session.onion_past_color = color;
+            self.art.onion_past_color = color;
+        } else {
+            self.session.onion_future_color = color;
+            self.art.onion_future_color = color;
+        }
+        self.session_dirty = true;
+        self.dirty = true;
+        self.status = "Onion skin color updated.".into();
+    }
+
+    /// How many neighbour cels the skin shows. `0` hides that side.
+    pub fn set_onion_reach(&mut self, past: u8, future: u8) {
+        self.art.onion_past = past.min(vmi_core::ONION_LIMIT);
+        self.art.onion_future = future.min(vmi_core::ONION_LIMIT);
+        self.dirty = true;
     }
 
     pub fn edit_layer<F: FnOnce(&mut Node)>(&mut self, id: &str, edit: F) {
@@ -600,13 +720,20 @@ impl Desk {
             self.history.push(self.art.clone());
             self.stroke_edit_saved = true;
         }
-        let embedded = find(&self.art.layers, &layer_id).map(|node| node.embedded).unwrap_or(false);
+        let embedded = find(&self.art.layers, &layer_id)
+            .map(|node| node.embedded)
+            .unwrap_or(false);
         if embedded {
             self.unbake(&layer_id);
-            self.status = "Baked pixels were cleared so the stroke can redraw from its traits.".into();
+            self.status =
+                "Baked pixels were cleared so the stroke can redraw from its traits.".into();
         }
         if let Some(node) = find_mut(&mut self.art.layers, &layer_id) {
-            if let Some(stroke) = node.strokes.iter_mut().find(|stroke| stroke.id == stroke_id) {
+            if let Some(stroke) = node
+                .strokes
+                .iter_mut()
+                .find(|stroke| stroke.id == stroke_id)
+            {
                 edit(stroke);
                 stroke.touch();
             }
@@ -650,17 +777,186 @@ impl Desk {
         self.status = "Group added.".into();
     }
 
+    fn library_target(&self) -> String {
+        let id = self.library_folder.as_str();
+        if self
+            .art
+            .objects
+            .iter()
+            .any(|object| object.id == id && object.is_folder())
+        {
+            self.library_folder.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn add_folder(&mut self) {
+        let before = self.art.clone();
+        let id = self.art.alloc_id();
+        let folder = self.library_target();
+        let count = self
+            .art
+            .objects
+            .iter()
+            .filter(|object| object.is_folder())
+            .count()
+            + 1;
+        let mut object = DeskObject::new(id.clone(), format!("Folder {count}"), Vec::new());
+        object.kind = "folder".into();
+        object.folder = folder.clone();
+        object.stack = vmi_core::next_stack(&self.art.objects, &folder, true);
+        self.art.objects.push(object);
+        self.history.push(before);
+        self.library_folder = id.clone();
+        self.object_window = Some(id);
+        self.object_edit_saved = false;
+        self.status = "Folder added. New objects join it. The top row is behind.".into();
+    }
+
     pub fn add_object(&mut self) {
         let before = self.art.clone();
         let id = self.art.alloc_id();
-        let name = format!("Object {}", self.art.objects.len() + 1);
-        let mut object = DeskObject::new(id.clone(), name, Vec::new());
+        let folder = self.library_target();
+        let count = self
+            .art
+            .objects
+            .iter()
+            .filter(|object| !object.is_folder())
+            .count()
+            + 1;
+        let mut object = DeskObject::new(id.clone(), format!("Object {count}"), Vec::new());
         object.kind = "static".into();
+        object.folder = folder.clone();
+        object.stack = vmi_core::next_stack(&self.art.objects, &folder, false);
         self.art.objects.push(object);
         self.history.push(before);
         self.object_window = Some(id);
         self.object_edit_saved = false;
-        self.status = "Object added. Right-click it for its name and kind.".into();
+        self.status = "Object added. Its settings are below the list.".into();
+    }
+
+    /// Drop `from` on `target`. A symbol dropped on a folder joins that folder, in front.
+    /// A symbol dropped on a symbol takes that row. The top row is the back.
+    pub fn place_on(&mut self, from: &str, target: &str) {
+        let Some(source) = self
+            .art
+            .objects
+            .iter()
+            .find(|object| object.id == from)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(dest) = self
+            .art
+            .objects
+            .iter()
+            .find(|object| object.id == target)
+            .cloned()
+        else {
+            return;
+        };
+        if source.id == dest.id || (source.is_folder() && !dest.is_folder()) {
+            return;
+        }
+        let (to_folder, index) = if dest.is_folder() {
+            let count = self
+                .art
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.id != source.id
+                        && object.is_folder() == source.is_folder()
+                        && object.folder == dest.id
+                })
+                .count();
+            (dest.id, count)
+        } else {
+            let folder = dest.folder.clone();
+            let mut ids: Vec<(i64, String)> = self
+                .art
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.is_folder() == source.is_folder() && object.folder == folder
+                })
+                .map(|object| (object.stack, object.id.clone()))
+                .collect();
+            ids.sort();
+            let from_index = ids.iter().position(|(_, id)| id == &source.id);
+            let mut index = ids
+                .iter()
+                .position(|(_, id)| id == &dest.id)
+                .unwrap_or(ids.len());
+            if let Some(from_index) = from_index {
+                if from_index < index {
+                    index -= 1;
+                }
+            }
+            (folder, index)
+        };
+        self.place_symbol(&source.id, &to_folder, index);
+    }
+
+    pub fn place_object_in(&mut self, id: &str, to_folder: &str) {
+        let Some(object) = self.art.objects.iter().find(|object| object.id == id) else {
+            return;
+        };
+        if object.folder == to_folder {
+            return;
+        }
+        let is_folder = object.is_folder();
+        let count = self
+            .art
+            .objects
+            .iter()
+            .filter(|object| {
+                object.id != id && object.is_folder() == is_folder && object.folder == to_folder
+            })
+            .count();
+        self.place_symbol(id, to_folder, count);
+    }
+
+    fn place_symbol(&mut self, id: &str, to_folder: &str, index: usize) {
+        let before = self.art.clone();
+        if vmi_core::move_symbol(&mut self.art.objects, id, to_folder, index) {
+            self.history.push(before);
+            self.status = "Depth updated. The top row is behind.".into();
+        }
+    }
+
+    /// The selected layer becomes this state's picture. The first one is frame 000.
+    pub fn give_layer_to_state(&mut self, state: u16) {
+        let Some(layer) = self.selected.clone() else {
+            self.status = "Select a layer in the outliner.".into();
+            return;
+        };
+        let Some(name) = find(&self.art.layers, &layer).map(|node| node.name.clone()) else {
+            self.status = "Select a layer in the outliner.".into();
+            return;
+        };
+        let Some(id) = self.object_window.clone() else {
+            return;
+        };
+        if !self.art.objects.iter().any(|object| object.id == id) {
+            return;
+        }
+        if !self.object_edit_saved {
+            self.history.push(self.art.clone());
+            self.object_edit_saved = true;
+        }
+        let mut frame = 0u16;
+        let mut stored = false;
+        if let Some(object) = self.art.objects.iter_mut().find(|object| object.id == id) {
+            if !object.is_folder() {
+                frame = object.take_layer(&layer, state);
+                stored = true;
+            }
+        }
+        if stored {
+            self.status = format!("{name} is on {}.", vmi_core::slot_key(state, frame));
+        }
     }
 
     pub fn reorder_object(&mut self, from: usize, to: usize) {
@@ -730,9 +1026,16 @@ impl Desk {
         let start = if self.art.path.is_empty() {
             home_dir()
         } else {
-            Path::new(&self.art.path).parent().map(Path::to_path_buf).unwrap_or_else(home_dir)
+            Path::new(&self.art.path)
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(home_dir)
         };
-        let name = if self.art.file_name.is_empty() { "project" } else { self.art.file_name.as_str() };
+        let name = if self.art.file_name.is_empty() {
+            "project"
+        } else {
+            self.art.file_name.as_str()
+        };
         let stem = match name.rfind('.') {
             Some(dot) if dot > 0 => &name[..dot],
             _ => name,
@@ -769,8 +1072,6 @@ impl Desk {
         if let Some(id) = ink {
             self.selected = Some(id);
         }
-        let tool = self.session.tool;
-        self.edit_preset(tool, |slot| slot.color = [255, 255, 255]);
         self.status = note;
         Ok(())
     }
@@ -842,8 +1143,15 @@ impl Desk {
 
     /// "name  W×H  note", plus the warp counts when the drawing has any.
     fn opened_text(&self) -> String {
-        let note = if self.art.note.is_empty() { "Opened." } else { self.art.note.as_str() };
-        let mut text = format!("{}  {}×{}  {}", self.art.file_name, self.art.width, self.art.height, note);
+        let note = if self.art.note.is_empty() {
+            "Opened."
+        } else {
+            self.art.note.as_str()
+        };
+        let mut text = format!(
+            "{}  {}×{}  {}",
+            self.art.file_name, self.art.width, self.art.height, note
+        );
         let (targets, windows) = warp_counts(&self.art.layers);
         if targets > 0 || windows > 0 {
             text.push_str(&format!("  Warp targets: {targets}. Windows: {windows}."));
@@ -913,7 +1221,9 @@ impl Desk {
                 }
                 Ok(LoadMsg::Done(result)) => break result,
                 Err(mpsc::TryRecvError::Empty) => return,
-                Err(mpsc::TryRecvError::Disconnected) => break Err("The file could not be read.".into()),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    break Err("The file could not be read.".into())
+                }
             }
         };
         self.loading = None;
@@ -956,7 +1266,9 @@ impl Desk {
     /// The tab that holds `path`, when one does.
     pub fn tab_at(&self, path: &Path) -> Option<usize> {
         let path = absolute(path).display().to_string();
-        self.tabs.iter().position(|tab| tab.loaded && tab.path == path)
+        self.tabs
+            .iter()
+            .position(|tab| tab.loaded && tab.path == path)
     }
 
     /// The tab bar: None is the browser, Some is a project tab.
@@ -979,7 +1291,9 @@ impl Desk {
                 if self.shown != Some(index) {
                     self.stash_shown();
                 }
-                if self.tabs[index].loaded && (self.shown != Some(index) || self.tabs[index].stash.is_some()) {
+                if self.tabs[index].loaded
+                    && (self.shown != Some(index) || self.tabs[index].stash.is_some())
+                {
                     self.show_tab(index);
                 } else {
                     self.shown = Some(index);
@@ -1071,8 +1385,18 @@ impl Desk {
         let low_res = tab.low_res;
         self.stop();
         self.cancel_gesture();
-        let Stash { art, history, selected, camera, fitted, cut_points, cut_closed, warp_draft, warp_layer, sheet_pick } =
-            *stash;
+        let Stash {
+            art,
+            history,
+            selected,
+            camera,
+            fitted,
+            cut_points,
+            cut_closed,
+            warp_draft,
+            warp_layer,
+            sheet_pick,
+        } = *stash;
         self.art = art;
         self.history = history;
         self.selected = selected;
@@ -1086,16 +1410,25 @@ impl Desk {
         self.layer_window = None;
         self.stroke_window = None;
         self.object_window = None;
+        self.clip_focus = None;
         self.overlay_live = false;
         self.ensure_overlay();
         self.overlay.fill(0);
+        self.overlay_mark = None;
+        self.preview_snap.clear();
+        self.stroke_live = false;
+        self.stroke_erase = false;
+        self.stroke_layer.clear();
         self.dirty = true;
         self.place_picture(low_res);
         self.shown = Some(index);
         self.on_browser = false;
         self.session.path = self.art.path.clone();
         self.session_dirty = true;
-        self.status = format!("{}  {}×{}", self.art.file_name, self.art.width, self.art.height);
+        self.status = format!(
+            "{}  {}×{}",
+            self.art.file_name, self.art.width, self.art.height
+        );
         // Dim the studio until this plate is ready, like the Python's catch-up gate.
         self.load_events.push(LoadEvent::Catchup(name));
         self.load_events.push(LoadEvent::Shown);
@@ -1142,8 +1475,13 @@ impl Desk {
                 None => basename(Path::new(&tab.path)),
             };
             if same_export(parent, &name, &tab.export_dir, &other_name) {
-                let who = if other_name == name { tab.path.clone() } else { other_name };
-                self.status = format!("That folder is the export for {who}. This tab needs its own path.");
+                let who = if other_name == name {
+                    tab.path.clone()
+                } else {
+                    other_name
+                };
+                self.status =
+                    format!("That folder is the export for {who}. This tab needs its own path.");
                 return false;
             }
         }
@@ -1226,6 +1564,7 @@ impl Desk {
             return;
         }
         match self.tool() {
+            Tool::Select => self.choose_at(x, y),
             Tool::Point => self.begin_point(x, y),
             Tool::Bone => self.begin_bone(x, y),
             Tool::WarpTarget => self.add_warp_corner(x, y),
@@ -1246,7 +1585,11 @@ impl Desk {
     /// Pressure for the samples that follow. The window feeds this from the
     /// pen when the platform reports it.
     pub fn set_pressure(&mut self, pressure: f32) {
-        self.pressure = if pressure.is_finite() { pressure.clamp(0.0, 1.0) } else { 1.0 };
+        self.pressure = if pressure.is_finite() {
+            pressure.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
     }
 
     fn touch_rect(&mut self, rect: Option<[i32; 4]>) {
@@ -1255,7 +1598,12 @@ impl Desk {
             return;
         };
         self.dirty_rect = Some(match self.dirty_rect {
-            Some(have) => [have[0].min(rect[0]), have[1].min(rect[1]), have[2].max(rect[2]), have[3].max(rect[3])],
+            Some(have) => [
+                have[0].min(rect[0]),
+                have[1].min(rect[1]),
+                have[2].max(rect[2]),
+                have[3].max(rect[3]),
+            ],
             None => rect,
         });
     }
@@ -1266,12 +1614,26 @@ impl Desk {
         };
         // A raster stroke is already on the plate in the rectangles it touched.
         // Uploading the whole picture here is the hitch at the start of the next line.
-        let raster = matches!(&gesture, Gesture::Paint { tool, .. } if tool.release() != Release::Stroke);
+        let raster =
+            matches!(&gesture, Gesture::Paint { tool, .. } if tool.release() != Release::Stroke);
         let gesture = if needs_last_drag(&gesture, x, y) {
             self.drag(gesture, x, y)
         } else {
             gesture
         };
+        self.finish(gesture);
+        if !raster {
+            self.dirty = true;
+        }
+    }
+
+    /// End a stroke when the release has no pointer position.
+    pub fn release_doc(&mut self) {
+        let Some(gesture) = self.gesture.take() else {
+            return;
+        };
+        let raster =
+            matches!(&gesture, Gesture::Paint { tool, .. } if tool.release() != Release::Stroke);
         self.finish(gesture);
         if !raster {
             self.dirty = true;
@@ -1310,6 +1672,10 @@ impl Desk {
         }
         if self.tool().section() == Section::Cut {
             self.toggle_cut();
+            return;
+        }
+        if self.clip_focus.is_some() {
+            self.leave_clip();
         }
     }
 
@@ -1386,7 +1752,10 @@ impl Desk {
             self.status = "Select a layer.".into();
             return;
         };
-        if find(&self.art.layers, &layer_id).map(|node| !node.is_layer()).unwrap_or(true) {
+        if find(&self.art.layers, &layer_id)
+            .map(|node| !node.is_layer())
+            .unwrap_or(true)
+        {
             self.status = "Select a layer.".into();
             return;
         }
@@ -1415,8 +1784,15 @@ impl Desk {
         if frame.w < 2.0 || frame.h < 2.0 || self.art.width == 0 || self.art.height == 0 {
             return;
         }
-        let zoom = (frame.w / self.art.width as f32).min(frame.h / self.art.height as f32).max(0.01);
-        self.camera = Camera { zoom, pan_x: 0.0, pan_y: 0.0, rotation: 0.0 };
+        let zoom = (frame.w / self.art.width as f32)
+            .min(frame.h / self.art.height as f32)
+            .max(0.01);
+        self.camera = Camera {
+            zoom,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            rotation: 0.0,
+        };
         self.fitted = true;
         self.last_frame = frame;
     }
@@ -1429,7 +1805,12 @@ impl Desk {
     }
 
     pub fn actual(&mut self) {
-        self.camera = Camera { zoom: 1.0, pan_x: 0.0, pan_y: 0.0, rotation: 0.0 };
+        self.camera = Camera {
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            rotation: 0.0,
+        };
         self.fitted = true;
     }
 
@@ -1487,7 +1868,9 @@ impl Desk {
     }
 
     pub fn note_widths(&mut self, layers: f32, brushes: f32) {
-        if (self.session.layers_width - layers).abs() > 0.5 || (self.session.brush_width - brushes).abs() > 0.5 {
+        if (self.session.layers_width - layers).abs() > 0.5
+            || (self.session.brush_width - brushes).abs() > 0.5
+        {
             self.session.layers_width = layers;
             self.session.brush_width = brushes;
             self.session_dirty = true;
@@ -1496,7 +1879,9 @@ impl Desk {
 
     /// The right and bottom areas' sizes, and which view each area shows.
     pub fn note_areas(&mut self, right: f32, bottom: f32, views: &[String]) {
-        if (self.session.right_width - right).abs() > 0.5 || (self.session.bottom_height - bottom).abs() > 0.5 {
+        if (self.session.right_width - right).abs() > 0.5
+            || (self.session.bottom_height - bottom).abs() > 0.5
+        {
             self.session.right_width = right;
             self.session.bottom_height = bottom;
             self.session_dirty = true;
@@ -1520,8 +1905,21 @@ impl Desk {
     pub fn take_display(&mut self, force_full: bool) -> Option<Display> {
         let width = self.art.width;
         let height = self.art.height;
-        let need = (width as usize).saturating_mul(height as usize).saturating_mul(4);
-        let full = force_full || self.dirty || self.plate.len() != need;
+        let need = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        // Playback samples a smaller plate and leaves the full-res cache alone.
+        // A live stroke still wants the real pixels, so it takes the full plate.
+        if self.playing && !force_full && !self.stroke_live && !self.overlay_live {
+            self.dirty = false;
+            self.dirty_rect = None;
+            self.art.onion_past_color = self.session.onion_past_color;
+            self.art.onion_future_color = self.session.onion_future_color;
+            let (w, h, rgba) = present_proxy(&mut self.art, PLAY_SIDE);
+            let rgba = with_checker_at(&rgba, w, h, 0, 0);
+            return Some(Display::Play { w, h, rgba });
+        }
+        let full = force_full || self.dirty || self.plate.len() != need || self.playing;
         let rect = self.dirty_rect.take();
         if full {
             self.dirty = false;
@@ -1541,90 +1939,174 @@ impl Desk {
             let dst = ((rect[1] as usize + row) * width as usize + rect[0] as usize) * 4;
             self.plate[dst..dst + w as usize * 4].copy_from_slice(&rgba[src..src + w as usize * 4]);
         }
-        Some(Display::Part { x: rect[0] as u32, y: rect[1] as u32, w, h, rgba })
+        Some(Display::Part {
+            x: rect[0] as u32,
+            y: rect[1] as u32,
+            w,
+            h,
+            rgba,
+        })
     }
 
     fn compose(&mut self, rect: [i32; 4]) -> Vec<u8> {
         let width = self.art.width;
         let height = self.art.height;
+        // Undo restores a drawing and would otherwise put the default colours back.
+        self.art.onion_past_color = self.session.onion_past_color;
+        self.art.onion_future_color = self.session.onion_future_color;
         if self.stroke_live {
-            self.blend_live_stroke(rect);
+            self.blend_preview(rect);
         }
         let mut plate = present_region(&mut self.art, rect);
         let rw = (rect[2] - rect[0]).max(0) as u32;
         let rh = (rect[3] - rect[1]).max(0) as u32;
-        let need = (width as usize).saturating_mul(height as usize).saturating_mul(4);
-        // A vector preview is the overlay. A raster stroke is already in the layer for this rect.
+        let need = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        // A vector preview is the overlay. A raster stroke is blended for this rect, then put back.
         if self.overlay_live && !self.stroke_live && self.overlay.len() == need {
-            blit_into(&mut plate, rw, rh, rect[0], rect[1], &self.overlay, width, height, 0, 0, 255, false, "normal");
+            blit_into(
+                &mut plate,
+                rw,
+                rh,
+                rect[0],
+                rect[1],
+                &self.overlay,
+                width,
+                height,
+                0,
+                0,
+                255,
+                false,
+                "normal",
+                1,
+            );
         }
         if self.stroke_live {
-            self.restore_live_stroke(rect);
+            self.restore_preview();
         }
         with_checker_at(&plate, rw, rh, rect[0], rect[1])
     }
 
-    /// Put the stroke buffer onto the layer for `rect`, starting from the pen-down pixels.
-    fn blend_live_stroke(&mut self, rect: [i32; 4]) {
-        let width = self.art.width;
-        let height = self.art.height;
-        let opacity = self.stroke_opacity;
-        let erase = self.stroke_erase;
-        let layer = self.stroke_layer.clone();
-        let backup = std::mem::take(&mut self.stroke_backup);
-        let overlay = std::mem::take(&mut self.overlay);
-        if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-            blend_stroke(&mut node.pixels, &backup, &overlay, width, height, rect, opacity, erase);
-        }
-        self.stroke_backup = backup;
-        self.overlay = overlay;
-    }
-
-    fn restore_live_stroke(&mut self, rect: [i32; 4]) {
+    /// Show the stroke on the layer for `rect` without keeping a copy of the whole layer.
+    /// The clean pixels come back in `restore_preview`.
+    fn blend_preview(&mut self, rect: [i32; 4]) {
         let width = self.art.width;
         let height = self.art.height;
         let layer = self.stroke_layer.clone();
-        let backup = std::mem::take(&mut self.stroke_backup);
-        if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-            restore_rect(&mut node.pixels, &backup, width, height, rect);
-        }
-        self.stroke_backup = backup;
-    }
-
-    /// Write the whole stroke onto the layer at one opacity and drop the buffer.
-    fn commit_stroke_buffer(&mut self, layer: &str) {
-        let width = self.art.width;
-        let height = self.art.height;
         let opacity = self.stroke_opacity;
         let erase = self.stroke_erase;
-        let backup = std::mem::take(&mut self.stroke_backup);
+        let snap = find(&self.art.layers, &layer)
+            .map(|node| copy_tight(&node.pixels, width, height, rect))
+            .unwrap_or_default();
+        self.preview_rect = rect;
+        self.preview_snap = snap;
         let overlay = std::mem::take(&mut self.overlay);
-        if let Some(node) = find_mut(&mut self.art.layers, layer) {
-            blend_stroke(
+        if let Some(node) = find_mut(&mut self.art.layers, &layer) {
+            blend_overlay(
                 &mut node.pixels,
-                &backup,
                 &overlay,
                 width,
                 height,
-                [0, 0, width as i32, height as i32],
+                rect,
                 opacity,
                 erase,
             );
         }
-        let need = (width as usize).saturating_mul(height as usize).saturating_mul(4);
-        self.overlay = vec![0; need];
+        self.overlay = overlay;
+    }
+
+    fn restore_preview(&mut self) {
+        if self.preview_snap.is_empty() {
+            return;
+        }
+        let width = self.art.width;
+        let height = self.art.height;
+        let rect = self.preview_rect;
+        let layer = self.stroke_layer.clone();
+        let snap = std::mem::take(&mut self.preview_snap);
+        if let Some(node) = find_mut(&mut self.art.layers, &layer) {
+            paste_tight(&mut node.pixels, &snap, width, height, rect);
+        }
+    }
+
+    /// Write the stroke onto the clean layer where the buffer has ink.
+    fn commit_overlay(&mut self, layer: &str) {
+        let width = self.art.width;
+        let height = self.art.height;
+        let opacity = self.stroke_opacity;
+        let erase = self.stroke_erase;
+        let rect = self
+            .overlay_mark
+            .unwrap_or([0, 0, width as i32, height as i32]);
+        if self.overlay_mark.is_none() {
+            self.overlay_mark = Some(rect);
+        }
+        let overlay = std::mem::take(&mut self.overlay);
+        if let Some(node) = find_mut(&mut self.art.layers, layer) {
+            blend_overlay(
+                &mut node.pixels,
+                &overlay,
+                width,
+                height,
+                rect,
+                opacity,
+                erase,
+            );
+        }
+        self.overlay = overlay;
+        self.end_live_stroke();
+    }
+
+    fn end_live_stroke(&mut self) {
+        self.clear_marked_overlay();
         self.stroke_live = false;
         self.stroke_erase = false;
         self.stroke_layer.clear();
+        self.preview_snap.clear();
+        self.overlay_live = false;
+    }
+
+    fn note_overlay(&mut self, rect: Option<[i32; 4]>) {
+        let Some(rect) = rect else {
+            return;
+        };
+        self.overlay_mark = Some(match self.overlay_mark {
+            Some(have) => [
+                have[0].min(rect[0]),
+                have[1].min(rect[1]),
+                have[2].max(rect[2]),
+                have[3].max(rect[3]),
+            ],
+            None => rect,
+        });
+    }
+
+    fn clear_marked_overlay(&mut self) {
+        let width = self.art.width;
+        let height = self.art.height;
+        if let Some(rect) = self.overlay_mark.take() {
+            zero_rect(&mut self.overlay, width, height, rect);
+        }
     }
 
     pub fn marks(&self) -> Vec<Mark> {
         let mut marks = Vec::new();
         for point in &self.cut_points {
-            marks.push(Mark { x: point[0], y: point[1], hot: false });
+            marks.push(Mark {
+                x: point[0],
+                y: point[1],
+                hot: false,
+                line_to: None,
+            });
         }
         for point in &self.warp_draft {
-            marks.push(Mark { x: point[0], y: point[1], hot: true });
+            marks.push(Mark {
+                x: point[0],
+                y: point[1],
+                hot: true,
+                line_to: None,
+            });
         }
         let Some(id) = &self.selected else {
             return marks;
@@ -1635,19 +2117,40 @@ impl Desk {
         if self.warp_draft.is_empty() && matches!(self.tool(), Tool::WarpTarget | Tool::Point) {
             if let Some(poly) = node.vectors.first() {
                 for point in poly {
-                    marks.push(Mark { x: point[0], y: point[1], hot: true });
+                    marks.push(Mark {
+                        x: point[0],
+                        y: point[1],
+                        hot: true,
+                        line_to: None,
+                    });
                 }
             }
         }
-        if matches!(self.tool(), Tool::Point | Tool::Bone | Tool::Curve | Tool::Vector | Tool::Grain) {
+        // The pen keeps its points to itself. The Point tool is the editor.
+        if self.tool() == Tool::Point {
             for stroke in &node.strokes {
                 for vertex in &stroke.vertices {
-                    marks.push(Mark { x: vertex.x, y: vertex.y, hot: true });
+                    marks.push(Mark {
+                        x: vertex.x,
+                        y: vertex.y,
+                        hot: true,
+                        line_to: None,
+                    });
                     if let Some(handle) = vertex.handle_in {
-                        marks.push(Mark { x: handle[0], y: handle[1], hot: false });
+                        marks.push(Mark {
+                            x: handle[0],
+                            y: handle[1],
+                            hot: false,
+                            line_to: Some((vertex.x, vertex.y)),
+                        });
                     }
                     if let Some(handle) = vertex.handle_out {
-                        marks.push(Mark { x: handle[0], y: handle[1], hot: false });
+                        marks.push(Mark {
+                            x: handle[0],
+                            y: handle[1],
+                            hot: false,
+                            line_to: Some((vertex.x, vertex.y)),
+                        });
                     }
                 }
             }
@@ -1668,7 +2171,16 @@ impl Desk {
         if tool == Tool::Fill {
             let before = self.art.clone();
             let changed = find_mut(&mut self.art.layers, &layer)
-                .map(|node| flood_fill(&mut node.pixels, width, height, x.round() as i32, y.round() as i32, &settings))
+                .map(|node| {
+                    flood_fill(
+                        &mut node.pixels,
+                        width,
+                        height,
+                        x.round() as i32,
+                        y.round() as i32,
+                        &settings,
+                    )
+                })
                 .unwrap_or(false);
             if changed {
                 self.history.push(before);
@@ -1679,51 +2191,89 @@ impl Desk {
         }
         self.prepare_layer(&layer);
         // A vector stroke needs the whole document, because release edits the stroke list.
-        // A raster pen keeps one layer's pixels. Copying every layer on the way down
-        // is the straight, late first segment: the pen moves while that copy runs.
+        // A raster pen leaves the layer alone until the pen lifts. Copying it on the
+        // way down is the straight, late first segment: the pen moves while that copy runs.
         let vector = tool.release() == Release::Stroke;
+        let live = !vector
+            && (stroke_opacity_tool(tool) || (self.clear_ink && tool.release() == Release::Pixels));
         let before = if vector { Some(self.art.clone()) } else { None };
-        let backup = if vector {
+        let backup = if vector || live {
             Vec::new()
         } else {
-            find(&self.art.layers, &layer).map(|node| node.pixels.clone()).unwrap_or_default()
+            find(&self.art.layers, &layer)
+                .map(|node| node.pixels.clone())
+                .unwrap_or_default()
         };
         let base = Vec::new();
         let mut session = StrokeSession::default();
         let pressure = self.pressure;
         session.begin(x, y, pressure);
         let mut changed = false;
+        let first = (x, y, pressure);
         if vector {
             self.ensure_overlay();
-            self.overlay.fill(0);
+            self.clear_marked_overlay();
             let mut carry = Carry::default();
-            paint_samples(&mut self.overlay, width, height, &session.samples, tool, &settings, &mut carry);
+            paint_samples(
+                &mut self.overlay,
+                width,
+                height,
+                &session.samples,
+                tool,
+                &settings,
+                &mut carry,
+            );
             self.overlay_live = true;
             changed = true;
+            self.note_overlay(segment_bounds(width, height, first, first, tool, &settings));
             self.dirty = true;
-        } else if stroke_opacity_tool(tool) || (self.clear_ink && tool.release() == Release::Pixels) {
-            // Dabs build one shape. The opacity knob composites that shape once.
-            // Clear uses this brush's size and tip, then punches that shape out.
+        } else if live {
+            // Dabs build one shape in the stroke buffer. The opacity knob composites
+            // that shape once, on release. The layer stays as it was until then.
             self.ensure_overlay();
-            self.overlay.fill(0);
+            self.clear_marked_overlay();
             self.stroke_live = true;
             self.stroke_opacity = settings.opacity.clamp(0.0, 1.0);
             self.stroke_erase = tool == Tool::Eraser || (self.clear_ink && tool != Tool::Line);
             self.stroke_layer = layer.clone();
-            self.stroke_backup = backup.clone();
             let flow = flow_settings(&settings);
             let paint_tool = buffer_tool(tool);
             let mut carry = Carry::default();
-            paint_samples(&mut self.overlay, width, height, &session.samples, paint_tool, &flow, &mut carry);
+            paint_samples(
+                &mut self.overlay,
+                width,
+                height,
+                &session.samples,
+                paint_tool,
+                &flow,
+                &mut carry,
+            );
             changed = true;
-            let first = (x, y, pressure);
-            self.touch_rect(segment_bounds(width, height, first, first, paint_tool, &flow));
+            let bounds = segment_bounds(width, height, first, first, paint_tool, &flow);
+            self.note_overlay(bounds);
+            self.touch_rect(bounds);
         } else if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-            changed = paint_samples(&mut node.pixels, width, height, &session.samples, tool, &settings, &mut session.carry);
-            let first = (x, y, pressure);
+            changed = paint_samples(
+                &mut node.pixels,
+                width,
+                height,
+                &session.samples,
+                tool,
+                &settings,
+                &mut session.carry,
+            );
             self.touch_rect(segment_bounds(width, height, first, first, tool, &settings));
         }
-        self.gesture = Some(Gesture::Paint { layer, tool, settings, before, backup, base, session, changed });
+        self.gesture = Some(Gesture::Paint {
+            layer,
+            tool,
+            settings,
+            before,
+            backup,
+            base,
+            session,
+            changed,
+        });
     }
 
     fn begin_point(&mut self, x: f32, y: f32) {
@@ -1738,12 +2288,23 @@ impl Desk {
                 return;
             }
             let before = self.art.clone();
-            self.gesture = Some(Gesture::Point { layer, stroke, which, before, changed: false });
+            self.gesture = Some(Gesture::Point {
+                layer,
+                stroke,
+                which,
+                before,
+                changed: false,
+            });
             return;
         }
         if let Some(index) = self.nearest_corner(&layer, x, y) {
             let before = self.art.clone();
-            self.gesture = Some(Gesture::WarpCorner { layer, index, before, changed: false });
+            self.gesture = Some(Gesture::WarpCorner {
+                layer,
+                index,
+                before,
+                changed: false,
+            });
             return;
         }
         self.status = "No point under the pen.".into();
@@ -1760,7 +2321,14 @@ impl Desk {
             return;
         };
         let before = self.art.clone();
-        self.gesture = Some(Gesture::Bone { layer, stroke, before, x0: x, y0: y, changed: false });
+        self.gesture = Some(Gesture::Bone {
+            layer,
+            stroke,
+            before,
+            x0: x,
+            y0: y,
+            changed: false,
+        });
     }
 
     fn add_warp_corner(&mut self, x: f32, y: f32) {
@@ -1770,7 +2338,10 @@ impl Desk {
         };
         self.warp_layer = Some(layer);
         self.warp_draft.push([x, y]);
-        self.status = format!("{} corners. Enter keeps the polygon.", self.warp_draft.len());
+        self.status = format!(
+            "{} corners. Enter keeps the polygon.",
+            self.warp_draft.len()
+        );
         self.dirty = true;
     }
 
@@ -1813,7 +2384,16 @@ impl Desk {
     fn drag(&mut self, gesture: Gesture, x: f32, y: f32) -> Gesture {
         let (width, height) = (self.art.width, self.art.height);
         match gesture {
-            Gesture::Paint { mut session, layer, tool, settings, before, backup, base, mut changed } => {
+            Gesture::Paint {
+                mut session,
+                layer,
+                tool,
+                settings,
+                before,
+                backup,
+                base,
+                mut changed,
+            } => {
                 let pressure = self.pressure;
                 if tool == Tool::Line {
                     // The old line and the new one both need a repaint. The buffer holds the line at full cover.
@@ -1821,65 +2401,116 @@ impl Desk {
                     let old_end = session.samples.last().copied().unwrap_or(start);
                     session.line_to(x, y, pressure);
                     self.ensure_overlay();
-                    self.overlay.fill(0);
+                    let old_mark = self.overlay_mark;
+                    self.clear_marked_overlay();
                     let flow = flow_settings(&settings);
                     let mut carry = Carry::default();
-                    paint_samples(&mut self.overlay, width, height, &session.samples, tool, &flow, &mut carry);
+                    paint_samples(
+                        &mut self.overlay,
+                        width,
+                        height,
+                        &session.samples,
+                        tool,
+                        &flow,
+                        &mut carry,
+                    );
                     changed = true;
-                    self.touch_rect(segment_bounds(width, height, start, old_end, tool, &flow));
-                    self.touch_rect(segment_bounds(width, height, start, (x, y, pressure), tool, &flow));
+                    let old_bounds = segment_bounds(width, height, start, old_end, tool, &flow);
+                    let new_bounds =
+                        segment_bounds(width, height, start, (x, y, pressure), tool, &flow);
+                    self.note_overlay(old_mark);
+                    self.note_overlay(old_bounds);
+                    self.note_overlay(new_bounds);
+                    self.touch_rect(old_bounds);
+                    self.touch_rect(new_bounds);
                 } else if tool.release() == Release::Stroke {
                     if moved_from(session.samples.last(), x, y) {
                         // The overlay is a preview. Dabs land along the move only;
                         // the kept stroke is rebuilt from its traits on release.
-                        let from = session.samples.last().copied().unwrap_or((x, y, pressure));
-                        session.push(x, y, pressure);
-                        self.ensure_overlay();
-                        let mut carry = Carry::default();
-                        paint_segment(&mut self.overlay, width, height, from, (x, y, pressure), tool, &settings, &mut carry);
-                        self.overlay_live = true;
-                        changed = true;
-                        self.touch_rect(segment_bounds(width, height, from, (x, y, pressure), tool, &settings));
+                        if let Some(to) = session.push_stable(x, y, pressure, settings.stabilize) {
+                            let from = session.samples[session.samples.len() - 2];
+                            self.ensure_overlay();
+                            let mut carry = Carry::default();
+                            paint_segment(
+                                &mut self.overlay,
+                                width,
+                                height,
+                                from,
+                                to,
+                                tool,
+                                &settings,
+                                &mut carry,
+                            );
+                            self.overlay_live = true;
+                            changed = true;
+                            let bounds = segment_bounds(width, height, from, to, tool, &settings);
+                            self.note_overlay(bounds);
+                            self.touch_rect(bounds);
+                        }
                     }
                 } else if moved_from(session.samples.last(), x, y) {
-                    let from = session.samples.last().copied().unwrap_or((x, y, pressure));
-                    session.push(x, y, pressure);
-                    if self.stroke_live {
-                        let flow = flow_settings(&settings);
-                        let paint_tool = buffer_tool(tool);
-                        self.ensure_overlay();
-                        changed |= paint_segment(
-                            &mut self.overlay,
-                            width,
-                            height,
-                            from,
-                            (x, y, pressure),
-                            paint_tool,
-                            &flow,
-                            &mut session.carry,
-                        );
-                        self.touch_rect(segment_bounds(width, height, from, (x, y, pressure), paint_tool, &flow));
-                    } else if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-                        changed |= paint_segment(
-                            &mut node.pixels,
-                            width,
-                            height,
-                            from,
-                            (x, y, pressure),
-                            tool,
-                            &settings,
-                            &mut session.carry,
-                        );
-                        self.touch_rect(segment_bounds(width, height, from, (x, y, pressure), tool, &settings));
+                    if let Some(to) = session.push_stable(x, y, pressure, settings.stabilize) {
+                        let from = session.samples[session.samples.len() - 2];
+                        if self.stroke_live {
+                            let flow = flow_settings(&settings);
+                            let paint_tool = buffer_tool(tool);
+                            self.ensure_overlay();
+                            changed |= paint_segment(
+                                &mut self.overlay,
+                                width,
+                                height,
+                                from,
+                                to,
+                                paint_tool,
+                                &flow,
+                                &mut session.carry,
+                            );
+                            let bounds = segment_bounds(width, height, from, to, paint_tool, &flow);
+                            self.note_overlay(bounds);
+                            self.touch_rect(bounds);
+                        } else if let Some(node) = find_mut(&mut self.art.layers, &layer) {
+                            changed |= paint_segment(
+                                &mut node.pixels,
+                                width,
+                                height,
+                                from,
+                                to,
+                                tool,
+                                &settings,
+                                &mut session.carry,
+                            );
+                            self.touch_rect(segment_bounds(
+                                width, height, from, to, tool, &settings,
+                            ));
+                        }
                     }
                 }
-                Gesture::Paint { session, layer, tool, settings, before, backup, base, changed }
+                Gesture::Paint {
+                    session,
+                    layer,
+                    tool,
+                    settings,
+                    before,
+                    backup,
+                    base,
+                    changed,
+                }
             }
-            Gesture::Point { layer, stroke, which, before, mut changed } => {
+            Gesture::Point {
+                layer,
+                stroke,
+                which,
+                before,
+                mut changed,
+            } => {
                 if let Some(node) = find_mut(&mut self.art.layers, &layer) {
                     if let Some(found) = node.strokes.iter_mut().find(|item| item.id == stroke) {
                         let moved = match which {
-                            StrokeHit::Vertex(index) => found.vertices.get(index).map(|vertex| (vertex.x - x).hypot(vertex.y - y) > 0.01).unwrap_or(false),
+                            StrokeHit::Vertex(index) => found
+                                .vertices
+                                .get(index)
+                                .map(|vertex| (vertex.x - x).hypot(vertex.y - y) > 0.01)
+                                .unwrap_or(false),
                             StrokeHit::HandleIn(index) => found
                                 .vertices
                                 .get(index)
@@ -1899,18 +2530,17 @@ impl Desk {
                             match which {
                                 StrokeHit::Vertex(index) => {
                                     if let Some(vertex) = found.vertices.get_mut(index) {
-                                        vertex.x = x;
-                                        vertex.y = y;
+                                        move_vertex(vertex, x, y);
                                     }
                                 }
                                 StrokeHit::HandleIn(index) => {
                                     if let Some(vertex) = found.vertices.get_mut(index) {
-                                        vertex.handle_in = Some([x, y]);
+                                        move_handle(vertex, HandleSide::In, x, y);
                                     }
                                 }
                                 StrokeHit::HandleOut(index) => {
                                     if let Some(vertex) = found.vertices.get_mut(index) {
-                                        vertex.handle_out = Some([x, y]);
+                                        move_handle(vertex, HandleSide::Out, x, y);
                                     }
                                 }
                                 StrokeHit::Body => {}
@@ -1923,28 +2553,64 @@ impl Desk {
                     self.unbake(&layer);
                     self.dirty = true;
                 }
-                Gesture::Point { layer, stroke, which, before, changed }
+                Gesture::Point {
+                    layer,
+                    stroke,
+                    which,
+                    before,
+                    changed,
+                }
             }
-            Gesture::Bone { layer, stroke, before, x0, y0, mut changed } => {
+            Gesture::Bone {
+                layer,
+                stroke,
+                before,
+                x0,
+                y0,
+                mut changed,
+            } => {
                 if (x - x0).hypot(y - y0) > 1.0 {
                     if !changed {
                         self.unbake(&layer);
                     }
                     let reach = self.preset_of(Tool::Bone).bone_reach;
                     if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-                        if let Some(found) = node.strokes.iter_mut().find(|item| item.id == stroke) {
-                            found.bone = Some(Bone { x0, y0, x1: x, y1: y, reach });
+                        if let Some(found) = node.strokes.iter_mut().find(|item| item.id == stroke)
+                        {
+                            found.bone = Some(Bone {
+                                x0,
+                                y0,
+                                x1: x,
+                                y1: y,
+                                reach,
+                            });
                             found.touch();
                             changed = true;
                             self.dirty = true;
                         }
                     }
                 }
-                Gesture::Bone { layer, stroke, before, x0, y0, changed }
+                Gesture::Bone {
+                    layer,
+                    stroke,
+                    before,
+                    x0,
+                    y0,
+                    changed,
+                }
             }
-            Gesture::WarpCorner { layer, index, before, mut changed } => {
+            Gesture::WarpCorner {
+                layer,
+                index,
+                before,
+                mut changed,
+            } => {
                 if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-                    if let Some(point) = node.vectors.first_mut().and_then(|poly| poly.get_mut(index)) {
+                    if let Some(point) = node
+                        .vectors
+                        .first_mut()
+                        .and_then(|poly| poly.get_mut(index))
+                    {
                         if (point[0] - x).hypot(point[1] - y) > 0.01 {
                             *point = [x, y];
                             changed = true;
@@ -1952,7 +2618,12 @@ impl Desk {
                         }
                     }
                 }
-                Gesture::WarpCorner { layer, index, before, changed }
+                Gesture::WarpCorner {
+                    layer,
+                    index,
+                    before,
+                    changed,
+                }
             }
             Gesture::CutRect { x0, y0 } => {
                 self.cut_points = rect_points(x0, y0, x, y);
@@ -1960,7 +2631,12 @@ impl Desk {
                 Gesture::CutRect { x0, y0 }
             }
             Gesture::CutLasso => {
-                if self.cut_points.last().map(|point| (point[0] - x).hypot(point[1] - y) > 1.0).unwrap_or(true) {
+                if self
+                    .cut_points
+                    .last()
+                    .map(|point| (point[0] - x).hypot(point[1] - y) > 1.0)
+                    .unwrap_or(true)
+                {
                     self.cut_points.push([x, y]);
                     self.dirty = true;
                 }
@@ -1971,7 +2647,22 @@ impl Desk {
 
     fn finish(&mut self, gesture: Gesture) {
         match gesture {
-            Gesture::Paint { mut session, layer, tool, settings, before, backup, changed, .. } => {
+            Gesture::Paint {
+                mut session,
+                layer,
+                tool,
+                settings,
+                before,
+                backup,
+                mut changed,
+                ..
+            } => {
+                if tool != Tool::Line {
+                    let count = session.release_stable(settings.stabilize).len();
+                    if count > 0 && self.paint_tail(&mut session, &layer, tool, &settings, count) {
+                        changed = true;
+                    }
+                }
                 if tool.release() == Release::Stroke {
                     let id = self.art.alloc_stroke();
                     if let Some(stroke) = session.end_stroke(id, tool, &settings) {
@@ -1985,30 +2676,43 @@ impl Desk {
                         self.status = "Vector stroke kept. The picture is a cache.".into();
                     }
                     self.overlay_live = false;
-                    self.overlay.fill(0);
+                    self.clear_marked_overlay();
                 } else {
                     session.end_pixels();
                     let was_clear = self.clear_ink && tool != Tool::Eraser;
-                    if self.stroke_live {
-                        self.commit_stroke_buffer(&layer);
-                    }
                     if changed {
                         if tool == Tool::WarpMask {
                             if let Some(node) = find_mut(&mut self.art.layers, &layer) {
                                 node.marker = "mask".into();
                             }
                         }
-                        let previous = before.unwrap_or_else(|| self.art_with_layer_pixels(&layer, backup));
-                        self.history.push(previous);
+                        if self.stroke_live {
+                            // The layer is still clean. The undo copy happens before the
+                            // buffer lands, so pen-down never clones the plate.
+                            let previous = self.art.clone();
+                            self.commit_overlay(&layer);
+                            self.history.push(previous);
+                        } else {
+                            let previous = before
+                                .unwrap_or_else(|| self.art_with_layer_pixels(&layer, backup));
+                            self.history.push(previous);
+                        }
                         self.status = if was_clear {
                             "Clear wrote pixels.".into()
                         } else {
                             format!("{} wrote pixels.", tool.name())
                         };
+                    } else if self.stroke_live {
+                        self.end_live_stroke();
                     }
                 }
             }
-            Gesture::Point { changed, before, layer, .. } => {
+            Gesture::Point {
+                changed,
+                before,
+                layer,
+                ..
+            } => {
                 if changed {
                     self.unbake(&layer);
                     self.refill_warp(&layer);
@@ -2016,13 +2720,20 @@ impl Desk {
                     self.status = "Point moved. The stroke cache rebuilt.".into();
                 }
             }
-            Gesture::Bone { changed, before, .. } => {
+            Gesture::Bone {
+                changed, before, ..
+            } => {
                 if changed {
                     self.history.push(before);
                     self.status = "Bone kept. The stroke cache rebuilt.".into();
                 }
             }
-            Gesture::WarpCorner { changed, before, layer, .. } => {
+            Gesture::WarpCorner {
+                changed,
+                before,
+                layer,
+                ..
+            } => {
                 if changed {
                     self.refill_warp(&layer);
                     self.history.push(before);
@@ -2092,6 +2803,59 @@ impl Desk {
         }
     }
 
+    /// Paint the samples `release_stable` just appended. A vector stroke
+    /// rebuilds from those samples on release, so it does not need dabs here.
+    fn paint_tail(
+        &mut self,
+        session: &mut StrokeSession,
+        layer: &str,
+        tool: Tool,
+        settings: &ToolSettings,
+        count: usize,
+    ) -> bool {
+        if count == 0 || tool.release() == Release::Stroke || session.samples.len() < count + 1 {
+            return false;
+        }
+        let (width, height) = (self.art.width, self.art.height);
+        let start = session.samples.len() - count;
+        let mut changed = false;
+        for index in 0..count {
+            let from = session.samples[start - 1 + index];
+            let to = session.samples[start + index];
+            if self.stroke_live {
+                let flow = flow_settings(settings);
+                let paint_tool = buffer_tool(tool);
+                self.ensure_overlay();
+                changed |= paint_segment(
+                    &mut self.overlay,
+                    width,
+                    height,
+                    from,
+                    to,
+                    paint_tool,
+                    &flow,
+                    &mut session.carry,
+                );
+                let bounds = segment_bounds(width, height, from, to, paint_tool, &flow);
+                self.note_overlay(bounds);
+                self.touch_rect(bounds);
+            } else if let Some(node) = find_mut(&mut self.art.layers, layer) {
+                changed |= paint_segment(
+                    &mut node.pixels,
+                    width,
+                    height,
+                    from,
+                    to,
+                    tool,
+                    settings,
+                    &mut session.carry,
+                );
+                self.touch_rect(segment_bounds(width, height, from, to, tool, settings));
+            }
+        }
+        changed
+    }
+
     fn paint_target(&self) -> Result<String, ()> {
         let Some(id) = self.selected.clone() else {
             return Err(());
@@ -2130,35 +2894,36 @@ impl Desk {
         let Some(gesture) = self.gesture.take() else {
             return;
         };
-        if let Gesture::Paint { backup, layer, before, .. } = gesture {
+        self.restore_preview();
+        if let Gesture::Paint {
+            backup,
+            layer,
+            before,
+            ..
+        } = gesture
+        {
             if let Some(before) = before {
                 self.art = before;
-            } else if let Some(node) = find_mut(&mut self.art.layers, &layer) {
-                node.pixels = backup;
+            } else if !backup.is_empty() {
+                if let Some(node) = find_mut(&mut self.art.layers, &layer) {
+                    node.pixels = backup;
+                }
             }
-            self.overlay_live = false;
-            self.overlay.fill(0);
-            self.stroke_live = false;
-            self.stroke_erase = false;
-            self.stroke_backup.clear();
-            self.stroke_layer.clear();
+            self.end_live_stroke();
             self.dirty = true;
             return;
         }
         let before = match gesture {
-            Gesture::Point { before, .. } | Gesture::Bone { before, .. } | Gesture::WarpCorner { before, .. } => Some(before),
+            Gesture::Point { before, .. }
+            | Gesture::Bone { before, .. }
+            | Gesture::WarpCorner { before, .. } => Some(before),
             Gesture::CutRect { .. } | Gesture::CutLasso => None,
             Gesture::Paint { .. } => None,
         };
         if let Some(before) = before {
             self.art = before;
         }
-        self.overlay_live = false;
-        self.overlay.fill(0);
-        self.stroke_live = false;
-        self.stroke_erase = false;
-        self.stroke_backup.clear();
-        self.stroke_layer.clear();
+        self.end_live_stroke();
         self.dirty = true;
     }
 
@@ -2175,9 +2940,10 @@ impl Desk {
         self.gesture = None;
         self.overlay_live = false;
         self.overlay.clear();
+        self.overlay_mark = None;
+        self.preview_snap.clear();
         self.stroke_live = false;
         self.stroke_erase = false;
-        self.stroke_backup.clear();
         self.stroke_layer.clear();
         self.collapsed.clear();
         self.cut_points.clear();
@@ -2188,6 +2954,7 @@ impl Desk {
         self.layer_window = None;
         self.stroke_window = None;
         self.object_window = None;
+        self.clip_focus = None;
         self.layer_edit_saved = false;
         self.stroke_edit_saved = false;
         self.object_edit_saved = false;
@@ -2197,12 +2964,8 @@ impl Desk {
     }
 
     fn after_history(&mut self) {
-        self.overlay_live = false;
         self.overlay.fill(0);
-        self.stroke_live = false;
-        self.stroke_erase = false;
-        self.stroke_backup.clear();
-        self.stroke_layer.clear();
+        self.end_live_stroke();
         self.dirty = true;
         if let Some(id) = &self.selected {
             if find(&self.art.layers, id).is_some() {
@@ -2223,8 +2986,65 @@ impl Desk {
     }
 }
 
+/// Where `id` sits on the cut. A nested clip adds the key of each clip above it.
+fn clip_origin(nodes: &[Node], id: &str) -> Option<u32> {
+    fn visit(nodes: &[Node], id: &str, base: u32) -> Option<u32> {
+        for node in nodes {
+            if node.id == id {
+                return Some(base);
+            }
+            if node.is_layer() {
+                continue;
+            }
+            if node.animation {
+                for child in &node.children {
+                    let next = match anim::key_of(node, &child.id) {
+                        Some(start) => base.saturating_add(start),
+                        None => base,
+                    };
+                    if child.id == id {
+                        return Some(next);
+                    }
+                    if !child.is_layer() {
+                        if let Some(found) = visit(std::slice::from_ref(child), id, next) {
+                            return Some(found);
+                        }
+                    }
+                }
+            } else if let Some(found) = visit(&node.children, id, base) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    visit(nodes, id, 0)
+}
+
+/// The animation folder that holds `id`, one level up. None at the cut.
+fn enclosing_clip(nodes: &[Node], id: &str) -> Option<String> {
+    fn visit(nodes: &[Node], id: &str, parent: Option<&str>) -> Option<Option<String>> {
+        for node in nodes {
+            if node.id == id {
+                return Some(parent.map(str::to_string));
+            }
+            let next = if !node.is_layer() && node.animation {
+                Some(node.id.as_str())
+            } else {
+                parent
+            };
+            if let Some(found) = visit(&node.children, id, next) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    visit(nodes, id, None).flatten()
+}
+
 /// The sheet, the transport, and the onion skin. Time lives on the document:
 /// `art.playhead` picks one cel per animation folder when the picture paints.
+/// A focused clip shows that folder's own frames. Nested clips add their key
+/// onto the clip that holds them.
 impl Desk {
     /// Frames in the cut: the keys, or the stored cut end when it reaches
     /// further. Holds on the last cel live in that stored end.
@@ -2234,6 +3054,122 @@ impl Desk {
 
     pub fn playhead(&self) -> u32 {
         self.art.playhead
+    }
+
+    /// The clip the sheet is inside, when that folder is still an animation.
+    pub fn clip_label(&self) -> Option<String> {
+        let id = self.clip_focus.as_deref()?;
+        let node = find(&self.art.layers, id)?;
+        if node.is_layer() || !node.animation {
+            return None;
+        }
+        Some(node.name.clone())
+    }
+
+    pub fn drop_lost_clip(&mut self) {
+        let stale = match self.clip_focus.as_deref() {
+            Some(id) => {
+                find(&self.art.layers, id).is_none_or(|node| node.is_layer() || !node.animation)
+            }
+            None => false,
+        };
+        if stale {
+            self.clip_focus = None;
+        }
+    }
+
+    /// Frame 0 of the focused clip, on the cut. The whole cut starts at 0.
+    pub fn sheet_origin(&self) -> u32 {
+        let Some(id) = self.clip_focus.as_deref() else {
+            return 0;
+        };
+        clip_origin(&self.art.layers, id).unwrap_or(0)
+    }
+
+    /// How many frames the sheet shows. A top-level clip keeps the cut.
+    /// A nested clip shows its own keys.
+    pub fn sheet_len(&self) -> u32 {
+        let Some(id) = self.clip_focus.as_deref() else {
+            return self.cut_end();
+        };
+        if anim::animation_folder_ids(&self.art.layers)
+            .iter()
+            .any(|folder| folder == id)
+        {
+            return self.cut_end();
+        }
+        let Some(folder) = find(&self.art.layers, id) else {
+            return self.cut_end();
+        };
+        anim::frame_map(folder)
+            .last()
+            .map(|(frame, _)| frame.saturating_add(1))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The needle, in the sheet's own frames.
+    pub fn local_playhead(&self) -> u32 {
+        let len = self.sheet_len().max(1);
+        self.art
+            .playhead
+            .saturating_sub(self.sheet_origin())
+            .min(len - 1)
+    }
+
+    /// Columns for the sheet. Inside a clip that column is the clip's own frames.
+    pub fn sheet_columns(&self) -> Vec<XColumn> {
+        if let Some(id) = self.clip_focus.as_deref() {
+            if let Some(folder) = find(&self.art.layers, id) {
+                if !folder.is_layer() && folder.animation {
+                    return vec![column_of(folder, self.sheet_len())];
+                }
+            }
+        }
+        xsheet_columns(&self.art.layers, self.cut_end())
+    }
+
+    /// A sheet click. `local` is a frame on the sheet, which may sit inside a clip.
+    pub fn set_sheet_frame(&mut self, local: u32) {
+        let last_local = self.sheet_len().saturating_sub(1);
+        let local = local.min(last_local);
+        self.set_playhead(self.sheet_origin().saturating_add(local));
+    }
+
+    /// Open an animation folder on the sheet. The grid becomes that clip's frames.
+    pub fn enter_clip(&mut self, id: &str) {
+        let Some(node) = find(&self.art.layers, id) else {
+            return;
+        };
+        if node.is_layer() || !node.animation {
+            return;
+        }
+        if self.clip_focus.as_deref() == Some(node.id.as_str()) {
+            return;
+        }
+        let name = node.name.clone();
+        self.clip_focus = Some(node.id.clone());
+        self.sheet_pick = None;
+        let origin = self.sheet_origin();
+        let last = origin.saturating_add(self.sheet_len().saturating_sub(1));
+        if self.art.playhead < origin || self.art.playhead > last {
+            self.set_playhead(origin);
+        }
+        self.status = format!("Inside {name}. OUT leaves this clip.");
+    }
+
+    /// Step out one clip. The cut is the sheet when nothing is left above.
+    pub fn leave_clip(&mut self) {
+        let Some(id) = self.clip_focus.clone() else {
+            return;
+        };
+        self.clip_focus = enclosing_clip(&self.art.layers, &id);
+        self.sheet_pick = None;
+        self.status = if self.clip_focus.is_some() {
+            "Back one clip.".into()
+        } else {
+            "Back on the cut.".into()
+        };
     }
 
     /// Show a frame. Nothing is undone by this; it is where you are looking.
@@ -2254,6 +3190,21 @@ impl Desk {
     /// of a timeline, moving the playhead selects the cel that folder holds
     /// on the new frame. Before the first key the selection stays.
     fn follow_playhead(&mut self) {
+        if self.clip_focus.is_some() {
+            let id = self.clip_focus.clone().unwrap_or_default();
+            let local = self.local_playhead();
+            if let Some(folder) = find(&self.art.layers, &id) {
+                if let Some(shown) = anim::cel_at(folder, local) {
+                    let inside = self.selected.as_deref().is_some_and(|sel| {
+                        sel == id || folder.children.iter().any(|cel| cel.id == sel)
+                    });
+                    if inside && self.selected.as_deref() != Some(shown.id.as_str()) {
+                        self.selected = Some(shown.id.clone());
+                    }
+                }
+            }
+            return;
+        }
         let Some(selected) = self.selected.clone() else {
             return;
         };
@@ -2309,11 +3260,18 @@ impl Desk {
                 self.dirty = true;
             }
         } else {
-            self.status = format!("Stopped on frame {}.", self.art.playhead + 1);
+            self.dirty = true;
+            self.status = format!(
+                "Stopped on frame {}.",
+                vmi_core::slot_hex(self.art.playhead)
+            );
         }
     }
 
     pub fn stop(&mut self) {
+        if self.playing {
+            self.dirty = true;
+        }
         self.playing = false;
         self.play_clock = 0.0;
     }
@@ -2375,12 +3333,20 @@ impl Desk {
 
     pub fn toggle_loop(&mut self) {
         self.loop_play = !self.loop_play;
-        self.status = if self.loop_play { "Loop on.".into() } else { "Loop off: play stops on the last frame.".into() };
+        self.status = if self.loop_play {
+            "Loop on.".into()
+        } else {
+            "Loop off: play stops on the last frame.".into()
+        };
     }
 
     pub fn toggle_wrap(&mut self) {
         self.loop_wrap = !self.loop_wrap;
-        self.status = if self.loop_wrap { "Stepping wraps around the cut.".into() } else { "Stepping stops at the ends.".into() };
+        self.status = if self.loop_wrap {
+            "Stepping wraps around the cut.".into()
+        } else {
+            "Stepping stops at the ends.".into()
+        };
     }
 
     pub fn set_hold(&mut self, hold: u32) {
@@ -2396,7 +3362,7 @@ impl Desk {
         self.art.onion = !self.art.onion;
         self.dirty = true;
         self.status = if self.art.onion {
-            "Onion skin: three back in purple, three ahead in green.".into()
+            "Onion skin on. Right-click SKIN for its colors.".into()
         } else {
             "Onion skin off.".into()
         };
@@ -2424,7 +3390,9 @@ impl Desk {
         if anim::set_animation(&mut self.art.layers, id, on) {
             self.history.push(before);
             self.dirty = true;
-            let name = find(&self.art.layers, id).map(|node| node.name.clone()).unwrap_or_default();
+            let name = find(&self.art.layers, id)
+                .map(|node| node.name.clone())
+                .unwrap_or_default();
             self.status = if on {
                 format!("{name} is a timeline. Its layers are its cels.")
             } else {
@@ -2435,7 +3403,9 @@ impl Desk {
 
     /// Right-click a folder: Animation.
     pub fn toggle_animation(&mut self, id: &str) {
-        let on = find(&self.art.layers, id).map(|node| !node.animation).unwrap_or(false);
+        let on = find(&self.art.layers, id)
+            .map(|node| !node.animation)
+            .unwrap_or(false);
         self.set_animation(id, on);
     }
 
@@ -2446,7 +3416,9 @@ impl Desk {
             self.status = "Pick a folder to mark as an animation.".into();
             return;
         };
-        let is_group = find(&self.art.layers, &id).map(|node| !node.is_layer()).unwrap_or(false);
+        let is_group = find(&self.art.layers, &id)
+            .map(|node| !node.is_layer())
+            .unwrap_or(false);
         if is_group {
             self.toggle_animation(&id);
         } else {
@@ -2471,8 +3443,15 @@ impl Desk {
         let Some(current) = anim::cel_at(node, playhead) else {
             return playhead;
         };
-        let start = pairs.iter().find(|(_, cel)| cel.id == current.id).map(|(start, _)| *start).unwrap_or(playhead);
-        let is_last = pairs.last().map(|(_, cel)| cel.id == current.id).unwrap_or(true);
+        let start = pairs
+            .iter()
+            .find(|(_, cel)| cel.id == current.id)
+            .map(|(start, _)| *start)
+            .unwrap_or(playhead);
+        let is_last = pairs
+            .last()
+            .map(|(_, cel)| cel.id == current.id)
+            .unwrap_or(true);
         if is_last {
             playhead.max(start.saturating_add(self.hold))
         } else {
@@ -2484,7 +3463,11 @@ impl Desk {
     /// frames when nothing comes after it. It never shrinks.
     fn hold_last_cel(&mut self, folder: &str, start: u32) {
         let is_last = find(&self.art.layers, folder)
-            .map(|node| anim::frame_map(node).iter().all(|(frame, _)| *frame <= start))
+            .map(|node| {
+                anim::frame_map(node)
+                    .iter()
+                    .all(|(frame, _)| *frame <= start)
+            })
             .unwrap_or(false);
         if !is_last {
             return;
@@ -2499,7 +3482,10 @@ impl Desk {
     /// selected plain layer is wrapped in an Animation folder as the first
     /// frame, and a selected plain folder is marked. The playhead follows.
     pub fn new_cel(&mut self, folder: Option<&str>, frame: Option<u32>) {
-        let target = folder.map(str::to_string).or_else(|| self.sheet_folder()).or_else(|| self.selected.clone());
+        let target = folder
+            .map(str::to_string)
+            .or_else(|| self.sheet_folder())
+            .or_else(|| self.selected.clone());
         let Some(target) = target else {
             self.status = "Select a layer.".into();
             return;
@@ -2514,7 +3500,12 @@ impl Desk {
                 self.history.push(before);
                 let owner = anim::owning_animation(&self.art.layers, &id).unwrap_or(target);
                 let start = find(&self.art.layers, &owner)
-                    .and_then(|node| anim::frame_map(node).into_iter().find(|(_, cel)| cel.id == id).map(|(start, _)| start))
+                    .and_then(|node| {
+                        anim::frame_map(node)
+                            .into_iter()
+                            .find(|(_, cel)| cel.id == id)
+                            .map(|(start, _)| start)
+                    })
                     .unwrap_or(at);
                 self.hold_last_cel(&owner, start);
                 self.selected = Some(id);
@@ -2523,7 +3514,7 @@ impl Desk {
                 // drawing you just left shows through.
                 self.art.onion = true;
                 self.dirty = true;
-                self.status = format!("Frame {}. Onion skin on.", start + 1);
+                self.status = format!("Frame {}. Onion skin on.", vmi_core::slot_hex(start));
             }
             None => self.status = "Select a layer.".into(),
         }
@@ -2532,11 +3523,13 @@ impl Desk {
     /// Drag a block: the cel starts on another frame.
     pub fn move_cel(&mut self, folder: &str, cel: &str, start: u32) {
         let before = self.art.clone();
-        let moved = find_mut(&mut self.art.layers, folder).map(|node| anim::move_frame(node, cel, start)).unwrap_or(false);
+        let moved = find_mut(&mut self.art.layers, folder)
+            .map(|node| anim::move_frame(node, cel, start))
+            .unwrap_or(false);
         if moved {
             self.history.push(before);
             self.dirty = true;
-            self.status = format!("Cel moved to frame {}.", start + 1);
+            self.status = format!("Cel moved to frame {}.", vmi_core::slot_hex(start));
         }
     }
 
@@ -2566,7 +3559,8 @@ impl Desk {
 
     /// Select the cel a level shows at a frame, so the pen draws on it.
     pub fn pick_cel(&mut self, folder: &str, frame: u32) {
-        let id = find(&self.art.layers, folder).and_then(|node| anim::cel_at(node, frame).map(|cel| cel.id.clone()));
+        let id = find(&self.art.layers, folder)
+            .and_then(|node| anim::cel_at(node, frame).map(|cel| cel.id.clone()));
         match id {
             Some(id) => self.selected = Some(id),
             None => self.selected = Some(folder.to_string()),
@@ -2574,7 +3568,11 @@ impl Desk {
     }
 
     pub fn pick_range(&mut self, folder: &str, start: u32, count: u32) {
-        self.sheet_pick = Some(SheetPick { folder: folder.to_string(), start, count: count.max(1) });
+        self.sheet_pick = Some(SheetPick {
+            folder: folder.to_string(),
+            start,
+            count: count.max(1),
+        });
     }
 
     /// The first command on a column stores a sheet made from its keys
@@ -2604,11 +3602,23 @@ impl Desk {
     pub fn sheet_command(&mut self, folder: &str, name: &str, start: u32, count: u32, arg: i64) {
         let before = self.art.clone();
         self.ensure_sheet(folder);
-        let changed = anim::folder_command(&mut self.art, folder, name, start as usize, count as usize, arg);
+        let changed = anim::folder_command(
+            &mut self.art,
+            folder,
+            name,
+            start as usize,
+            count as usize,
+            arg,
+        );
         if changed {
             self.history.push(before);
             self.dirty = true;
-            self.status = format!("{name}: frames {}–{}.", start + 1, start + count.max(1));
+            let end = start + count.saturating_sub(1);
+            self.status = format!(
+                "{name}: frames {}–{}.",
+                vmi_core::slot_hex(start),
+                vmi_core::slot_hex(end)
+            );
         } else {
             self.status = format!("{name} left the sheet as it was.");
         }
@@ -2627,7 +3637,13 @@ fn first_layer(nodes: &[Node]) -> Option<String> {
     None
 }
 
-fn walk_layers(nodes: &[Node], depth: usize, collapsed: &HashSet<String>, guides: u32, out: &mut Vec<LayerRow>) {
+fn walk_layers(
+    nodes: &[Node],
+    depth: usize,
+    collapsed: &HashSet<String>,
+    guides: u32,
+    out: &mut Vec<LayerRow>,
+) {
     let count = nodes.len();
     for (index, node) in nodes.iter().rev().enumerate() {
         let group = !node.is_layer();
@@ -2654,16 +3670,25 @@ fn walk_layers(nodes: &[Node], depth: usize, collapsed: &HashSet<String>, guides
         if group && !open {
             continue;
         }
-        let child_guides = if has_next { guides | (1u32 << depth.min(31)) } else { guides };
+        let child_guides = if has_next {
+            guides | (1u32 << depth.min(31))
+        } else {
+            guides
+        };
         if node.animation {
             // Cels carry the frame they start on, from 1.
-            let starts: Vec<(String, u32)> =
-                anim::frame_map(node).into_iter().map(|(start, cel)| (cel.id.clone(), start)).collect();
+            let starts: Vec<(String, u32)> = anim::frame_map(node)
+                .into_iter()
+                .map(|(start, cel)| (cel.id.clone(), start))
+                .collect();
             let before = out.len();
             walk_layers(&node.children, depth + 1, collapsed, child_guides, out);
             for row in &mut out[before..] {
                 if row.depth == depth + 1 {
-                    row.frame = starts.iter().find(|(id, _)| *id == row.id).map(|(_, start)| start + 1);
+                    row.frame = starts
+                        .iter()
+                        .find(|(id, _)| *id == row.id)
+                        .map(|(_, start)| start + 1);
                 }
             }
         } else {
@@ -2678,7 +3703,15 @@ fn walk_layers(nodes: &[Node], depth: usize, collapsed: &HashSet<String>, guides
 fn stroke_opacity_tool(tool: Tool) -> bool {
     matches!(
         tool,
-        Tool::Pen | Tool::Pencil | Tool::Charcoal | Tool::Paint | Tool::Air | Tool::Dither | Tool::Eraser | Tool::Line | Tool::WarpMask
+        Tool::Pen
+            | Tool::Pencil
+            | Tool::Charcoal
+            | Tool::Paint
+            | Tool::Air
+            | Tool::Dither
+            | Tool::Eraser
+            | Tool::Line
+            | Tool::WarpMask
     )
 }
 
@@ -2700,9 +3733,10 @@ fn flow_settings(settings: &ToolSettings) -> ToolSettings {
     flow
 }
 
-fn blend_stroke(
+/// Composite stroke-buffer ink onto the layer. Clear paper in the buffer stays put,
+/// so the destination can be the live layer instead of a full pen-down copy.
+fn blend_overlay(
     layer: &mut [u8],
-    backup: &[u8],
     overlay: &[u8],
     width: u32,
     height: u32,
@@ -2710,63 +3744,100 @@ fn blend_stroke(
     opacity: f32,
     erase: bool,
 ) {
-    if layer.len() != backup.len() || overlay.len() != layer.len() || width == 0 || height == 0 {
+    if overlay.len() != layer.len() || width == 0 || height == 0 {
         return;
     }
     let opacity = opacity.clamp(0.0, 1.0);
-    let x0 = rect[0].max(0);
-    let y0 = rect[1].max(0);
-    let x1 = rect[2].min(width as i32);
-    let y1 = rect[3].min(height as i32);
+    if opacity <= 0.0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = rect_span(width, height, rect);
     for y in y0..y1 {
         for x in x0..x1 {
-            let index = ((y as u32 * width + x as u32) * 4) as usize;
+            let index = ((y * width + x) * 4) as usize;
             let src_a = overlay[index + 3];
+            if src_a == 0 {
+                continue;
+            }
             if erase {
                 let cover = (f32::from(src_a) / 255.0) * opacity;
-                let alpha = f32::from(backup[index + 3]) * (1.0 - cover);
-                layer[index] = backup[index];
-                layer[index + 1] = backup[index + 1];
-                layer[index + 2] = backup[index + 2];
+                let alpha = f32::from(layer[index + 3]) * (1.0 - cover);
                 layer[index + 3] = alpha.round().clamp(0.0, 255.0) as u8;
                 continue;
             }
-            if src_a == 0 || opacity <= 0.0 {
-                layer[index] = backup[index];
-                layer[index + 1] = backup[index + 1];
-                layer[index + 2] = backup[index + 2];
-                layer[index + 3] = backup[index + 3];
-                continue;
-            }
-            let dst = Rgba::new(backup[index], backup[index + 1], backup[index + 2], backup[index + 3]);
-            let src = Rgba::new(overlay[index], overlay[index + 1], overlay[index + 2], overlay[index + 3]);
-            let out = source_over(dst, src, opacity);
-            let channels = out.channels();
+            let dst = Rgba::new(
+                layer[index],
+                layer[index + 1],
+                layer[index + 2],
+                layer[index + 3],
+            );
+            let src = Rgba::new(
+                overlay[index],
+                overlay[index + 1],
+                overlay[index + 2],
+                overlay[index + 3],
+            );
+            let channels = source_over(dst, src, opacity).channels();
             layer[index..index + 4].copy_from_slice(&channels);
         }
     }
 }
 
-fn restore_rect(layer: &mut [u8], backup: &[u8], width: u32, height: u32, rect: [i32; 4]) {
-    if layer.len() != backup.len() || width == 0 {
-        return;
-    }
+fn rect_span(width: u32, height: u32, rect: [i32; 4]) -> (u32, u32, u32, u32) {
     let x0 = rect[0].max(0) as u32;
-    let x1 = (rect[2].max(0) as u32).min(width);
     let y0 = rect[1].max(0) as u32;
+    let x1 = (rect[2].max(0) as u32).min(width);
     let y1 = (rect[3].max(0) as u32).min(height);
-    if x1 <= x0 {
-        return;
-    }
+    (x0, y0, x1.max(x0), y1.max(y0))
+}
+
+fn copy_tight(src: &[u8], width: u32, height: u32, rect: [i32; 4]) -> Vec<u8> {
+    let (x0, y0, x1, y1) = rect_span(width, height, rect);
     let span = ((x1 - x0) * 4) as usize;
+    let rows = (y1 - y0) as usize;
+    if span == 0 || rows == 0 || src.len() < (width as usize) * (height as usize) * 4 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(rows * span);
     for y in y0..y1 {
         let start = ((y * width + x0) * 4) as usize;
-        layer[start..start + span].copy_from_slice(&backup[start..start + span]);
+        out.extend_from_slice(&src[start..start + span]);
+    }
+    out
+}
+
+fn paste_tight(dst: &mut [u8], snap: &[u8], width: u32, height: u32, rect: [i32; 4]) {
+    let (x0, y0, x1, y1) = rect_span(width, height, rect);
+    let span = ((x1 - x0) * 4) as usize;
+    let rows = (y1 - y0) as usize;
+    if span == 0
+        || snap.len() != rows * span
+        || dst.len() < (width as usize) * (height as usize) * 4
+    {
+        return;
+    }
+    for (row, y) in (y0..y1).enumerate() {
+        let start = ((y * width + x0) * 4) as usize;
+        let from = row * span;
+        dst[start..start + span].copy_from_slice(&snap[from..from + span]);
+    }
+}
+
+fn zero_rect(buf: &mut [u8], width: u32, height: u32, rect: [i32; 4]) {
+    let (x0, y0, x1, y1) = rect_span(width, height, rect);
+    let span = ((x1 - x0) * 4) as usize;
+    if span == 0 || buf.len() < (width as usize) * (height as usize) * 4 {
+        return;
+    }
+    for y in y0..y1 {
+        let start = ((y * width + x0) * 4) as usize;
+        buf[start..start + span].fill(0);
     }
 }
 
 fn moved_from(last: Option<&(f32, f32, f32)>, x: f32, y: f32) -> bool {
-    last.map(|point| (point.0 - x).hypot(point.1 - y) > 0.4).unwrap_or(true)
+    last.map(|point| (point.0 - x).hypot(point.1 - y) > 0.4)
+        .unwrap_or(true)
 }
 
 fn needs_last_drag(gesture: &Gesture, x: f32, y: f32) -> bool {
@@ -2777,9 +3848,11 @@ fn needs_last_drag(gesture: &Gesture, x: f32, y: f32) -> bool {
             }
             moved_from(session.samples.last(), x, y)
         }
-        Gesture::CutLasso | Gesture::CutRect { .. } | Gesture::Point { .. } | Gesture::Bone { .. } | Gesture::WarpCorner { .. } => {
-            true
-        }
+        Gesture::CutLasso
+        | Gesture::CutRect { .. }
+        | Gesture::Point { .. }
+        | Gesture::Bone { .. }
+        | Gesture::WarpCorner { .. } => true,
     }
 }
 
@@ -2804,7 +3877,10 @@ fn fill_polygon(pixels: &mut [u8], width: u32, height: u32, points: &[[f32; 2]],
 }
 
 fn extension_is(path: &Path, expect: &str) -> bool {
-    path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.eq_ignore_ascii_case(expect)).unwrap_or(false)
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case(expect))
+        .unwrap_or(false)
 }
 
 /// `os.path.abspath`: against the working folder, without touching the disk.
@@ -2812,7 +3888,9 @@ fn absolute(path: &Path) -> PathBuf {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf())
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
     };
     let mut out = PathBuf::new();
     for part in joined.components() {
@@ -2835,7 +3913,9 @@ fn home_dir() -> PathBuf {
 }
 
 fn basename(path: &Path) -> String {
-    path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default()
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 /// Warp targets and windows in the drawing, for the opened line.
@@ -2927,13 +4007,19 @@ fn venv_python(root: &Path) -> Option<PathBuf> {
 /// A linked worktree's `.git` file points at `<main>/.git/worktrees/<name>`.
 fn main_worktree(root: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(root.join(".git")).ok()?;
-    let line = text.lines().find_map(|line| line.trim().strip_prefix("gitdir:"))?;
+    let line = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))?;
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
     let gitdir = PathBuf::from(line);
-    let gitdir = if gitdir.is_absolute() { gitdir } else { root.join(gitdir) };
+    let gitdir = if gitdir.is_absolute() {
+        gitdir
+    } else {
+        root.join(gitdir)
+    };
     let worktrees = gitdir.parent()?;
     if worktrees.file_name().and_then(|name| name.to_str()) != Some("worktrees") {
         return None;
@@ -2948,7 +4034,8 @@ fn main_worktree(root: &Path) -> Option<PathBuf> {
 /// The bridge prints `note <text>` on stdout at each stage; those lines feed
 /// the load gate while the file converts.
 fn open_with_python(path: &Path, progress: &dyn Fn(&str)) -> Result<Art, String> {
-    let root = studio_root().ok_or_else(|| "The Python studio is not next to this program.".to_string())?;
+    let root = studio_root()
+        .ok_or_else(|| "The Python studio is not next to this program.".to_string())?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|time| time.as_nanos())
@@ -2973,16 +4060,24 @@ fn open_with_python(path: &Path, progress: &dyn Fn(&str)) -> Result<Art, String>
         .spawn()
         .map_err(|err| format!("Python could not start ({}: {err}).", python.display()))?;
     if let Some(stdout) = child.stdout.take() {
-        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             if let Some(note) = line.strip_prefix("note ") {
                 progress(note.trim());
             }
         }
     }
-    let output = child.wait_with_output().map_err(|err| format!("Python did not finish ({err})."))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("Python did not finish ({err})."))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        let line = err.lines().find(|line| !line.trim().is_empty()).unwrap_or("Python could not open that file.");
+        let line = err
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Python could not open that file.");
         let _ = std::fs::remove_dir_all(&dir);
         return Err(line.to_string());
     }
@@ -3012,6 +4107,64 @@ mod tests {
         let mut desk = Desk::new(Session::default());
         desk.finish_new(Art::new(48, 32));
         desk
+    }
+
+    #[test]
+    fn a_folder_holds_the_next_object_and_a_drop_sets_its_depth() {
+        let mut desk = tiny();
+        desk.add_folder();
+        let folder = desk.art.objects[0].id.clone();
+        assert_eq!(desk.art.objects[0].kind, "folder");
+        assert_eq!(desk.library_folder, folder);
+        desk.add_object();
+        desk.add_object();
+        assert_eq!(desk.art.objects.len(), 3);
+        assert!(desk.art.objects[1..]
+            .iter()
+            .all(|object| object.folder == folder));
+        assert_eq!(desk.art.objects[1].stack, 0);
+        assert_eq!(desk.art.objects[2].stack, 1);
+        let back = desk.art.objects[1].id.clone();
+        let front = desk.art.objects[2].id.clone();
+        desk.place_on(&front, &back);
+        let rows = vmi_core::library_rows(&desk.art.objects, &std::collections::HashSet::new());
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec![folder.as_str(), front.as_str(), back.as_str()]
+        );
+        desk.undo();
+        let rows = vmi_core::library_rows(&desk.art.objects, &std::collections::HashSet::new());
+        assert_eq!(rows[1].id, back);
+        assert_eq!(rows[2].id, front);
+        desk.object_window = Some(front.clone());
+        desk.object_edit_saved = false;
+        desk.selected = Some(desk.art.layers[0].id.clone());
+        desk.give_layer_to_state(0);
+        let symbol = desk
+            .art
+            .objects
+            .iter()
+            .find(|object| object.id == front)
+            .unwrap();
+        assert_eq!(symbol.assign[&desk.art.layers[0].id], (0, 0));
+        assert_eq!(desk.art.objects.len(), 3);
+    }
+
+    #[test]
+    fn onion_colors_stay_on_the_session() {
+        let mut desk = tiny();
+        assert!(!desk.onion_window);
+        desk.open_onion_window();
+        assert!(desk.onion_window);
+        desk.set_onion_color(true, [9, 8, 7]);
+        desk.set_onion_color(false, [1, 2, 3]);
+        assert_eq!(desk.session.onion_past_color, [9, 8, 7]);
+        assert_eq!(desk.session.onion_future_color, [1, 2, 3]);
+        assert_eq!(desk.art.onion_past_color, [9, 8, 7]);
+        desk.set_onion_reach(1, 2);
+        assert_eq!((desk.art.onion_past, desk.art.onion_future), (1, 2));
+        desk.close_onion_window();
+        assert!(!desk.onion_window);
     }
 
     fn paint_red(desk: &mut Desk, x: u32, y: u32) {
@@ -3063,7 +4216,12 @@ mod tests {
         desk.up_doc(24.0, 18.0);
         assert_eq!(desk.art.layers[0].strokes.len(), 1);
         assert!(desk.art.layers[0].strokes[0].vertices.len() >= 2);
-        assert!(desk.art.layers[0].pixels.iter().skip(3).step_by(4).all(|alpha| *alpha == 0));
+        assert!(desk.art.layers[0]
+            .pixels
+            .iter()
+            .skip(3)
+            .step_by(4)
+            .all(|alpha| *alpha == 0));
         let plate = present(&mut desk.art);
         assert!(plate.iter().skip(3).step_by(4).any(|alpha| *alpha > 0));
 
@@ -3096,7 +4254,11 @@ mod tests {
         desk.swap_inks();
         assert_eq!(desk.ink, [0, 0, 255]);
         assert_eq!(desk.ink_back, [255, 0, 0]);
-        assert_eq!(desk.preset_of(Tool::Paint).color, [0, 255, 0], "a tool preset does not own the ink");
+        assert_eq!(
+            desk.preset_of(Tool::Paint).color,
+            [0, 255, 0],
+            "a tool preset does not own the ink"
+        );
         desk.toggle_clear();
         assert!(desk.clear_ink);
     }
@@ -3108,7 +4270,12 @@ mod tests {
         desk.camera.pan_x = 30.0;
         desk.camera.pan_y = -12.0;
         desk.camera.rotation = 0.2;
-        let frame = Frame { x: 0.0, y: 0.0, w: 200.0, h: 120.0 };
+        let frame = Frame {
+            x: 0.0,
+            y: 0.0,
+            w: 200.0,
+            h: 120.0,
+        };
         let (cx, cy) = frame.center();
         let (dx, dy) = desk.camera.to_doc(frame, 48.0, 32.0, cx, cy);
         desk.rotate_about_view(0.35);
@@ -3137,14 +4304,20 @@ mod tests {
         let once = alpha_at(&desk.art, 20, 16);
         assert!((100..160).contains(&once), "one pass {once}");
         let index = ((16 * desk.art.width + 20) * 4) as usize;
-        assert_eq!(desk.art.layers[0].pixels[index], 255, "shared ink, not the preset");
+        assert_eq!(
+            desk.art.layers[0].pixels[index], 255,
+            "shared ink, not the preset"
+        );
         desk.undo();
         desk.down_doc(4.0, 16.0, Button::Primary);
         desk.move_doc(40.0, 16.0);
         desk.move_doc(4.0, 16.0);
         desk.up_doc(4.0, 16.0);
         let crossed = alpha_at(&desk.art, 20, 16);
-        assert!((crossed as i32 - once as i32).abs() < 8, "a retraced stroke stacked to {crossed} from {once}");
+        assert!(
+            (crossed as i32 - once as i32).abs() < 8,
+            "a retraced stroke stacked to {crossed} from {once}"
+        );
     }
 
     #[test]
@@ -3170,11 +4343,46 @@ mod tests {
 
         desk.add_group();
         desk.add_layer();
-        let group = desk.layer_rows().into_iter().find(|row| row.group).expect("group").id;
+        let group = desk
+            .layer_rows()
+            .into_iter()
+            .find(|row| row.group)
+            .expect("group")
+            .id;
         assert!(desk.layer_rows().iter().any(|row| row.depth > 0));
         desk.toggle_folder(&group);
         assert!(desk.layer_rows().iter().all(|row| row.depth == 0));
         assert!(desk.layer_rows().iter().any(|row| row.group && !row.open));
+    }
+
+    #[test]
+    fn a_cancelled_pen_keeps_the_layer() {
+        let mut desk = tiny();
+        desk.edit_preset(Tool::Pen, |slot| {
+            slot.size = 4.0;
+            slot.fringe = 0.0;
+            slot.softness = 0.0;
+            slot.edge = Edge::Hard;
+            slot.opacity = 1.0;
+            slot.size_pressure = false;
+            slot.opacity_pressure = false;
+        });
+        desk.down_doc(8.0, 8.0, Button::Primary);
+        desk.up_doc(8.0, 8.0);
+        assert!(alpha_at(&desk.art, 8, 8) > 200);
+        desk.down_doc(24.0, 8.0, Button::Primary);
+        desk.move_doc(36.0, 8.0);
+        desk.escape();
+        assert!(
+            alpha_at(&desk.art, 8, 8) > 200,
+            "cancel leaves the earlier ink"
+        );
+        assert_eq!(
+            alpha_at(&desk.art, 30, 8),
+            0,
+            "the open stroke is not committed"
+        );
+        assert!(desk.gesture.is_none());
     }
 
     #[test]
@@ -3186,7 +4394,11 @@ mod tests {
         });
         let first = desk.take_display(false);
         assert!(matches!(first, Some(Display::Full(_))));
-        assert_eq!(desk.take_display(false), None, "nothing changed, nothing to upload");
+        assert_eq!(
+            desk.take_display(false),
+            None,
+            "nothing changed, nothing to upload"
+        );
         desk.down_doc(10.0, 10.0, Button::Primary);
         desk.move_doc(20.0, 12.0);
         let Some(Display::Part { x, y, w, h, rgba }) = desk.take_display(false) else {
@@ -3218,16 +4430,34 @@ mod tests {
         light.down_doc(10.0, 16.0, Button::Primary);
         light.move_doc(36.0, 16.0);
         light.up_doc(36.0, 16.0);
-        let count = |desk: &Desk| desk.art.layers[0].pixels.iter().skip(3).step_by(4).filter(|a| **a > 0).count();
+        let count = |desk: &Desk| {
+            desk.art.layers[0]
+                .pixels
+                .iter()
+                .skip(3)
+                .step_by(4)
+                .filter(|a| **a > 0)
+                .count()
+        };
         assert!(count(&light) > 0);
-        assert!(count(&light) < count(&heavy), "{} vs {}", count(&light), count(&heavy));
+        assert!(
+            count(&light) < count(&heavy),
+            "{} vs {}",
+            count(&light),
+            count(&heavy)
+        );
         assert!(ToolSettings::default_for(Tool::Pencil).size_pressure);
     }
 
     #[test]
     fn zoom_at_keeps_the_document_point_under_the_pointer() {
         let mut desk = tiny();
-        let frame = Frame { x: 100.0, y: 50.0, w: 400.0, h: 300.0 };
+        let frame = Frame {
+            x: 100.0,
+            y: 50.0,
+            w: 400.0,
+            h: 300.0,
+        };
         desk.fit(frame);
         let (sx, sy) = (180.0, 120.0);
         let (w, h) = (desk.art.width as f32, desk.art.height as f32);
@@ -3259,7 +4489,10 @@ mod tests {
         desk.up_doc(30.0, 16.0);
         assert!(desk.gesture.is_none());
         let index = ((16 * desk.art.width + 24) * 4) as usize;
-        assert!(desk.art.layers[0].pixels[index] > 0, "carry should still be on the layer");
+        assert!(
+            desk.art.layers[0].pixels[index] > 0,
+            "carry should still be on the layer"
+        );
 
         let group = desk.art.add_group(None, "Folder");
         desk.select_layer(group);
@@ -3299,7 +4532,10 @@ mod tests {
         desk.up_doc(20.0, 28.0);
         let stroke = desk.art.layers[0].strokes[0].id;
         desk.down_doc(8.0, 28.0, Button::Secondary);
-        assert_eq!(desk.stroke_window, Some((desk.art.layers[0].id.clone(), stroke)));
+        assert_eq!(
+            desk.stroke_window,
+            Some((desk.art.layers[0].id.clone(), stroke))
+        );
         assert_eq!(desk.tool(), Tool::Vector);
         desk.set_tool(Tool::Bone);
         desk.down_doc(12.0, 28.0, Button::Primary);
@@ -3328,7 +4564,11 @@ mod tests {
         assert!(desk.cut_ready());
         desk.cut_to_folder();
         assert_eq!(alpha_at(&desk.art, 4, 4), 0);
-        assert!(desk.art.layers.iter().any(|node| node.kind == vmi_core::NodeKind::Group));
+        assert!(desk
+            .art
+            .layers
+            .iter()
+            .any(|node| node.kind == vmi_core::NodeKind::Group));
     }
 
     #[test]
@@ -3369,7 +4609,10 @@ mod tests {
         desk.set_hold(2);
         desk.new_cel(None, None);
         let folder = desk.sheet_folder().expect("the wrap is the sheet's folder");
-        assert_eq!(anim::owning_animation(&desk.art.layers, &ink).as_deref(), Some(folder.as_str()));
+        assert_eq!(
+            anim::owning_animation(&desk.art.layers, &ink).as_deref(),
+            Some(folder.as_str())
+        );
         assert_eq!(desk.playhead(), 2);
         assert_eq!(desk.cut_end(), 4);
         assert!(desk.art.onion, "a new frame turns the skin on");
@@ -3390,13 +4633,21 @@ mod tests {
         // a later key moves only when it sat on that slot.
         desk.set_playhead(0);
         let first = find(&desk.art.layers, &folder).unwrap().timeline[0].clone();
-        assert_eq!(desk.selected.as_deref(), Some(first.as_str()), "the pen follows the playhead to the cel it shows");
+        assert_eq!(
+            desk.selected.as_deref(),
+            Some(first.as_str()),
+            "the pen follows the playhead to the cel it shows"
+        );
         desk.set_hold(1);
         desk.new_cel(None, None);
         let node = find(&desk.art.layers, &folder).unwrap();
         assert_eq!(node.frames, vec![0, 1, 2, 5]);
         assert_eq!(desk.playhead(), 1);
-        assert_eq!(desk.cut_end(), 8, "a frame inside the cut leaves the stored end alone");
+        assert_eq!(
+            desk.cut_end(),
+            8,
+            "a frame inside the cut leaves the stored end alone"
+        );
 
         // Stepping stops at the ends unless wrap is on.
         desk.last_frame();
@@ -3419,7 +4670,10 @@ mod tests {
         desk.set_playhead(7);
         desk.toggle_play();
         assert!(desk.playing);
-        assert!(desk.tick(5.0), "the idle gap before Play is not playback time");
+        assert!(
+            desk.tick(5.0),
+            "the idle gap before Play is not playback time"
+        );
         assert_eq!(desk.playhead(), 7);
         assert!(desk.tick(1.0 / f64::from(desk.art.fps) + 0.001));
         assert_eq!(desk.playhead(), 0);
@@ -3429,7 +4683,10 @@ mod tests {
         // key. The sheet is the grid as it read, held to the cut end.
         desk.sheet_command(&folder, "reverse", 0, 3, 0);
         let node = find(&desk.art.layers, &folder).unwrap();
-        let sheet = node.exposure.as_ref().expect("the first command stores the sheet");
+        let sheet = node
+            .exposure
+            .as_ref()
+            .expect("the first command stores the sheet");
         assert_eq!(sheet.slots.len(), 8);
         assert_eq!(&sheet.slots[..3], ["001", "000", "000"]);
         assert_eq!(&sheet.slots[3..], ["001", "001", "002", "002", "002"]);
@@ -3454,31 +4711,56 @@ mod tests {
         assert!(desk.on_browser);
         assert!(desk.tabs.is_empty());
 
-        // New picture: an unsaved tab, Paper under Ink, Ink selected, white pen.
+        // New picture: an unsaved tab, Paper under Ink, Ink selected. The pen
+        // keeps the shared ink. A new page does not give this tool its own color.
         desk.open_blank(1920, 1080, "#FFFFFF", None, false).unwrap();
         assert_eq!(desk.tabs.len(), 1);
         assert_eq!(desk.shown, Some(0));
         assert!(!desk.on_browser);
         assert_eq!(desk.art.file_name, "Untitled 1920×1080");
         assert_eq!(desk.tab_names(), ["Untitled 1920×1080"]);
-        let ink = desk.art.layers.iter().find(|node| node.name == "Ink").unwrap().id.clone();
+        let ink = desk
+            .art
+            .layers
+            .iter()
+            .find(|node| node.name == "Ink")
+            .unwrap()
+            .id
+            .clone();
         assert_eq!(desk.selected.as_deref(), Some(ink.as_str()));
-        assert_eq!(desk.preset().color, [255, 255, 255]);
-        assert_eq!(desk.status, "New picture 1920×1080. Draw on Ink. Save blueprint writes the file.");
+        assert_eq!(desk.ink, [0xFF, 0x3E, 0xB8]);
+        assert_eq!(desk.preset().color, [0xFF, 0x3E, 0xB8]);
+        assert_eq!(
+            desk.status,
+            "New picture 1920×1080. Draw on Ink. Save blueprint writes the file."
+        );
         assert_eq!(desk.export_dir(), home_dir());
         let ink_alpha = |desk: &Desk| {
-            let ink = desk.art.layers.iter().find(|node| node.name == "Ink").unwrap();
+            let ink = desk
+                .art
+                .layers
+                .iter()
+                .find(|node| node.name == "Ink")
+                .unwrap();
             ink.pixels[((3 * desk.art.width + 3) * 4 + 3) as usize]
         };
         desk.history.push(desk.art.clone());
         let width = desk.art.width;
-        let ink_node = desk.art.layers.iter_mut().find(|node| node.name == "Ink").unwrap();
+        let ink_node = desk
+            .art
+            .layers
+            .iter_mut()
+            .find(|node| node.name == "Ink")
+            .unwrap();
         ink_node.pixels[((3 * width + 3) * 4) as usize] = 255;
         ink_node.pixels[((3 * width + 3) * 4 + 3) as usize] = 255;
 
         // A second new picture of the same size takes the next number.
         desk.open_blank(1920, 1080, "#808080", None, false).unwrap();
-        assert_eq!(desk.tab_names(), ["Untitled 1920×1080", "Untitled 1920×1080 2"]);
+        assert_eq!(
+            desk.tab_names(),
+            ["Untitled 1920×1080", "Untitled 1920×1080 2"]
+        );
         assert_eq!(desk.shown, Some(1));
         assert_eq!(desk.undo_depth(), 0, "the new tab starts its own history");
         assert_eq!(ink_alpha(&desk), 0);
@@ -3490,13 +4772,22 @@ mod tests {
         assert_eq!(ink_alpha(&desk), 255);
         assert_eq!(desk.undo_depth(), 1);
         let events = desk.take_load_events();
-        assert_eq!(events, [LoadEvent::Catchup("Untitled 1920×1080".into()), LoadEvent::Shown]);
+        assert_eq!(
+            events,
+            [
+                LoadEvent::Catchup("Untitled 1920×1080".into()),
+                LoadEvent::Shown
+            ]
+        );
 
         // The browser tab stashes the drawing; the editor's state stays put.
         desk.select_tab(None);
         assert!(desk.on_browser);
         assert_eq!(desk.shown, Some(0));
-        assert_eq!(desk.tab_names(), ["Untitled 1920×1080", "Untitled 1920×1080 2"]);
+        assert_eq!(
+            desk.tab_names(),
+            ["Untitled 1920×1080", "Untitled 1920×1080 2"]
+        );
 
         // Save as: the tab takes the path, the export folder stays its own.
         desk.select_tab(Some(0));
@@ -3514,8 +4805,12 @@ mod tests {
         assert!(desk.claim_export_dir(&mine));
         assert_eq!(desk.export_dir(), absolute(&mine));
         desk.select_tab(Some(1));
-        desk.save_blueprint(&dir.join("first.vmib")).unwrap_or_default();
-        assert!(!desk.claim_export_dir(&mine), "two tabs with one scene folder");
+        desk.save_blueprint(&dir.join("first.vmib"))
+            .unwrap_or_default();
+        assert!(
+            !desk.claim_export_dir(&mine),
+            "two tabs with one scene folder"
+        );
         assert!(desk.status.contains("This tab needs its own path."));
 
         // Closing the shown tab brings up the neighbor; closing the last one
@@ -3528,7 +4823,10 @@ mod tests {
         assert!(desk.tabs.is_empty());
         assert!(desk.on_browser);
         assert_eq!(desk.shown, None);
-        assert_eq!(desk.status, "Open a .clip, .psd, .kra, .xcf, or .vmib file.");
+        assert_eq!(
+            desk.status,
+            "Open a .clip, .psd, .kra, .xcf, or .vmib file."
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3547,7 +4845,10 @@ mod tests {
         assert_eq!(desk.tabs.len(), 1);
         assert!(!desk.tabs[0].loaded);
         assert_eq!(desk.tab_names(), ["shot.vmib"]);
-        assert_eq!(desk.take_load_events(), [LoadEvent::Started("shot.vmib".into())]);
+        assert_eq!(
+            desk.take_load_events(),
+            [LoadEvent::Started("shot.vmib".into())]
+        );
         // A second open while reading is refused.
         assert!(!desk.begin_open(&path, false));
         assert_eq!(desk.status, "Still reading.");
@@ -3559,7 +4860,10 @@ mod tests {
         }
         assert!(!desk.is_loading(), "the read finished");
         let events = desk.take_load_events();
-        assert_eq!(events.first(), Some(&LoadEvent::Note("Reading shot.vmib".into())));
+        assert_eq!(
+            events.first(),
+            Some(&LoadEvent::Note("Reading shot.vmib".into()))
+        );
         assert_eq!(events.last(), Some(&LoadEvent::Shown));
         assert!(desk.tabs[0].loaded);
         assert_eq!(desk.art.width, 64);
@@ -3587,7 +4891,9 @@ mod tests {
         assert_eq!(desk.shown, Some(0));
         assert_eq!(desk.art.file_name, "shot.vmib");
         assert_eq!(desk.status, "That file is missing.");
-        assert!(desk.take_load_events().contains(&LoadEvent::Failed("That file is missing.".into())));
+        assert!(desk
+            .take_load_events()
+            .contains(&LoadEvent::Failed("That file is missing.".into())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3602,8 +4908,15 @@ mod tests {
         std::fs::create_dir_all(python.parent().unwrap()).unwrap();
         std::fs::write(&python, b"").unwrap();
         std::fs::create_dir_all(&branch).unwrap();
-        let gitdir = main.join(".git").join("worktrees").join("vmi-studio-latest");
-        std::fs::write(branch.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        let gitdir = main
+            .join(".git")
+            .join("worktrees")
+            .join("vmi-studio-latest");
+        std::fs::write(
+            branch.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
 
         assert_eq!(main_worktree(&branch), Some(main.clone()));
         assert_eq!(python_program(&branch), python);
@@ -3616,5 +4929,66 @@ mod tests {
         if let Some(saved) = saved {
             std::env::set_var("VMI_PYTHON", saved);
         }
+    }
+
+    #[test]
+    fn select_opens_the_folder_and_names_the_layer() {
+        let mut desk = tiny();
+        let mut sky = Node::layer("sky", "sky", desk.art.width, desk.art.height);
+        for pixel in sky.pixels.chunks_mut(4) {
+            pixel[1] = 255;
+            pixel[3] = 255;
+        }
+        let mut sign = Node::layer("sign", "sign", desk.art.width, desk.art.height);
+        let width = desk.art.width;
+        let at = ((4 * width + 4) * 4) as usize;
+        sign.pixels[at] = 255;
+        sign.pixels[at + 3] = 255;
+        let mut folder = Node::group("booth", "booth");
+        folder.children.push(sign);
+        desk.art.layers = vec![sky, folder];
+        desk.collapsed.insert("booth".into());
+        desk.set_tool(Tool::Select);
+        desk.down_doc(4.2, 4.2, Button::Primary);
+        assert_eq!(desk.selected.as_deref(), Some("sign"));
+        assert_eq!(desk.status, "sign");
+        assert!(!desk.collapsed.contains("booth"));
+        assert_eq!(desk.reveal.as_deref(), Some("sign"));
+        desk.down_doc(0.0, 0.0, Button::Primary);
+        assert_eq!(desk.selected.as_deref(), Some("sky"));
+        desk.down_doc(-1.0, 0.0, Button::Primary);
+        assert_eq!(desk.status, "No layer there.");
+        assert_eq!(desk.selected.as_deref(), Some("sky"));
+    }
+
+    #[test]
+    fn select_opens_every_folder_on_the_way_in() {
+        let mut desk = tiny();
+        let width = desk.art.width;
+        let height = desk.art.height;
+        let mut sky = Node::layer("sky", "sky", width, height);
+        for pixel in sky.pixels.chunks_mut(4) {
+            pixel[1] = 255;
+            pixel[3] = 255;
+        }
+        let mut sign = Node::layer("sign", "sign", width, height);
+        let at = ((4 * width + 4) * 4) as usize;
+        sign.pixels[at] = 255;
+        sign.pixels[at + 3] = 255;
+        let mut room = Node::group("room", "room");
+        room.children.push(sign);
+        let mut booth = Node::group("booth", "booth");
+        booth.children.push(room);
+        desk.art.layers = vec![sky, booth];
+        desk.collapsed.insert("booth".into());
+        desk.collapsed.insert("room".into());
+        desk.selected = Some("sky".into());
+        desk.set_tool(Tool::Select);
+        desk.down_doc(4.2, 4.2, Button::Primary);
+        assert_eq!(desk.selected.as_deref(), Some("sign"));
+        assert_eq!(desk.status, "sign");
+        assert!(!desk.collapsed.contains("booth"));
+        assert!(!desk.collapsed.contains("room"));
+        assert_eq!(desk.reveal.as_deref(), Some("sign"));
     }
 }

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::color::Rgba;
-use crate::coverage::{liquid_level, stamp, Stamp, StampMode, TONE};
+use crate::coverage::{liquid_level, stamp, DitherPattern, Stamp, StampMode, TONE};
 use crate::tip::Grain;
 use crate::tool::{CurveKind, GrainKind, Tool, ToolSettings};
 
@@ -53,6 +53,10 @@ pub struct VectorStroke {
     pub edge: crate::coverage::Edge,
     pub chunk: u32,
     pub tones: bool,
+    #[serde(default)]
+    pub pattern: DitherPattern,
+    #[serde(default)]
+    pub bias: f32,
     pub grain: GrainKind,
     pub seed: u64,
     pub bone: Option<Bone>,
@@ -68,11 +72,20 @@ fn dirty_new() -> bool {
 }
 
 impl VectorStroke {
-    pub fn from_gesture(id: u64, tool: Tool, points: &[(f32, f32, f32)], settings: &ToolSettings) -> Option<Self> {
+    pub fn from_gesture(
+        id: u64,
+        tool: Tool,
+        points: &[(f32, f32, f32)],
+        settings: &ToolSettings,
+    ) -> Option<Self> {
         if points.is_empty() {
             return None;
         }
-        let curve = if tool == Tool::Curve { CurveKind::Cubic } else { settings.curve };
+        let curve = if tool == Tool::Curve {
+            CurveKind::Cubic
+        } else {
+            settings.curve
+        };
         let mut vertices = Vec::with_capacity(points.len());
         for (x, y, pressure) in points {
             let radius = settings.radius_for((*pressure).clamp(0.0, 1.0)).max(0.5);
@@ -85,6 +98,7 @@ impl VectorStroke {
                 handle_out: None,
             });
         }
+        simplify_points(&mut vertices, 1.75);
         if curve != CurveKind::Poly {
             assign_handles(&mut vertices, curve);
         }
@@ -104,6 +118,8 @@ impl VectorStroke {
             edge: settings.edge,
             chunk: settings.chunk.max(1),
             tones: settings.tones || grain == GrainKind::Liquid,
+            pattern: settings.dither_pattern,
+            bias: settings.dither_bias,
             grain,
             seed: settings.seed,
             bone: None,
@@ -134,6 +150,58 @@ impl VectorStroke {
         }
         self.cache.as_ref()
     }
+}
+
+/// Drop samples that sit on the line between their neighbours. A slow pen
+/// does not become a point per pixel. Corners and the two ends stay.
+fn simplify_points(vertices: &mut Vec<Vertex>, tolerance: f32) {
+    if vertices.len() < 3 {
+        return;
+    }
+    let tol2 = tolerance.max(0.25) * tolerance.max(0.25);
+    let keep = rdp_keep(vertices, 0, vertices.len() - 1, tol2);
+    let next: Vec<Vertex> = keep
+        .into_iter()
+        .map(|index| vertices[index].clone())
+        .collect();
+    *vertices = next;
+}
+
+fn rdp_keep(vertices: &[Vertex], start: usize, end: usize, tol2: f32) -> Vec<usize> {
+    if end <= start + 1 {
+        return vec![start, end];
+    }
+    let mut far = start;
+    let mut best = 0.0_f32;
+    for index in start + 1..end {
+        let distance = point_line_distance2(&vertices[index], &vertices[start], &vertices[end]);
+        if distance > best {
+            best = distance;
+            far = index;
+        }
+    }
+    if best > tol2 {
+        let mut left = rdp_keep(vertices, start, far, tol2);
+        let right = rdp_keep(vertices, far, end, tol2);
+        left.pop();
+        left.extend(right);
+        left
+    } else {
+        vec![start, end]
+    }
+}
+
+fn point_line_distance2(point: &Vertex, from: &Vertex, to: &Vertex) -> f32 {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= 1e-6 {
+        return (point.x - from.x).hypot(point.y - from.y).powi(2);
+    }
+    let t = (((point.x - from.x) * dx + (point.y - from.y) * dy) / len2).clamp(0.0, 1.0);
+    let px = from.x + dx * t;
+    let py = from.y + dy * t;
+    (point.x - px).hypot(point.y - py).powi(2)
 }
 
 fn assign_handles(vertices: &mut [Vertex], curve: CurveKind) {
@@ -191,7 +259,11 @@ fn samples_of(stroke: &VectorStroke) -> Vec<Sample> {
     }
     if count == 1 {
         let (x, y) = placed(&stroke.vertices[0], stroke.bone);
-        return vec![Sample { x, y, radius: stroke.vertices[0].width.max(0.5) }];
+        return vec![Sample {
+            x,
+            y,
+            radius: stroke.vertices[0].width.max(0.5),
+        }];
     }
     let mut out = Vec::new();
     let last = if stroke.closed { count } else { count - 1 };
@@ -205,9 +277,20 @@ fn samples_of(stroke: &VectorStroke) -> Vec<Sample> {
         let steps = ((span / step).ceil() as i32).clamp(1, 256);
         for step_index in 0..=steps {
             let t = step_index as f32 / steps as f32;
-            let (x, y) = point_at(stroke, index % count, (index + 1) % count, t, (ax, ay), (bx, by));
+            let (x, y) = point_at(
+                stroke,
+                index % count,
+                (index + 1) % count,
+                t,
+                (ax, ay),
+                (bx, by),
+            );
             let radius = a.width + (b.width - a.width) * t;
-            out.push(Sample { x, y, radius: radius.max(0.5) });
+            out.push(Sample {
+                x,
+                y,
+                radius: radius.max(0.5),
+            });
             if out.len() >= 8000 {
                 return out;
             }
@@ -229,12 +312,21 @@ fn point_at(
     match stroke.curve {
         CurveKind::Poly => (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t),
         CurveKind::Quadratic => {
-            let handle = va.handle_out.map(|h| bone_point(h, stroke.bone)).unwrap_or(((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5));
+            let handle = va
+                .handle_out
+                .map(|h| bone_point(h, stroke.bone))
+                .unwrap_or(((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5));
             quad(a, handle, b, t)
         }
         CurveKind::Cubic => {
-            let c1 = va.handle_out.map(|h| bone_point(h, stroke.bone)).unwrap_or(a);
-            let c2 = vb.handle_in.map(|h| bone_point(h, stroke.bone)).unwrap_or(b);
+            let c1 = va
+                .handle_out
+                .map(|h| bone_point(h, stroke.bone))
+                .unwrap_or(a);
+            let c2 = vb
+                .handle_in
+                .map(|h| bone_point(h, stroke.bone))
+                .unwrap_or(b);
             cubic(a, c1, c2, b, t)
         }
         CurveKind::Spline => {
@@ -255,7 +347,10 @@ fn bone_point(point: [f32; 2], bone: Option<Bone>) -> (f32, f32) {
 
 fn quad(a: (f32, f32), b: (f32, f32), c: (f32, f32), t: f32) -> (f32, f32) {
     let u = 1.0 - t;
-    (u * u * a.0 + 2.0 * u * t * b.0 + t * t * c.0, u * u * a.1 + 2.0 * u * t * b.1 + t * t * c.1)
+    (
+        u * u * a.0 + 2.0 * u * t * b.0 + t * t * c.0,
+        u * u * a.1 + 2.0 * u * t * b.1 + t * t * c.1,
+    )
 }
 
 fn cubic(a: (f32, f32), b: (f32, f32), c: (f32, f32), d: (f32, f32), t: f32) -> (f32, f32) {
@@ -269,9 +364,50 @@ fn catmull(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), t: f3
     let t2 = t * t;
     let t3 = t2 * t;
     let axis = |a: f32, b: f32, c: f32, d: f32| {
-        0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
+        0.5 * ((2.0 * b)
+            + (-a + c) * t
+            + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+            + (-a + 3.0 * b - 3.0 * c + d) * t3)
     };
     (axis(p0.0, p1.0, p2.0, p3.0), axis(p0.1, p1.1, p2.1, p3.1))
+}
+
+/// Which handle a Point-tool drag is holding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandleSide {
+    In,
+    Out,
+}
+
+/// Move a point and keep its handles the same offset from it.
+pub fn move_vertex(vertex: &mut Vertex, x: f32, y: f32) {
+    let dx = x - vertex.x;
+    let dy = y - vertex.y;
+    vertex.x = x;
+    vertex.y = y;
+    if let Some(handle) = vertex.handle_in.as_mut() {
+        handle[0] += dx;
+        handle[1] += dy;
+    }
+    if let Some(handle) = vertex.handle_out.as_mut() {
+        handle[0] += dx;
+        handle[1] += dy;
+    }
+}
+
+/// Drag one handle. The other stays opposite, through the point, at the same length.
+pub fn move_handle(vertex: &mut Vertex, side: HandleSide, x: f32, y: f32) {
+    let mirror = [vertex.x * 2.0 - x, vertex.y * 2.0 - y];
+    match side {
+        HandleSide::In => {
+            vertex.handle_in = Some([x, y]);
+            vertex.handle_out = Some(mirror);
+        }
+        HandleSide::Out => {
+            vertex.handle_out = Some([x, y]);
+            vertex.handle_in = Some(mirror);
+        }
+    }
 }
 
 pub fn bake(stroke: &VectorStroke, width: u32, height: u32) -> Option<Raster> {
@@ -285,20 +421,27 @@ pub fn bake(stroke: &VectorStroke, width: u32, height: u32) -> Option<Raster> {
     let mut canvas = vec![0u8; (width as usize) * (height as usize) * 4];
     let color = Rgba::rgb(stroke.color[0], stroke.color[1], stroke.color[2]);
     for sample in &samples {
-        stamp(&mut canvas, width, height, Stamp {
-            cx: sample.x,
-            cy: sample.y,
-            radius: sample.radius,
-            softness: stroke.softness,
-            fringe: stroke.fringe,
-            opacity: 1.0,
-            color,
-            edge: stroke.edge,
-            chunk: stroke.chunk,
-            tones: stroke.tones && stroke.grain != GrainKind::Liquid,
-            mode: StampMode::Over,
-            grain: Grain::plain(),
-        });
+        stamp(
+            &mut canvas,
+            width,
+            height,
+            Stamp {
+                cx: sample.x,
+                cy: sample.y,
+                radius: sample.radius,
+                softness: stroke.softness,
+                fringe: stroke.fringe,
+                opacity: 1.0,
+                color,
+                edge: stroke.edge,
+                chunk: stroke.chunk,
+                tones: stroke.tones && stroke.grain != GrainKind::Liquid,
+                pattern: stroke.pattern,
+                bias: stroke.bias,
+                mode: StampMode::Over,
+                grain: Grain::plain(),
+            },
+        );
     }
     apply_grain(&mut canvas, width, height, stroke);
     tight(canvas, width, height)
@@ -349,20 +492,27 @@ fn apply_grain(canvas: &mut [u8], width: u32, height: u32, stroke: &VectorStroke
             let dots = generate(stroke.seed, min_x, min_y, max_x, max_y, 24);
             let color = Rgba::rgb(stroke.color[0], stroke.color[1], stroke.color[2]);
             for (x, y) in dots {
-                stamp(canvas, width, height, Stamp {
-                    cx: x,
-                    cy: y,
-                    radius: (stroke.size * 0.08).max(1.0),
-                    softness: 0.0,
-                    fringe: 0.0,
-                    opacity: 1.0,
-                    color,
-                    edge: crate::coverage::Edge::Hard,
-                    chunk: 1,
-                    tones: false,
-                    mode: StampMode::Over,
-                    grain: Grain::plain(),
-                });
+                stamp(
+                    canvas,
+                    width,
+                    height,
+                    Stamp {
+                        cx: x,
+                        cy: y,
+                        radius: (stroke.size * 0.08).max(1.0),
+                        softness: 0.0,
+                        fringe: 0.0,
+                        opacity: 1.0,
+                        color,
+                        edge: crate::coverage::Edge::Hard,
+                        chunk: 1,
+                        tones: false,
+                        pattern: DitherPattern::Bayer,
+                        bias: 0.0,
+                        mode: StampMode::Over,
+                        grain: Grain::plain(),
+                    },
+                );
             }
             for index in (0..canvas.len()).step_by(4) {
                 if mask[index + 3] == 0 {
@@ -394,7 +544,14 @@ fn alpha_bounds(buf: &[u8], width: u32, height: u32) -> Option<(f32, f32, f32, f
     any.then_some((min_x as f32, min_y as f32, max_x as f32, max_y as f32))
 }
 
-pub fn generate(seed: u64, min_x: f32, min_y: f32, max_x: f32, max_y: f32, count: u32) -> Vec<(f32, f32)> {
+pub fn generate(
+    seed: u64,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    count: u32,
+) -> Vec<(f32, f32)> {
     let count = count.min(64);
     let mut rng = seed | 1;
     let mut out = Vec::with_capacity(count as usize);
@@ -403,7 +560,10 @@ pub fn generate(seed: u64, min_x: f32, min_y: f32, max_x: f32, max_y: f32, count
         let ux = (rng >> 33) as f32 / (1u32 << 31) as f32;
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
         let uy = (rng >> 33) as f32 / (1u32 << 31) as f32;
-        out.push((min_x + (max_x - min_x) * ux.clamp(0.0, 1.0), min_y + (max_y - min_y) * uy.clamp(0.0, 1.0)));
+        out.push((
+            min_x + (max_x - min_x) * ux.clamp(0.0, 1.0),
+            min_y + (max_y - min_y) * uy.clamp(0.0, 1.0),
+        ));
     }
     out
 }
@@ -437,7 +597,13 @@ pub fn tight(buf: Vec<u8>, width: u32, height: u32) -> Option<Raster> {
         let dst = (y * w * 4) as usize;
         rgba[dst..dst + (w * 4) as usize].copy_from_slice(&buf[src..src + (w * 4) as usize]);
     }
-    Some(Raster { x: min_x as i32, y: min_y as i32, w, h, rgba })
+    Some(Raster {
+        x: min_x as i32,
+        y: min_y as i32,
+        w,
+        h,
+        rgba,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,12 +633,21 @@ pub fn hit_stroke(stroke: &VectorStroke, x: f32, y: f32, pick: f32) -> Option<St
             return Some(StrokeHit::Vertex(index));
         }
     }
-    let radius = stroke.vertices.iter().map(|vertex| vertex.width).fold(0.0, f32::max) + 6.0;
+    let radius = stroke
+        .vertices
+        .iter()
+        .map(|vertex| vertex.width)
+        .fold(0.0, f32::max)
+        + 6.0;
     let count = stroke.vertices.len();
     if count == 1 {
         return Some(StrokeHit::Body);
     }
-    let last = if stroke.closed { count } else { count.saturating_sub(1) };
+    let last = if stroke.closed {
+        count
+    } else {
+        count.saturating_sub(1)
+    };
     for index in 0..last {
         let a = &stroke.vertices[index % count];
         let b = &stroke.vertices[(index + 1) % count];
@@ -504,6 +679,8 @@ mod tests {
         let settings = ToolSettings::default_for(Tool::Vector);
         let points = [(4.0, 8.0, 1.0), (20.0, 12.0, 0.5), (36.0, 8.0, 1.0)];
         let stroke = VectorStroke::from_gesture(1, Tool::Vector, &points, &settings).unwrap();
+        assert_eq!(stroke.curve, CurveKind::Cubic);
+        assert!(stroke.vertices[1].handle_out.is_some());
         assert_eq!(stroke.vertices.len(), 3);
         assert!((stroke.vertices[1].pressure - 0.5).abs() < 1e-5);
         let baked = bake(&stroke, 64, 32).unwrap();
@@ -513,7 +690,13 @@ mod tests {
 
     #[test]
     fn a_bone_moves_a_near_point_and_leaves_a_far_one() {
-        let bone = Bone { x0: 0.0, y0: 0.0, x1: 0.0, y1: 10.0, reach: 20.0 };
+        let bone = Bone {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 0.0,
+            y1: 10.0,
+            reach: 20.0,
+        };
         let (x, y) = apply_bone(10.0, 0.0, bone);
         assert!((x - 10.0).abs() > 0.5 || (y - 0.0).abs() > 0.5, "{x},{y}");
         let (far_x, far_y) = apply_bone(400.0, 0.0, bone);
@@ -522,9 +705,45 @@ mod tests {
     }
 
     #[test]
+    fn a_straight_pen_keeps_the_ends_and_drops_the_samples_between() {
+        let settings = ToolSettings::default_for(Tool::Vector);
+        let points: Vec<(f32, f32, f32)> = (0..24)
+            .map(|index| (index as f32 * 3.0, 10.0, 1.0))
+            .collect();
+        let stroke = VectorStroke::from_gesture(4, Tool::Vector, &points, &settings).unwrap();
+        assert!(stroke.vertices.len() < 6, "{}", stroke.vertices.len());
+        assert!((stroke.vertices[0].x - 0.0).abs() < 0.01);
+        assert!((stroke.vertices.last().unwrap().x - 69.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_moved_point_keeps_its_handles_and_a_handle_stays_opposite() {
+        let mut vertex = Vertex {
+            x: 10.0,
+            y: 20.0,
+            pressure: 1.0,
+            width: 4.0,
+            handle_in: Some([6.0, 20.0]),
+            handle_out: Some([14.0, 20.0]),
+        };
+        move_vertex(&mut vertex, 12.0, 23.0);
+        assert_eq!(vertex.handle_in, Some([8.0, 23.0]));
+        assert_eq!(vertex.handle_out, Some([16.0, 23.0]));
+        move_handle(&mut vertex, HandleSide::Out, 20.0, 23.0);
+        assert_eq!(vertex.handle_out, Some([20.0, 23.0]));
+        assert_eq!(vertex.handle_in, Some([4.0, 23.0]));
+    }
+
+    #[test]
     fn curve_release_stores_handles() {
         let settings = ToolSettings::default_for(Tool::Curve);
-        let stroke = VectorStroke::from_gesture(2, Tool::Curve, &[(0.0, 0.0, 1.0), (10.0, 20.0, 1.0), (30.0, 0.0, 1.0)], &settings).unwrap();
+        let stroke = VectorStroke::from_gesture(
+            2,
+            Tool::Curve,
+            &[(0.0, 0.0, 1.0), (10.0, 20.0, 1.0), (30.0, 0.0, 1.0)],
+            &settings,
+        )
+        .unwrap();
         assert_eq!(stroke.curve, CurveKind::Cubic);
         assert!(stroke.vertices[1].handle_in.is_some());
         assert!(stroke.vertices[1].handle_out.is_some());
@@ -544,7 +763,8 @@ mod tests {
         settings.edge = Edge::Hard;
         settings.fringe = 0.0;
         settings.softness = 0.0;
-        let stroke = VectorStroke::from_gesture(3, Tool::Grain, &[(16.0, 16.0, 1.0)], &settings).unwrap();
+        let stroke =
+            VectorStroke::from_gesture(3, Tool::Grain, &[(16.0, 16.0, 1.0)], &settings).unwrap();
         let baked = bake(&stroke, 48, 48).unwrap();
         assert!(baked.rgba.chunks(4).any(|pixel| pixel[3] == 255));
         for pixel in baked.rgba.chunks(4) {

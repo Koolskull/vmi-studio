@@ -12,6 +12,60 @@ pub const TONE: [[u8; 3]; 3] = [[0, 0, 0], [0x44, 0x44, 0x44], [0xCC, 0xCC, 0xCC
 
 const BAYER: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
+const BAYER8: [[u32; 8]; 8] = [
+    [0, 32, 8, 40, 2, 34, 10, 42],
+    [48, 16, 56, 24, 50, 18, 58, 26],
+    [12, 44, 4, 36, 14, 46, 6, 38],
+    [60, 28, 52, 20, 62, 30, 54, 22],
+    [3, 35, 11, 43, 1, 33, 9, 41],
+    [51, 19, 59, 27, 49, 17, 57, 25],
+    [15, 47, 7, 39, 13, 45, 5, 37],
+    [63, 31, 55, 23, 61, 29, 53, 21],
+];
+
+/// How a dither edge breaks cover into ink. Bayer is the original 4×4 gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DitherPattern {
+    #[default]
+    Bayer,
+    Bayer8,
+    Checker,
+    Lines,
+    Dots,
+}
+
+impl DitherPattern {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bayer => "Bayer",
+            Self::Bayer8 => "Bayer 8",
+            Self::Checker => "Checker",
+            Self::Lines => "Lines",
+            Self::Dots => "Dots",
+        }
+    }
+
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Bayer => "B",
+            Self::Bayer8 => "8",
+            Self::Checker => "C",
+            Self::Lines => "L",
+            Self::Dots => "D",
+        }
+    }
+
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Bayer,
+            Self::Bayer8,
+            Self::Checker,
+            Self::Lines,
+            Self::Dots,
+        ]
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Edge {
     Smooth,
@@ -58,7 +112,11 @@ pub fn curve_value(curve: &[(f32, f32)], t: f32) -> f32 {
         let right = pair[1];
         if amount <= right.0 {
             let span = right.0 - left.0;
-            let mix = if span <= 0.0 { 0.0 } else { (amount - left.0) / span };
+            let mix = if span <= 0.0 {
+                0.0
+            } else {
+                (amount - left.0) / span
+            };
             return clamp01(left.1 + (right.1 - left.1) * mix);
         }
     }
@@ -69,7 +127,11 @@ pub fn curve_value(curve: &[(f32, f32)], t: f32) -> f32 {
 pub fn coverage(dist: f32, radius: f32, softness: f32, fringe: f32) -> f32 {
     let edge = radius.max(0.5);
     let softness = softness.clamp(0.0, 1.0);
-    let fringe = if fringe.is_finite() && fringe > 0.0 { fringe } else { 0.0 };
+    let fringe = if fringe.is_finite() && fringe > 0.0 {
+        fringe
+    } else {
+        0.0
+    };
     if softness <= 0.0 && fringe <= 0.0 {
         return if dist <= edge { 1.0 } else { 0.0 };
     }
@@ -80,7 +142,11 @@ pub fn coverage(dist: f32, radius: f32, softness: f32, fringe: f32) -> f32 {
     let span = (edge - inner).max(0.001);
     let cover = ((edge - dist) / span).clamp(0.0, 1.0);
     if fringe <= 0.0 {
-        if cover >= 0.5 { 1.0 } else { 0.0 }
+        if cover >= 0.5 {
+            1.0
+        } else {
+            0.0
+        }
     } else {
         cover
     }
@@ -98,10 +164,43 @@ fn chunk_index(x: i32, y: i32, chunk: u32) -> (u32, u32) {
     (cx.rem_euclid(4) as u32, cy.rem_euclid(4) as u32)
 }
 
+/// The ordered threshold at this pixel, 0..=1. `bias` slides it: negative keeps
+/// more ink, positive keeps less. Zero bias on Bayer is the original gate.
+pub fn dither_gate(x: i32, y: i32, chunk: u32, pattern: DitherPattern, bias: f32) -> f32 {
+    let step = chunk.max(1) as i32;
+    let limit = match pattern {
+        DitherPattern::Bayer => {
+            let (bx, by) = chunk_index(x, y, chunk);
+            (BAYER[by as usize][bx as usize] as f32 + 0.5) / 16.0
+        }
+        DitherPattern::Bayer8 => {
+            let bx = x.div_euclid(step).rem_euclid(8) as usize;
+            let by = y.div_euclid(step).rem_euclid(8) as usize;
+            (BAYER8[by][bx] as f32 + 0.5) / 64.0
+        }
+        DitherPattern::Checker => {
+            if (x.div_euclid(step) + y.div_euclid(step)) & 1 == 0 {
+                0.25
+            } else {
+                0.75
+            }
+        }
+        DitherPattern::Lines => (y.div_euclid(step).rem_euclid(4) as f32 + 0.5) / 4.0,
+        DitherPattern::Dots => {
+            let cx = x.div_euclid(step);
+            let cy = y.div_euclid(step);
+            let fx = (x - cx * step) as f32 + 0.5;
+            let fy = (y - cy * step) as f32 + 0.5;
+            let mid = step as f32 * 0.5;
+            (fx - mid).hypot(fy - mid) / mid.max(0.5)
+        }
+    };
+    (limit + bias.clamp(-1.0, 1.0) * 0.45).clamp(0.02, 0.98)
+}
+
 /// 0, 1, or 2. The load-gate tones: black, `#444444`, `#CCCCCC`.
-pub fn tone_level(cover: f32, x: i32, y: i32, chunk: u32) -> u8 {
-    let (bx, by) = chunk_index(x, y, chunk);
-    let limit = (BAYER[by as usize][bx as usize] as f32 + 0.5) / 16.0;
+pub fn tone_level(cover: f32, x: i32, y: i32, chunk: u32, pattern: DitherPattern, bias: f32) -> u8 {
+    let limit = dither_gate(x, y, chunk, pattern, bias);
     let scaled = cover.clamp(0.0, 1.0) * 2.0;
     let mut level = scaled.floor();
     if scaled - level > limit {
@@ -110,10 +209,15 @@ pub fn tone_level(cover: f32, x: i32, y: i32, chunk: u32) -> u8 {
     level.clamp(0.0, 2.0) as u8
 }
 
-pub fn dither_keeps(cover: f32, x: i32, y: i32, chunk: u32) -> bool {
-    let (bx, by) = chunk_index(x, y, chunk);
-    let limit = (BAYER[by as usize][bx as usize] as f32 + 0.5) / 16.0;
-    cover > limit
+pub fn dither_keeps(
+    cover: f32,
+    x: i32,
+    y: i32,
+    chunk: u32,
+    pattern: DitherPattern,
+    bias: f32,
+) -> bool {
+    cover > dither_gate(x, y, chunk, pattern, bias)
 }
 
 pub fn stroke_steps(
@@ -126,7 +230,8 @@ pub fn stroke_steps(
     spacing: f32,
 ) -> Vec<(f32, f32, f32)> {
     let distance = (x1 - x0).hypot(y1 - y0);
-    let step = spacing.max(0.5);
+    // Spacing is already inside the brush. The floor only stops a zero step.
+    let step = spacing.max(0.15);
     if distance < step {
         return Vec::new();
     }
@@ -137,7 +242,11 @@ pub fn stroke_steps(
     let mut points = Vec::with_capacity(count as usize);
     for index in 1..=count {
         let mix = ((index as f32) * step / distance).min(1.0);
-        points.push((x0 + (x1 - x0) * mix, y0 + (y1 - y0) * mix, p0 + (p1 - p0) * mix));
+        points.push((
+            x0 + (x1 - x0) * mix,
+            y0 + (y1 - y0) * mix,
+            p0 + (p1 - p0) * mix,
+        ));
     }
     points
 }
@@ -154,6 +263,8 @@ pub struct Stamp {
     pub edge: Edge,
     pub chunk: u32,
     pub tones: bool,
+    pub pattern: DitherPattern,
+    pub bias: f32,
     pub mode: StampMode,
     /// The generating engine. `Grain::plain()` is a bare disc.
     pub grain: Grain,
@@ -161,7 +272,11 @@ pub struct Stamp {
 
 impl Stamp {
     pub fn fringe_used(self) -> f32 {
-        if self.edge == Edge::Hard { 0.0 } else { self.fringe.max(0.0) }
+        if self.edge == Edge::Hard {
+            0.0
+        } else {
+            self.fringe.max(0.0)
+        }
     }
 }
 
@@ -172,7 +287,11 @@ pub fn stamp(buf: &mut [u8], width: u32, height: u32, dab: Stamp) -> bool {
     }
     let fringe = dab.fringe_used();
     let softness = dab.softness.clamp(0.0, 1.0);
-    let pad = if fringe > 0.0 || softness > 0.0 { fringe.max(1.0) } else { 0.0 };
+    let pad = if fringe > 0.0 || softness > 0.0 {
+        fringe.max(1.0)
+    } else {
+        0.0
+    };
     let reach = dab.radius + pad;
     let x0 = (dab.cx - reach).floor().max(0.0) as i32;
     let y0 = (dab.cy - reach).floor().max(0.0) as i32;
@@ -185,7 +304,8 @@ pub fn stamp(buf: &mut [u8], width: u32, height: u32, dab: Stamp) -> bool {
     for y in y0..y1 {
         for x in x0..x1 {
             let dist = ((x as f32 + 0.5) - dab.cx).hypot((y as f32 + 0.5) - dab.cy);
-            let mut cover = coverage(dist, dab.radius, softness, fringe) * dab.opacity.clamp(0.0, 1.0);
+            let mut cover =
+                coverage(dist, dab.radius, softness, fringe) * dab.opacity.clamp(0.0, 1.0);
             if cover <= 0.0 {
                 continue;
             }
@@ -202,11 +322,11 @@ pub fn stamp(buf: &mut [u8], width: u32, height: u32, dab: Stamp) -> bool {
             }
             if dab.edge == Edge::Dither {
                 if dab.tones {
-                    let level = tone_level(cover, x, y, dab.chunk);
+                    let level = tone_level(cover, x, y, dab.chunk, dab.pattern, dab.bias);
                     let tone = TONE[level as usize];
                     color = Rgba::rgb(tone[0], tone[1], tone[2]);
                     cover = 1.0;
-                } else if dither_keeps(cover, x, y, dab.chunk) {
+                } else if dither_keeps(cover, x, y, dab.chunk, dab.pattern, dab.bias) {
                     cover = 1.0;
                 } else {
                     continue;
@@ -225,7 +345,12 @@ pub fn stamp(buf: &mut [u8], width: u32, height: u32, dab: Stamp) -> bool {
 pub fn shade(color: Rgba, amount: f32) -> Rgba {
     let shift = amount.clamp(-1.0, 1.0) * 255.0;
     let ch = |value: u8| rint_u8((f32::from(value) + shift).clamp(0.0, 255.0));
-    Rgba { r: ch(color.r), g: ch(color.g), b: ch(color.b), a: color.a }
+    Rgba {
+        r: ch(color.r),
+        g: ch(color.g),
+        b: ch(color.b),
+        a: color.a,
+    }
 }
 
 fn write_pixel(pixel: &mut [u8], color: Rgba, cover: f32, mode: StampMode) -> bool {
@@ -245,7 +370,11 @@ fn write_pixel(pixel: &mut [u8], color: Rgba, cover: f32, mode: StampMode) -> bo
             pixel.copy_from_slice(&out.channels());
         }
         StampMode::Over => {
-            let out = source_over(Rgba::new(before[0], before[1], before[2], before[3]), color, cover);
+            let out = source_over(
+                Rgba::new(before[0], before[1], before[2], before[3]),
+                color,
+                cover,
+            );
             pixel.copy_from_slice(&out.channels());
         }
     }
@@ -327,8 +456,16 @@ fn noise(x: f32, y: f32, z: f32) -> f32 {
     let fz = fade(z - iz as f32);
     let at = |dx: i32, dy: i32, dz: i32| hash_cell(ix + dx, iy + dy, iz + dz);
     let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
-    let front = lerp(lerp(at(0, 0, 0), at(1, 0, 0), fx), lerp(at(0, 1, 0), at(1, 1, 0), fx), fy);
-    let back = lerp(lerp(at(0, 0, 1), at(1, 0, 1), fx), lerp(at(0, 1, 1), at(1, 1, 1), fx), fy);
+    let front = lerp(
+        lerp(at(0, 0, 0), at(1, 0, 0), fx),
+        lerp(at(0, 1, 0), at(1, 1, 0), fx),
+        fy,
+    );
+    let back = lerp(
+        lerp(at(0, 0, 1), at(1, 0, 1), fx),
+        lerp(at(0, 1, 1), at(1, 1, 1), fx),
+        fy,
+    );
     lerp(front, back, fz)
 }
 
@@ -355,7 +492,9 @@ mod tests {
     use super::*;
 
     fn row(buf: &[u8], width: u32, y: u32) -> Vec<u8> {
-        (0..width).map(|x| buf[((y * width + x) * 4 + 3) as usize]).collect()
+        (0..width)
+            .map(|x| buf[((y * width + x) * 4 + 3) as usize])
+            .collect()
     }
 
     #[test]
@@ -363,61 +502,102 @@ mod tests {
         let mut hard = vec![0u8; 24 * 24 * 4];
         let mut soft = vec![0u8; 24 * 24 * 4];
         let color = Rgba::rgb(255, 255, 255);
-        stamp(&mut hard, 24, 24, Stamp {
-            cx: 12.0,
-            cy: 12.0,
-            radius: 4.0,
-            softness: 0.0,
-            fringe: 0.0,
-            opacity: 1.0,
-            color,
-            edge: Edge::Hard,
-            chunk: 1,
-            tones: false,
-            mode: StampMode::Over,
-            grain: Grain::plain(),
-        });
-        stamp(&mut soft, 24, 24, Stamp {
-            cx: 12.0,
-            cy: 12.0,
-            radius: 4.0,
-            softness: 0.0,
-            fringe: 0.5,
-            opacity: 1.0,
-            color,
-            edge: Edge::Smooth,
-            chunk: 1,
-            tones: false,
-            mode: StampMode::Over,
-            grain: Grain::plain(),
-        });
+        stamp(
+            &mut hard,
+            24,
+            24,
+            Stamp {
+                cx: 12.0,
+                cy: 12.0,
+                radius: 4.0,
+                softness: 0.0,
+                fringe: 0.0,
+                opacity: 1.0,
+                color,
+                edge: Edge::Hard,
+                chunk: 1,
+                tones: false,
+                pattern: DitherPattern::Bayer,
+                bias: 0.0,
+                mode: StampMode::Over,
+                grain: Grain::plain(),
+            },
+        );
+        stamp(
+            &mut soft,
+            24,
+            24,
+            Stamp {
+                cx: 12.0,
+                cy: 12.0,
+                radius: 4.0,
+                softness: 0.0,
+                fringe: 0.5,
+                opacity: 1.0,
+                color,
+                edge: Edge::Smooth,
+                chunk: 1,
+                tones: false,
+                pattern: DitherPattern::Bayer,
+                bias: 0.0,
+                mode: StampMode::Over,
+                grain: Grain::plain(),
+            },
+        );
         assert_eq!(
             row(&hard, 24, 12),
-            vec![0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0]
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0,
+                0, 0
+            ]
         );
         assert_eq!(
             row(&soft, 24, 12),
-            vec![0, 0, 0, 0, 0, 0, 0, 0, 246, 255, 255, 255, 255, 255, 255, 246, 0, 0, 0, 0, 0, 0, 0, 0]
+            vec![
+                0, 0, 0, 0, 0, 0, 0, 0, 246, 255, 255, 255, 255, 255, 255, 246, 0, 0, 0, 0, 0, 0,
+                0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn bayer_at_zero_bias_is_the_original_gate_and_a_pattern_can_disagree() {
+        assert!((dither_gate(0, 0, 1, DitherPattern::Bayer, 0.0) - 0.5 / 16.0).abs() < 1e-5);
+        assert!(dither_keeps(0.5, 0, 0, 1, DitherPattern::Bayer, 0.0));
+        assert!(!dither_keeps(0.5, 1, 0, 1, DitherPattern::Bayer, 0.0));
+        let bayer = dither_keeps(0.4, 1, 0, 1, DitherPattern::Bayer, 0.0);
+        let dots = dither_keeps(0.4, 1, 0, 1, DitherPattern::Dots, 0.0);
+        assert_ne!(bayer, dots);
+        assert!(
+            dither_gate(0, 0, 1, DitherPattern::Bayer, -1.0)
+                < dither_gate(0, 0, 1, DitherPattern::Bayer, 1.0)
         );
     }
 
     #[test]
     fn dither_is_ink_or_clear() {
         let mut buf = vec![0u8; 32 * 32 * 4];
-        stamp(&mut buf, 32, 32, Stamp {
-            cx: 16.0,
-            cy: 16.0,
-            radius: 10.0,
-            softness: 0.8,
-            fringe: 1.0,
-            opacity: 1.0,
-            color: Rgba::rgb(255, 0, 0),
-            edge: Edge::Dither,
-            chunk: 2,
-            tones: false,
-            mode: StampMode::Over,
-            grain: Grain::plain(),
-        });
+        stamp(
+            &mut buf,
+            32,
+            32,
+            Stamp {
+                cx: 16.0,
+                cy: 16.0,
+                radius: 10.0,
+                softness: 0.8,
+                fringe: 1.0,
+                opacity: 1.0,
+                color: Rgba::rgb(255, 0, 0),
+                edge: Edge::Dither,
+                chunk: 2,
+                tones: false,
+                pattern: DitherPattern::Bayer,
+                bias: 0.0,
+                mode: StampMode::Over,
+                grain: Grain::plain(),
+            },
+        );
         for pixel in buf.chunks(4) {
             assert!(pixel[3] == 0 || pixel[3] == 255, "{pixel:?}");
             if pixel[3] == 255 {

@@ -8,7 +8,7 @@
 //! cell. A rest is `---`. A red needle marks the exact frame.
 
 use eframe::egui;
-use vmi_core::anim::{frame_map, timeline_cels, xsheet_columns, XColumn};
+use vmi_core::anim::{frame_map, timeline_cels, XColumn};
 use vmi_core::{find, Theme};
 
 use crate::desk::Desk;
@@ -18,8 +18,8 @@ pub const CELL_W: f32 = 44.0;
 pub const CELL_H: f32 = 16.0;
 pub const HEAD: f32 = 18.0;
 pub const FRAME_W: f32 = 32.0;
-/// Film geometry: a frame is this wide, a lane is a cell tall.
-pub const FILM_W: f32 = 18.0;
+/// Film geometry: a frame is wide enough for a three-digit hex slot.
+pub const FILM_W: f32 = 32.0;
 pub const LANE_NAME_W: f32 = 56.0;
 /// The needle.
 pub const RED: egui::Color32 = egui::Color32::from_rgb(0xff, 0x2a, 0x2a);
@@ -58,16 +58,33 @@ pub enum Drag {
     /// The pointer is scrubbing the ruler.
     Scrub,
     /// A key cell is being moved along time.
-    Key { folder: String, cel: String, from: u32, to: u32 },
+    Key {
+        folder: String,
+        cel: String,
+        from: u32,
+        to: u32,
+    },
     /// A range is being picked in one column.
     Pick { folder: String, anchor: u32 },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SheetState {
     pub drag: Option<Drag>,
     /// The frame the view last scrolled to keep in sight.
     pub kept: Option<u32>,
+    /// 1 is the normal cell. Smaller shows a longer cut on the same grid.
+    pub zoom: f32,
+}
+
+impl Default for SheetState {
+    fn default() -> Self {
+        Self {
+            drag: None,
+            kept: None,
+            zoom: 1.0,
+        }
+    }
 }
 
 /// What a click or drag on the sheet asks the desk to do.
@@ -75,22 +92,50 @@ pub struct SheetState {
 pub enum Act {
     SetFrame(u32),
     /// Show and select the cel a level holds at a frame.
-    Pick { folder: String, frame: u32 },
+    Pick {
+        folder: String,
+        frame: u32,
+    },
     /// Pick a range of cells in one column, for the command menu.
-    Range { folder: String, start: u32, count: u32 },
-    MoveCel { folder: String, cel: String, start: u32 },
-    NewCel { folder: String, frame: u32 },
-    DeleteCel { folder: String, cel: String },
+    Range {
+        folder: String,
+        start: u32,
+        count: u32,
+    },
+    MoveCel {
+        folder: String,
+        cel: String,
+        start: u32,
+    },
+    NewCel {
+        folder: String,
+        frame: u32,
+    },
+    DeleteCel {
+        folder: String,
+        cel: String,
+    },
     /// An exposure command on the picked range.
-    Command { folder: String, name: &'static str, start: u32, count: u32, arg: i64 },
+    Command {
+        folder: String,
+        name: &'static str,
+        start: u32,
+        count: u32,
+        arg: i64,
+    },
     /// Shift+F with nothing picked: a frame after the selected drawing.
     NewFrame,
     /// Layer > Animation folder on the selected folder.
     AnimateSelected,
+    /// Open a clip. The sheet becomes that folder's frames.
+    Enter(String),
+    /// Step out of the clip. The cut is the sheet when nothing is left above.
+    Leave,
 }
 
-/// One row of one column, in KoolDraw's grammar: a key that prints its
-/// drawing number, a held cell, or a rest.
+/// One row of one column, in KoolDraw's grammar: a key, a held cell, or a rest.
+/// The painted label is the frame slot in hex. `number` is the drawing's place
+/// in the pool, kept so the sheet grammar test can still read that order.
 #[derive(Clone, Debug, Default)]
 struct Row {
     /// The cel the level shows here, when the row stands for one.
@@ -99,7 +144,8 @@ struct Row {
     filled: bool,
     /// This frame starts the drawing.
     key: bool,
-    /// The drawing number a key prints, from 1.
+    /// Drawing order in the pool, from 1. The cell paints the slot, not this.
+    #[allow(dead_code)]
     number: Option<usize>,
 }
 
@@ -110,7 +156,6 @@ struct CellInfo<'a> {
     cel: Option<&'a str>,
     filled: bool,
     key: bool,
-    number: Option<usize>,
 }
 
 /// The rows of one column. A folder without a stored exposure sheet reads
@@ -147,7 +192,13 @@ fn rows_of(column: &XColumn, folder: Option<&vmi_core::Node>, rows: u32) -> Vec<
         return out;
     }
     let numbers: std::collections::HashMap<String, usize> = folder
-        .map(|folder| timeline_cels(folder).iter().enumerate().map(|(index, cel)| (cel.id.clone(), index + 1)).collect())
+        .map(|folder| {
+            timeline_cels(folder)
+                .iter()
+                .enumerate()
+                .map(|(index, cel)| (cel.id.clone(), index + 1))
+                .collect()
+        })
         .unwrap_or_default();
     for frame in 0..rows as usize {
         let cel = column.cells.get(frame).cloned().flatten();
@@ -162,10 +213,17 @@ fn rows_of(column: &XColumn, folder: Option<&vmi_core::Node>, rows: u32) -> Vec<
 }
 
 /// Draw the sheet in `mode` and hand back what the pointer asked for.
-pub fn show(ui: &mut egui::Ui, desk: &Desk, state: &mut SheetState, mode: Mode, theme: &Theme) -> Vec<Act> {
+pub fn show(
+    ui: &mut egui::Ui,
+    desk: &Desk,
+    state: &mut SheetState,
+    mode: Mode,
+    theme: &Theme,
+) -> Vec<Act> {
     let mut acts = Vec::new();
-    let end = desk.cut_end();
-    let mut columns = xsheet_columns(&desk.art.layers, end);
+    clip_bar(ui, desk, state, theme, &mut acts);
+    let end = desk.sheet_len();
+    let mut columns = desk.sheet_columns();
     // Front level first. The document lists the back first.
     columns.reverse();
     if columns.is_empty() {
@@ -181,20 +239,80 @@ pub fn show(ui: &mut egui::Ui, desk: &Desk, state: &mut SheetState, mode: Mode, 
         .unwrap_or(0)
         .max(end)
         .max(1);
-    let grid: Vec<Vec<Row>> =
-        columns.iter().map(|column| rows_of(column, find(&desk.art.layers, &column.folder_id), rows)).collect();
+    let grid: Vec<Vec<Row>> = columns
+        .iter()
+        .map(|column| rows_of(column, find(&desk.art.layers, &column.folder_id), rows))
+        .collect();
     let drawn = mode.resolve(ui.ctx().screen_rect().size());
+    let zoom = state.zoom.clamp(0.35, 1.6);
     match drawn {
-        Mode::Film => film(ui, desk, state, theme, &columns, &grid, rows, &mut acts),
-        _ => xsheet(ui, desk, state, theme, &columns, &grid, rows, &mut acts),
+        Mode::Film => film(
+            ui, desk, state, theme, &columns, &grid, rows, zoom, &mut acts,
+        ),
+        _ => xsheet(
+            ui, desk, state, theme, &columns, &grid, rows, zoom, &mut acts,
+        ),
     }
     acts
+}
+
+/// The cut, or the clip we are inside, plus the sheet zoom.
+fn clip_bar(
+    ui: &mut egui::Ui,
+    desk: &Desk,
+    state: &mut SheetState,
+    theme: &Theme,
+    acts: &mut Vec<Act>,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
+        if let Some(name) = desk.clip_label() {
+            ui.label(
+                egui::RichText::new(name)
+                    .monospace()
+                    .small()
+                    .color(rgb(theme.ink)),
+            );
+            if ui
+                .small_button("OUT")
+                .on_hover_text("Leave this clip. The cut is the longer timeline.")
+                .clicked()
+            {
+                acts.push(Act::Leave);
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("CUT")
+                    .monospace()
+                    .small()
+                    .color(rgb(theme.quiet)),
+            );
+        }
+        if ui
+            .small_button("-")
+            .on_hover_text("Zoom the sheet out. A long cut stays one grid.")
+            .clicked()
+        {
+            state.zoom = (state.zoom / 1.25).clamp(0.35, 1.6);
+        }
+        if ui
+            .small_button("+")
+            .on_hover_text("Zoom the sheet in.")
+            .clicked()
+        {
+            state.zoom = (state.zoom * 1.25).clamp(0.35, 1.6);
+        }
+    });
 }
 
 /// Nothing animated yet. The two ways in are the Layer menu's: New frame
 /// wraps the selected drawing as frame 1, Animation folder marks a folder.
 fn empty_sheet(ui: &mut egui::Ui, desk: &Desk, theme: &Theme, acts: &mut Vec<Act>) {
-    ui.label(egui::RichText::new("No animation yet.").color(rgb(theme.soft)).monospace());
+    ui.label(
+        egui::RichText::new("No animation yet.")
+            .color(rgb(theme.soft))
+            .monospace(),
+    );
     let selected_group = desk
         .selected
         .as_deref()
@@ -216,14 +334,28 @@ fn empty_sheet(ui: &mut egui::Ui, desk: &Desk, theme: &Theme, acts: &mut Vec<Act
         }
     });
     ui.label(
-        egui::RichText::new("Or right-click a folder in Layers and choose Animation.").color(rgb(theme.quiet)).small(),
+        egui::RichText::new("Or right-click a folder in Layers and choose Animation.")
+            .color(rgb(theme.quiet))
+            .small(),
     );
 }
 
 fn cell_info<'a>(column: &'a XColumn, grid: &'a [Row], frame: u32) -> CellInfo<'a> {
     match grid.get(frame as usize) {
-        Some(row) => CellInfo { column, frame, cel: row.cel.as_deref(), filled: row.filled, key: row.key, number: row.number },
-        None => CellInfo { column, frame, cel: None, filled: false, key: false, number: None },
+        Some(row) => CellInfo {
+            column,
+            frame,
+            cel: row.cel.as_deref(),
+            filled: row.filled,
+            key: row.key,
+        },
+        None => CellInfo {
+            column,
+            frame,
+            cel: None,
+            filled: false,
+            key: false,
+        },
     }
 }
 
@@ -236,20 +368,37 @@ fn xsheet(
     columns: &[XColumn],
     grid: &[Vec<Row>],
     rows: u32,
+    zoom: f32,
     acts: &mut Vec<Act>,
 ) {
-    let playhead = desk.art.playhead;
-    let width = FRAME_W + columns.len() as f32 * CELL_W;
-    let height = HEAD + rows as f32 * CELL_H;
-    let scroll = egui::ScrollArea::both().id_salt("xsheet").auto_shrink([false, false]);
+    let cell_w = CELL_W * zoom;
+    let cell_h = (CELL_H * zoom).max(8.0);
+    let playhead = desk.local_playhead();
+    let width = FRAME_W + columns.len() as f32 * cell_w;
+    let height = HEAD + rows as f32 * cell_h;
+    let scroll = egui::ScrollArea::both()
+        .id_salt("xsheet")
+        .auto_shrink([false, false]);
     scroll.show(ui, |ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(ui.available_width()), height), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(width.max(ui.available_width()), height),
+            egui::Sense::hover(),
+        );
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, rgb(theme.field));
         // Header: level names, front first.
         for (index, column) in columns.iter().enumerate() {
-            let x = rect.min.x + FRAME_W + index as f32 * CELL_W;
-            let head = egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(CELL_W, HEAD));
+            let x = rect.min.x + FRAME_W + index as f32 * cell_w;
+            let head =
+                egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(cell_w, HEAD));
+            let head_response = ui.interact(
+                head,
+                ui.id().with(("col", &column.folder_id)),
+                egui::Sense::click(),
+            );
+            if head_response.double_clicked() {
+                acts.push(Act::Enter(column.folder_id.clone()));
+            }
             let selected = desk.selected.as_deref() == Some(column.folder_id.as_str())
                 || desk
                     .selected
@@ -257,7 +406,11 @@ fn xsheet(
                     .and_then(|id| vmi_core::anim::owning_animation(&desk.art.layers, id))
                     .as_deref()
                     == Some(column.folder_id.as_str());
-            let color = if selected { rgb(theme.ink) } else { rgb(theme.soft) };
+            let color = if selected {
+                rgb(theme.ink)
+            } else {
+                rgb(theme.soft)
+            };
             painter.text(
                 head.center(),
                 egui::Align2::CENTER_CENTER,
@@ -271,17 +424,24 @@ fn xsheet(
             );
         }
         painter.line_segment(
-            [egui::pos2(rect.min.x, rect.min.y + HEAD), egui::pos2(rect.min.x + width, rect.min.y + HEAD)],
+            [
+                egui::pos2(rect.min.x, rect.min.y + HEAD),
+                egui::pos2(rect.min.x + width, rect.min.y + HEAD),
+            ],
             egui::Stroke::new(1.0_f32, rgb(theme.rule)),
         );
-        // Frame numbers down the left, from 1. Dragging them scrubs.
+        // Frame slots down the left, `000` then `001`. Dragging them scrubs.
         let ruler = egui::Rect::from_min_size(
             egui::pos2(rect.min.x, rect.min.y + HEAD),
-            egui::vec2(FRAME_W, rows as f32 * CELL_H),
+            egui::vec2(FRAME_W, rows as f32 * cell_h),
         );
-        let ruler_response = ui.interact(ruler, ui.id().with("xsheet-ruler"), egui::Sense::click_and_drag());
+        let ruler_response = ui.interact(
+            ruler,
+            ui.id().with("xsheet-ruler"),
+            egui::Sense::click_and_drag(),
+        );
         for frame in 0..rows {
-            let y = rect.min.y + HEAD + frame as f32 * CELL_H;
+            let y = rect.min.y + HEAD + frame as f32 * cell_h;
             let here = frame == playhead;
             let color = if here {
                 rgb(theme.ink)
@@ -291,15 +451,18 @@ fn xsheet(
                 rgb(theme.quiet)
             };
             painter.text(
-                egui::pos2(rect.min.x + FRAME_W - 4.0, y + CELL_H * 0.5),
+                egui::pos2(rect.min.x + FRAME_W - 4.0, y + cell_h * 0.5),
                 egui::Align2::RIGHT_CENTER,
-                format!("{:>3}", frame + 1),
+                vmi_core::slot_hex(frame),
                 egui::FontId::monospace(10.0),
                 color,
             );
             if frame % 4 == 0 {
                 painter.line_segment(
-                    [egui::pos2(rect.min.x + FRAME_W, y), egui::pos2(rect.min.x + width, y)],
+                    [
+                        egui::pos2(rect.min.x + FRAME_W, y),
+                        egui::pos2(rect.min.x + width, y),
+                    ],
                     egui::Stroke::new(1.0_f32, rgb(theme.rule)),
                 );
             }
@@ -309,7 +472,7 @@ fn xsheet(
         }
         if matches!(state.drag, Some(Drag::Scrub)) {
             if let Some(pos) = ruler_response.interact_pointer_pos() {
-                let frame = ((pos.y - ruler.min.y) / CELL_H).floor().max(0.0) as u32;
+                let frame = ((pos.y - ruler.min.y) / cell_h).floor().max(0.0) as u32;
                 acts.push(Act::SetFrame(frame.min(rows - 1)));
             }
             if !ui.input(|input| input.pointer.primary_down()) {
@@ -318,25 +481,30 @@ fn xsheet(
         }
         // Cells.
         for (index, column) in columns.iter().enumerate() {
-            let x = rect.min.x + FRAME_W + index as f32 * CELL_W;
+            let x = rect.min.x + FRAME_W + index as f32 * cell_w;
             for frame in 0..rows {
-                let y = rect.min.y + HEAD + frame as f32 * CELL_H;
-                let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CELL_W, CELL_H));
+                let y = rect.min.y + HEAD + frame as f32 * cell_h;
+                let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w, cell_h));
                 let info = cell_info(column, &grid[index], frame);
                 cell_interact(ui, desk, state, theme, &painter, cell, &info, true, acts);
             }
         }
         // The needle: a red line across the exact frame.
-        let y = rect.min.y + HEAD + playhead as f32 * CELL_H;
+        let y = rect.min.y + HEAD + playhead as f32 * cell_h;
         painter.line_segment(
             [egui::pos2(rect.min.x, y), egui::pos2(rect.min.x + width, y)],
             egui::Stroke::new(1.0_f32, RED),
         );
-        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(rect.min.x, y - 1.0), egui::vec2(3.0, 3.0)), 0.0, RED);
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(rect.min.x, y - 1.0), egui::vec2(3.0, 3.0)),
+            0.0,
+            RED,
+        );
         // Keep the playhead in sight. Only then does the view move.
         if state.kept != Some(playhead) {
             state.kept = Some(playhead);
-            let row = egui::Rect::from_min_size(egui::pos2(rect.min.x, y), egui::vec2(FRAME_W, CELL_H));
+            let row =
+                egui::Rect::from_min_size(egui::pos2(rect.min.x, y), egui::vec2(FRAME_W, cell_h));
             ui.scroll_to_rect(row, None);
         }
     });
@@ -351,36 +519,52 @@ fn film(
     columns: &[XColumn],
     grid: &[Vec<Row>],
     rows: u32,
+    zoom: f32,
     acts: &mut Vec<Act>,
 ) {
-    let playhead = desk.art.playhead;
+    let film_w = FILM_W * zoom;
+    let cell_h = (CELL_H * zoom).max(8.0);
+    let playhead = desk.local_playhead();
     let frames = rows;
-    let width = LANE_NAME_W + frames as f32 * FILM_W;
-    let height = HEAD + columns.len() as f32 * CELL_H;
-    let scroll = egui::ScrollArea::both().id_salt("film").auto_shrink([false, false]);
+    let width = LANE_NAME_W + frames as f32 * film_w;
+    let height = HEAD + columns.len() as f32 * cell_h;
+    let scroll = egui::ScrollArea::both()
+        .id_salt("film")
+        .auto_shrink([false, false]);
     scroll.show(ui, |ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height.max(ui.available_height())), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(width, height.max(ui.available_height())),
+            egui::Sense::hover(),
+        );
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, rgb(theme.field));
         // Ruler along the top. Dragging it scrubs.
         let ruler = egui::Rect::from_min_size(
             egui::pos2(rect.min.x + LANE_NAME_W, rect.min.y),
-            egui::vec2(frames as f32 * FILM_W, HEAD),
+            egui::vec2(frames as f32 * film_w, HEAD),
         );
-        let ruler_response = ui.interact(ruler, ui.id().with("film-ruler"), egui::Sense::click_and_drag());
+        let ruler_response = ui.interact(
+            ruler,
+            ui.id().with("film-ruler"),
+            egui::Sense::click_and_drag(),
+        );
         for frame in 0..frames {
-            let x = rect.min.x + LANE_NAME_W + frame as f32 * FILM_W;
+            let x = rect.min.x + LANE_NAME_W + frame as f32 * film_w;
             let here = frame == playhead;
-            if here || frame % 4 == 0 {
-                let color = if here { rgb(theme.ink) } else { rgb(theme.soft) };
-                painter.text(
-                    egui::pos2(x + FILM_W * 0.5, rect.min.y + HEAD * 0.5),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{}", frame + 1),
-                    egui::FontId::monospace(9.0),
-                    color,
-                );
-            }
+            let color = if here {
+                rgb(theme.ink)
+            } else if frame % 4 == 0 {
+                rgb(theme.soft)
+            } else {
+                rgb(theme.quiet)
+            };
+            painter.text(
+                egui::pos2(x + film_w * 0.5, rect.min.y + HEAD * 0.5),
+                egui::Align2::CENTER_CENTER,
+                vmi_core::slot_hex(frame),
+                egui::FontId::monospace(9.0),
+                color,
+            );
             if frame % 4 == 0 {
                 painter.line_segment(
                     [egui::pos2(x, rect.min.y + HEAD), egui::pos2(x, rect.max.y)],
@@ -393,7 +577,7 @@ fn film(
         }
         if matches!(state.drag, Some(Drag::Scrub)) {
             if let Some(pos) = ruler_response.interact_pointer_pos() {
-                let frame = ((pos.x - ruler.min.x) / FILM_W).floor().max(0.0) as u32;
+                let frame = ((pos.x - ruler.min.x) / film_w).floor().max(0.0) as u32;
                 acts.push(Act::SetFrame(frame.min(frames - 1)));
             }
             if !ui.input(|input| input.pointer.primary_down()) {
@@ -402,11 +586,23 @@ fn film(
         }
         // Lanes, front first.
         for (index, column) in columns.iter().enumerate() {
-            let y = rect.min.y + HEAD + index as f32 * CELL_H;
+            let y = rect.min.y + HEAD + index as f32 * cell_h;
             painter.line_segment(
                 [egui::pos2(rect.min.x, y), egui::pos2(rect.min.x + width, y)],
                 egui::Stroke::new(1.0_f32, rgb(theme.rule)),
             );
+            let name_rect = egui::Rect::from_min_size(
+                egui::pos2(rect.min.x, y),
+                egui::vec2(LANE_NAME_W, cell_h),
+            );
+            let name_response = ui.interact(
+                name_rect,
+                ui.id().with(("lane", &column.folder_id)),
+                egui::Sense::click(),
+            );
+            if name_response.double_clicked() {
+                acts.push(Act::Enter(column.folder_id.clone()));
+            }
             let selected = desk.selected.as_deref() == Some(column.folder_id.as_str())
                 || desk
                     .selected
@@ -414,31 +610,40 @@ fn film(
                     .and_then(|id| vmi_core::anim::owning_animation(&desk.art.layers, id))
                     .as_deref()
                     == Some(column.folder_id.as_str());
-            let color = if selected { rgb(theme.ink) } else { rgb(theme.soft) };
+            let color = if selected {
+                rgb(theme.ink)
+            } else {
+                rgb(theme.soft)
+            };
             painter.text(
-                egui::pos2(rect.min.x + 4.0, y + CELL_H * 0.5),
+                egui::pos2(rect.min.x + 4.0, y + cell_h * 0.5),
                 egui::Align2::LEFT_CENTER,
                 clip_name(&column.name, 7),
                 egui::FontId::monospace(10.0),
                 color,
             );
             for frame in 0..frames {
-                let x = rect.min.x + LANE_NAME_W + frame as f32 * FILM_W;
-                let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(FILM_W, CELL_H));
+                let x = rect.min.x + LANE_NAME_W + frame as f32 * film_w;
+                let cell = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(film_w, cell_h));
                 let info = cell_info(column, &grid[index], frame);
                 cell_interact(ui, desk, state, theme, &painter, cell, &info, false, acts);
             }
         }
         // The needle.
-        let x = rect.min.x + LANE_NAME_W + playhead as f32 * FILM_W;
+        let x = rect.min.x + LANE_NAME_W + playhead as f32 * film_w;
         painter.line_segment(
             [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
             egui::Stroke::new(1.0_f32, RED),
         );
-        painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x - 1.0, rect.min.y), egui::vec2(3.0, 3.0)), 0.0, RED);
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x - 1.0, rect.min.y), egui::vec2(3.0, 3.0)),
+            0.0,
+            RED,
+        );
         if state.kept != Some(playhead) {
             state.kept = Some(playhead);
-            let col = egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(FILM_W, HEAD));
+            let col =
+                egui::Rect::from_min_size(egui::pos2(x, rect.min.y), egui::vec2(film_w, HEAD));
             ui.scroll_to_rect(col, None);
         }
     });
@@ -463,24 +668,40 @@ fn cell_interact(
     let picked = desk
         .sheet_pick
         .as_ref()
-        .map(|pick| pick.folder == folder && info.frame >= pick.start && info.frame < pick.start + pick.count)
+        .map(|pick| {
+            pick.folder == folder
+                && info.frame >= pick.start
+                && info.frame < pick.start + pick.count
+        })
         .unwrap_or(false);
     let moving = match &state.drag {
-        Some(Drag::Key { folder: f, cel, to, .. }) => f == folder && Some(cel.as_str()) == info.cel && *to == info.frame,
+        Some(Drag::Key {
+            folder: f, cel, to, ..
+        }) => f == folder && Some(cel.as_str()) == info.cel && *to == info.frame,
         _ => false,
     };
     if picked {
         painter.rect_filled(cell.shrink(0.5), 0.0, rgb(theme.row));
-        painter.rect_stroke(cell.shrink(0.5), 0.0, egui::Stroke::new(1.0_f32, rgb(theme.ink)));
+        painter.rect_stroke(
+            cell.shrink(0.5),
+            0.0,
+            egui::Stroke::new(1.0_f32, rgb(theme.ink)),
+        );
     } else if response.hovered() {
         painter.rect_filled(cell.shrink(0.5), 0.0, rgb(theme.row));
     }
     let font = egui::FontId::monospace(10.0);
     match (info.filled, info.key) {
         (true, true) => {
-            let text = info.number.map(|n| format!("{n:02}")).unwrap_or_else(|| "??".into());
+            let text = vmi_core::slot_hex(info.frame);
             let color = if moving { RED } else { rgb(theme.ink) };
-            painter.text(cell.center(), egui::Align2::CENTER_CENTER, text, font, color);
+            painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                font,
+                color,
+            );
         }
         (true, false) => {
             // A hold. Dotted down the sheet, dashes along the film.
@@ -489,43 +710,87 @@ fn cell_interact(
                 let x = cell.center().x.round() + 0.5;
                 let mut y = cell.min.y + 2.0;
                 while y < cell.max.y - 1.0 {
-                    painter.line_segment([egui::pos2(x, y), egui::pos2(x, y + 2.0)], egui::Stroke::new(1.0_f32, color));
+                    painter.line_segment(
+                        [egui::pos2(x, y), egui::pos2(x, y + 2.0)],
+                        egui::Stroke::new(1.0_f32, color),
+                    );
                     y += 4.0;
                 }
             } else {
                 let y = cell.center().y.round() + 0.5;
                 let mut x = cell.min.x + 2.0;
                 while x < cell.max.x - 1.0 {
-                    painter.line_segment([egui::pos2(x, y), egui::pos2(x + 2.0, y)], egui::Stroke::new(1.0_f32, color));
+                    painter.line_segment(
+                        [egui::pos2(x, y), egui::pos2(x + 2.0, y)],
+                        egui::Stroke::new(1.0_f32, color),
+                    );
                     x += 4.0;
                 }
             }
         }
         (false, _) => {
-            painter.text(cell.center(), egui::Align2::CENTER_CENTER, "---", font, rgb(theme.quiet));
+            painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                "---",
+                font,
+                rgb(theme.quiet),
+            );
         }
     }
     // Hover names the cel.
     if response.hovered() {
         if let Some(cel) = info.cel {
             if let Some(node) = find(&desk.art.layers, cel) {
-                response.clone().on_hover_text(format!("{}  frame {}", node.name, info.frame + 1));
+                response.clone().on_hover_text(format!(
+                    "{}  {}",
+                    node.name,
+                    vmi_core::slot_hex(info.frame)
+                ));
             }
         }
     }
     let shift = ui.input(|input| input.modifiers.shift);
+    if response.double_clicked() {
+        if let Some(cel) = info.cel {
+            if let Some(node) = find(&desk.art.layers, cel) {
+                if !node.is_layer() && node.animation {
+                    acts.push(Act::Enter(cel.to_string()));
+                }
+            }
+        }
+    }
     if response.clicked() {
         if shift {
-            if let Some(pick) = desk.sheet_pick.as_ref().filter(|pick| pick.folder == folder) {
+            if let Some(pick) = desk
+                .sheet_pick
+                .as_ref()
+                .filter(|pick| pick.folder == folder)
+            {
                 let (start, last) = (pick.start.min(info.frame), pick.start.max(info.frame));
-                acts.push(Act::Range { folder: folder.to_string(), start, count: last - start + 1 });
+                acts.push(Act::Range {
+                    folder: folder.to_string(),
+                    start,
+                    count: last - start + 1,
+                });
             } else {
-                acts.push(Act::Range { folder: folder.to_string(), start: info.frame, count: 1 });
+                acts.push(Act::Range {
+                    folder: folder.to_string(),
+                    start: info.frame,
+                    count: 1,
+                });
             }
         } else {
             acts.push(Act::SetFrame(info.frame));
-            acts.push(Act::Pick { folder: folder.to_string(), frame: info.frame });
-            acts.push(Act::Range { folder: folder.to_string(), start: info.frame, count: 1 });
+            acts.push(Act::Pick {
+                folder: folder.to_string(),
+                frame: info.frame,
+            });
+            acts.push(Act::Range {
+                folder: folder.to_string(),
+                start: info.frame,
+                count: 1,
+            });
         }
     }
     if response.drag_started() {
@@ -538,28 +803,63 @@ fn cell_interact(
                 to: info.frame,
             });
         } else {
-            state.drag = Some(Drag::Pick { folder: folder.to_string(), anchor: info.frame });
-            acts.push(Act::Range { folder: folder.to_string(), start: info.frame, count: 1 });
+            state.drag = Some(Drag::Pick {
+                folder: folder.to_string(),
+                anchor: info.frame,
+            });
+            acts.push(Act::Range {
+                folder: folder.to_string(),
+                start: info.frame,
+                count: 1,
+            });
         }
     }
     // Any drag that is over this cell right now lands here.
-    let pointer_here = response.hovered() || cell.contains(ui.input(|input| input.pointer.hover_pos()).unwrap_or(egui::pos2(-1.0, -1.0)));
+    let pointer_here = response.hovered()
+        || cell.contains(
+            ui.input(|input| input.pointer.hover_pos())
+                .unwrap_or(egui::pos2(-1.0, -1.0)),
+        );
     if pointer_here && ui.input(|input| input.pointer.primary_down()) {
         match state.drag.clone() {
-            Some(Drag::Key { folder: f, cel, from, to }) if f == folder && to != info.frame => {
-                state.drag = Some(Drag::Key { folder: f, cel, from, to: info.frame });
+            Some(Drag::Key {
+                folder: f,
+                cel,
+                from,
+                to,
+            }) if f == folder && to != info.frame => {
+                state.drag = Some(Drag::Key {
+                    folder: f,
+                    cel,
+                    from,
+                    to: info.frame,
+                });
             }
             Some(Drag::Pick { folder: f, anchor }) if f == folder => {
                 let (start, last) = (anchor.min(info.frame), anchor.max(info.frame));
-                acts.push(Act::Range { folder: folder.to_string(), start, count: last - start + 1 });
+                acts.push(Act::Range {
+                    folder: folder.to_string(),
+                    start,
+                    count: last - start + 1,
+                });
             }
             _ => {}
         }
     }
     if ui.input(|input| input.pointer.any_released()) {
-        if let Some(Drag::Key { folder: f, cel, from, to }) = state.drag.clone() {
+        if let Some(Drag::Key {
+            folder: f,
+            cel,
+            from,
+            to,
+        }) = state.drag.clone()
+        {
             if from != to {
-                acts.push(Act::MoveCel { folder: f, cel, start: to });
+                acts.push(Act::MoveCel {
+                    folder: f,
+                    cel,
+                    start: to,
+                });
             }
             acts.push(Act::SetFrame(to));
             state.drag = None;
@@ -572,31 +872,57 @@ fn cell_interact(
         let pick = desk
             .sheet_pick
             .clone()
-            .filter(|pick| pick.folder == folder && info.frame >= pick.start && info.frame < pick.start + pick.count)
-            .unwrap_or(crate::desk::SheetPick { folder: folder.to_string(), start: info.frame, count: 1 });
+            .filter(|pick| {
+                pick.folder == folder
+                    && info.frame >= pick.start
+                    && info.frame < pick.start + pick.count
+            })
+            .unwrap_or(crate::desk::SheetPick {
+                folder: folder.to_string(),
+                start: info.frame,
+                count: 1,
+            });
         ui.label(
-            egui::RichText::new(format!("{}  frames {}–{}", info.column.name, pick.start + 1, pick.start + pick.count))
-                .monospace()
-                .color(rgb(theme.soft)),
+            egui::RichText::new(format!(
+                "{}  frames {}–{}",
+                info.column.name,
+                vmi_core::slot_hex(pick.start),
+                vmi_core::slot_hex(pick.start + pick.count.saturating_sub(1))
+            ))
+            .monospace()
+            .color(rgb(theme.soft)),
         );
         if ui.button("New frame here").clicked() {
-            acts.push(Act::NewCel { folder: folder.to_string(), frame: info.frame });
+            acts.push(Act::NewCel {
+                folder: folder.to_string(),
+                frame: info.frame,
+            });
             ui.close_menu();
         }
         if let Some(cel) = info.cel {
             if ui.button("Delete this cel").clicked() {
-                acts.push(Act::DeleteCel { folder: folder.to_string(), cel: cel.to_string() });
+                acts.push(Act::DeleteCel {
+                    folder: folder.to_string(),
+                    cel: cel.to_string(),
+                });
                 ui.close_menu();
             }
         }
         ui.separator();
         // The OpenToonz cell commands, with the Python labels and fixed arguments.
-        let command = |ui: &mut egui::Ui, acts: &mut Vec<Act>, label: &str, name: &'static str, arg: i64| {
-            if ui.button(label).clicked() {
-                acts.push(Act::Command { folder: folder.to_string(), name, start: pick.start, count: pick.count, arg });
-                ui.close_menu();
-            }
-        };
+        let command =
+            |ui: &mut egui::Ui, acts: &mut Vec<Act>, label: &str, name: &'static str, arg: i64| {
+                if ui.button(label).clicked() {
+                    acts.push(Act::Command {
+                        folder: folder.to_string(),
+                        name,
+                        start: pick.start,
+                        count: pick.count,
+                        arg,
+                    });
+                    ui.close_menu();
+                }
+            };
         command(ui, acts, "Reverse", "reverse", 0);
         command(ui, acts, "Swing", "swing", 0);
         ui.menu_button("Step", |ui| {
@@ -656,42 +982,75 @@ mod tests {
     fn a_stored_sheet_reads_in_the_same_grammar_as_the_keys() {
         let mut folder = vmi_core::Node::group("f", "Shot");
         folder.animation = true;
-        folder.children = vec![vmi_core::Node::layer("a", "1", 2, 2), vmi_core::Node::layer("b", "2", 2, 2)];
+        folder.children = vec![
+            vmi_core::Node::layer("a", "1", 2, 2),
+            vmi_core::Node::layer("b", "2", 2, 2),
+        ];
         folder.timeline = vec!["a".into(), "b".into()];
         folder.frames = vec![0, 2];
         let column = XColumn {
             folder_id: "f".into(),
             name: "Shot".into(),
-            cells: vec![Some("a".into()), Some("a".into()), Some("b".into()), Some("b".into())],
+            cells: vec![
+                Some("a".into()),
+                Some("a".into()),
+                Some("b".into()),
+                Some("b".into()),
+            ],
             keys: vec![true, false, true, false],
             labels: vec![],
             stored: false,
         };
         let keyed = rows_of(&column, Some(&folder), 4);
-        assert_eq!(keyed.iter().map(|row| (row.filled, row.key, row.number)).collect::<Vec<_>>(), [
-            (true, true, Some(1)),
-            (true, false, Some(1)),
-            (true, true, Some(2)),
-            (true, false, Some(2)),
-        ]);
+        assert_eq!(
+            keyed
+                .iter()
+                .map(|row| (row.filled, row.key, row.number))
+                .collect::<Vec<_>>(),
+            [
+                (true, true, Some(1)),
+                (true, false, Some(1)),
+                (true, true, Some(2)),
+                (true, false, Some(2)),
+            ]
+        );
 
         // Swing: 1 2 2 1, then a blank and an id the keys never issued.
         let stored = XColumn {
-            labels: vec!["000".into(), "001".into(), "001".into(), "000".into(), String::new(), "002".into()],
+            labels: vec![
+                "000".into(),
+                "001".into(),
+                "001".into(),
+                "000".into(),
+                String::new(),
+                "002".into(),
+            ],
             stored: true,
             ..column
         };
         let rows = rows_of(&stored, Some(&folder), 7);
-        assert_eq!(rows.iter().map(|row| (row.filled, row.key, row.number)).collect::<Vec<_>>(), [
-            (true, true, Some(1)),
-            (true, true, Some(2)),
-            (true, false, Some(2)),
-            (true, true, Some(1)),
-            (false, false, None),
-            (true, true, Some(3)),
-            (false, false, None),
-        ]);
-        assert_eq!(rows[3].cel.as_deref(), Some("a"), "a reused drawing is still its cel");
-        assert_eq!(rows[5].cel, None, "an id without a cel prints its number alone");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.filled, row.key, row.number))
+                .collect::<Vec<_>>(),
+            [
+                (true, true, Some(1)),
+                (true, true, Some(2)),
+                (true, false, Some(2)),
+                (true, true, Some(1)),
+                (false, false, None),
+                (true, true, Some(3)),
+                (false, false, None),
+            ]
+        );
+        assert_eq!(
+            rows[3].cel.as_deref(),
+            Some("a"),
+            "a reused drawing is still its cel"
+        );
+        assert_eq!(
+            rows[5].cel, None,
+            "an id without a cel prints its number alone"
+        );
     }
 }

@@ -20,8 +20,10 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::anim::{animation_folders, cut_end, ExposureSheet, DEFAULT_FPS};
 use crate::color::hex_of;
-use crate::coverage::Edge;
-use crate::doc::{expand_raster, present_plain, tight_pixels, Art, ClipTime, DeskObject, Node, NodeKind};
+use crate::coverage::{DitherPattern, Edge};
+use crate::doc::{
+    expand_raster, present_plain, tight_pixels, Art, ClipTime, DeskObject, Node, NodeKind,
+};
 use crate::kosv::{clean_effects, clean_kosv, clean_marks, effects_value, kosv_value, marks_value};
 use crate::tasks::{colors_value, pack_colors, pack_tasks, tasks_value};
 use crate::tool::{CurveKind, GrainKind};
@@ -35,7 +37,11 @@ const CLOUD_SERVICE: &str = "2kool.tv";
 
 /// The name without its extension, the way Python writes `name`.
 fn stem_name(file_name: &str) -> String {
-    let name = if file_name.trim().is_empty() { "project" } else { file_name };
+    let name = if file_name.trim().is_empty() {
+        "project"
+    } else {
+        file_name
+    };
     match name.rfind('.') {
         Some(dot) if dot > 0 => name[..dot].to_string(),
         _ => name.to_string(),
@@ -73,7 +79,12 @@ pub fn save(art: &mut Art, path: &Path) -> Result<(), String> {
         "kosv": kosv_value(&art.kosv),
     });
     let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
-    document["layers"] = Value::Array(art.layers.iter().map(|node| layer_row(art, node, &mut blobs)).collect());
+    document["layers"] = Value::Array(
+        art.layers
+            .iter()
+            .map(|node| layer_row(art, node, &mut blobs))
+            .collect(),
+    );
     if let Some(clip_time) = clip_time_row(art) {
         document["clip_time"] = clip_time;
     }
@@ -90,7 +101,11 @@ fn clip_time_row(art: &Art) -> Option<Value> {
         return None;
     }
     let clip = art.clip_time.clone().unwrap_or_default();
-    let name = if clip.name.trim().is_empty() { "Timeline".to_string() } else { clip.name.clone() };
+    let name = if clip.name.trim().is_empty() {
+        "Timeline".to_string()
+    } else {
+        clip.name.clone()
+    };
     let last_key = cut_end(&art.layers).saturating_sub(1);
     Some(json!({
         "name": name,
@@ -142,13 +157,15 @@ fn layer_row(art: &Art, node: &Node, blobs: &mut Vec<(String, Vec<u8>)>) -> Valu
     if let Some(raster) = tight_pixels(&node.pixels, art.width, art.height) {
         let file = format!("inks/{}.rgba", node.id);
         blobs.push((file.clone(), raster.rgba.clone()));
-        row["ink"] = json!({"x": raster.x, "y": raster.y, "w": raster.w, "h": raster.h, "file": file});
+        row["ink"] =
+            json!({"x": raster.x, "y": raster.y, "w": raster.w, "h": raster.h, "file": file});
     }
     let shown = layer_picture(art, node);
     if let Some(raster) = shown {
         let file = format!("rasters/{}.rgba", node.id);
         blobs.push((file.clone(), raster.rgba.clone()));
-        row["raster"] = json!({"x": raster.x, "y": raster.y, "w": raster.w, "h": raster.h, "file": file});
+        row["raster"] =
+            json!({"x": raster.x, "y": raster.y, "w": raster.w, "h": raster.h, "file": file});
     }
     row
 }
@@ -179,6 +196,8 @@ fn stroke_row(stroke: &VectorStroke) -> Value {
         "edge": match stroke.edge { Edge::Smooth => "smooth", Edge::Hard => "hard", Edge::Dither => "dither" },
         "chunk": stroke.chunk,
         "tones": stroke.tones,
+        "dither_pattern": pattern_name(stroke.pattern),
+        "dither_bias": stroke.bias,
         "curve": curve_name(stroke.curve),
         "grain": grain_name(stroke.grain),
         "seed": stroke.seed,
@@ -195,6 +214,26 @@ fn curve_name(curve: CurveKind) -> &'static str {
         CurveKind::Quadratic => "quadratic",
         CurveKind::Cubic => "cubic",
         CurveKind::Spline => "spline",
+    }
+}
+
+fn pattern_name(pattern: DitherPattern) -> &'static str {
+    match pattern {
+        DitherPattern::Bayer => "bayer",
+        DitherPattern::Bayer8 => "bayer8",
+        DitherPattern::Checker => "checker",
+        DitherPattern::Lines => "lines",
+        DitherPattern::Dots => "dots",
+    }
+}
+
+fn pattern_of(value: Option<&Value>) -> DitherPattern {
+    match value.and_then(Value::as_str).unwrap_or("bayer") {
+        "bayer8" => DitherPattern::Bayer8,
+        "checker" => DitherPattern::Checker,
+        "lines" => DitherPattern::Lines,
+        "dots" => DitherPattern::Dots,
+        _ => DitherPattern::Bayer,
     }
 }
 
@@ -220,6 +259,12 @@ pub fn object_row(object: &DeskObject) -> Value {
         .filter(|(_, value)| !value.trim().is_empty())
         .map(|(key, value)| (key.clone(), Value::String(value.clone())))
         .collect();
+    let samples: serde_json::Map<String, Value> = object
+        .samples
+        .iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect();
     json!({
         "id": object.id,
         "name": object.name,
@@ -234,6 +279,8 @@ pub fn object_row(object: &DeskObject) -> Value {
         "kind": object.kind,
         "warp_layer": object.warp_layer,
         "sound": object.sound,
+        "folder": object.folder,
+        "samples": Value::Object(samples),
     })
 }
 
@@ -244,14 +291,24 @@ pub fn objects_from(rows: Option<&Value>, known: &HashSet<String>) -> Vec<DeskOb
         return objects;
     };
     for row in rows {
-        let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if id.is_empty() || objects.iter().any(|object| object.id == id) {
             continue;
         }
         let layer_ids: Vec<String> = row
             .get("layer_ids")
             .and_then(Value::as_array)
-            .map(|ids| ids.iter().filter_map(Value::as_str).filter(|id| known.contains(*id)).map(str::to_string).collect())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|id| known.contains(*id))
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default();
         let mut assign = BTreeMap::new();
         if let Some(rows) = row.get("assign").and_then(Value::as_object) {
@@ -270,15 +327,41 @@ pub fn objects_from(rows: Option<&Value>, known: &HashSet<String>) -> Vec<DeskOb
         let mut labels = BTreeMap::new();
         if let Some(rows) = row.get("labels").and_then(Value::as_object) {
             for (key, value) in rows {
-                if let Some(text) = value.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+                if let Some(text) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
                     labels.insert(key.clone(), text.to_string());
                 }
             }
         }
-        let text = |name: &str| row.get(name).and_then(Value::as_str).unwrap_or("").to_string();
+        let mut samples = BTreeMap::new();
+        if let Some(rows) = row.get("samples").and_then(Value::as_object) {
+            for (key, value) in rows {
+                if let Some(text) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    samples.insert(key.clone(), text.to_string());
+                }
+            }
+        }
+        let text = |name: &str| {
+            row.get(name)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
         objects.push(DeskObject {
             id,
-            name: row.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()).unwrap_or("object").to_string(),
+            name: row
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("object")
+                .to_string(),
             kind: text("kind"),
             layer_ids,
             assign,
@@ -290,6 +373,8 @@ pub fn objects_from(rows: Option<&Value>, known: &HashSet<String>) -> Vec<DeskOb
             role: text("role"),
             warp_layer: text("warp_layer"),
             sound: text("sound"),
+            folder: text("folder"),
+            samples,
         });
     }
     objects
@@ -312,12 +397,17 @@ fn write_zip(path: &Path, document: &Value, blobs: &[(String, Vec<u8>)]) -> Resu
     let mut zip = ZipWriter::new(file);
     let stored = FileOptions::default().compression_method(CompressionMethod::Stored);
     let deflate = FileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("mimetype", stored).map_err(|err| err.to_string())?;
-    zip.write_all(b"application/x-vmi-blueprint").map_err(|err| err.to_string())?;
-    zip.start_file("blueprint.json", deflate).map_err(|err| err.to_string())?;
-    zip.write_all(document.to_string().as_bytes()).map_err(|err| err.to_string())?;
+    zip.start_file("mimetype", stored)
+        .map_err(|err| err.to_string())?;
+    zip.write_all(b"application/x-vmi-blueprint")
+        .map_err(|err| err.to_string())?;
+    zip.start_file("blueprint.json", deflate)
+        .map_err(|err| err.to_string())?;
+    zip.write_all(document.to_string().as_bytes())
+        .map_err(|err| err.to_string())?;
     for (name, data) in blobs {
-        zip.start_file(name, deflate).map_err(|err| err.to_string())?;
+        zip.start_file(name, deflate)
+            .map_err(|err| err.to_string())?;
         zip.write_all(data).map_err(|err| err.to_string())?;
     }
     zip.finish().map_err(|err| err.to_string())?;
@@ -327,9 +417,13 @@ fn write_zip(path: &Path, document: &Value, blobs: &[(String, Vec<u8>)]) -> Resu
 pub fn load(path: &Path) -> Result<Art, String> {
     let file = File::open(path).map_err(|err| err.to_string())?;
     let mut archive = ZipArchive::new(file).map_err(|err| err.to_string())?;
-    let mut json_file = archive.by_name("blueprint.json").map_err(|_| "This blueprint has no project.".to_string())?;
+    let mut json_file = archive
+        .by_name("blueprint.json")
+        .map_err(|_| "This blueprint has no project.".to_string())?;
     let mut raw = String::new();
-    json_file.read_to_string(&mut raw).map_err(|err| err.to_string())?;
+    json_file
+        .read_to_string(&mut raw)
+        .map_err(|err| err.to_string())?;
     drop(json_file);
     let document: Value = serde_json::from_str(&raw).map_err(|err| err.to_string())?;
     if document.get("format").and_then(Value::as_str) != Some(FORMAT) {
@@ -346,13 +440,20 @@ pub fn load(path: &Path) -> Result<Art, String> {
     art.file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| document.get("name").and_then(Value::as_str).unwrap_or("project").to_string());
+        .unwrap_or_else(|| {
+            document
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("project")
+                .to_string()
+        });
     art.path = path.display().to_string();
     art.kind = FORMAT.to_string();
     let mut max_id = 0u64;
     if let Some(layers) = document.get("layers").and_then(Value::as_array) {
         for row in layers {
-            art.layers.push(node_from(row, &mut archive, width, height, &mut max_id)?);
+            art.layers
+                .push(node_from(row, &mut archive, width, height, &mut max_id)?);
         }
     }
     art.next_id = max_id + 1;
@@ -364,22 +465,48 @@ pub fn load(path: &Path) -> Result<Art, String> {
         Some(name @ ("menu" | "battle")) => name.to_string(),
         _ => String::new(),
     };
-    art.arrange_locked = document.get("arrange_locked").and_then(Value::as_bool).unwrap_or(true);
+    art.arrange_locked = document
+        .get("arrange_locked")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     if let Some(source) = document.get("source").and_then(Value::as_object) {
-        art.source_file = source.get("file").and_then(Value::as_str).unwrap_or("").to_string();
-        art.source_kind = source.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+        art.source_file = source
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        art.source_kind = source
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
     }
     art.tasks = pack_tasks(document.get("tasks").unwrap_or(&Value::Null));
     art.task_colors = pack_colors(document.get("task_colors").unwrap_or(&Value::Null));
     art.kosv = clean_kosv(document.get("kosv").unwrap_or(&Value::Null));
     if let Some(clip_time) = document.get("clip_time").and_then(Value::as_object) {
-        let number = |key: &str| clip_time.get(key).and_then(Value::as_f64).unwrap_or(0.0).max(0.0).round() as u32;
+        let number = |key: &str| {
+            clip_time
+                .get(key)
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .max(0.0)
+                .round() as u32
+        };
         let fps = number("fps");
         art.fps = if fps == 0 { DEFAULT_FPS } else { fps };
         art.playhead = number("current");
-        let name = clip_time.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        let name = clip_time
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         art.clip_time = Some(ClipTime {
-            name: if name.is_empty() { "Timeline".to_string() } else { name.to_string() },
+            name: if name.is_empty() {
+                "Timeline".to_string()
+            } else {
+                name.to_string()
+            },
             start: number("start"),
             end: number("end"),
         });
@@ -388,30 +515,76 @@ pub fn load(path: &Path) -> Result<Art, String> {
 }
 
 fn max_stroke(nodes: &[Node]) -> u64 {
-    nodes.iter().map(|node| {
-        node.strokes.iter().map(|stroke| stroke.id).max().unwrap_or(0).max(max_stroke(&node.children))
-    }).max().unwrap_or(0)
+    nodes
+        .iter()
+        .map(|node| {
+            node.strokes
+                .iter()
+                .map(|stroke| stroke.id)
+                .max()
+                .unwrap_or(0)
+                .max(max_stroke(&node.children))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
-fn node_from(row: &Value, archive: &mut ZipArchive<File>, width: u32, height: u32, max_id: &mut u64) -> Result<Node, String> {
-    let id = row.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+fn node_from(
+    row: &Value,
+    archive: &mut ZipArchive<File>,
+    width: u32,
+    height: u32,
+    max_id: &mut u64,
+) -> Result<Node, String> {
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if id.is_empty() {
         return Err("This blueprint has a broken layer.".into());
     }
-    if let Some(number) = id.strip_prefix('n').and_then(|text| text.parse::<u64>().ok()) {
+    if let Some(number) = id
+        .strip_prefix('n')
+        .and_then(|text| text.parse::<u64>().ok())
+    {
         *max_id = (*max_id).max(number);
     }
-    let kind = if row.get("kind").and_then(Value::as_str) == Some("group") { NodeKind::Group } else { NodeKind::Layer };
+    let kind = if row.get("kind").and_then(Value::as_str) == Some("group") {
+        NodeKind::Group
+    } else {
+        NodeKind::Layer
+    };
     let name = row.get("name").and_then(Value::as_str).unwrap_or("Layer");
-    let mut node = if kind == NodeKind::Group { Node::group(id, name) } else { Node::layer(id, name, width, height) };
+    let mut node = if kind == NodeKind::Group {
+        Node::group(id, name)
+    } else {
+        Node::layer(id, name, width, height)
+    };
     node.visible = row.get("visible").and_then(Value::as_bool).unwrap_or(true);
-    node.opacity = row.get("opacity").and_then(Value::as_u64).unwrap_or(255).min(255) as u8;
-    node.blend = row.get("blend").and_then(Value::as_str).unwrap_or("normal").to_string();
+    node.opacity = row
+        .get("opacity")
+        .and_then(Value::as_u64)
+        .unwrap_or(255)
+        .min(255) as u8;
+    node.blend = row
+        .get("blend")
+        .and_then(Value::as_str)
+        .unwrap_or("normal")
+        .to_string();
     node.clip = row.get("clip").and_then(Value::as_bool).unwrap_or(false);
     node.mute = row.get("mute").and_then(Value::as_bool).unwrap_or(false);
     node.solo = row.get("solo").and_then(Value::as_bool).unwrap_or(false);
-    node.marker = row.get("marker").and_then(Value::as_str).unwrap_or("").to_string();
-    node.color = row.get("color").and_then(Value::as_str).unwrap_or("").to_string();
+    node.marker = row
+        .get("marker")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    node.color = row
+        .get("color")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     node.vectors = read_vectors(row.get("vectors"));
     node.strokes = read_strokes(row.get("strokes"));
     if let Some(ink) = row.get("ink") {
@@ -425,10 +598,14 @@ fn node_from(row: &Value, archive: &mut ZipArchive<File>, width: u32, height: u3
     }
     if let Some(children) = row.get("children").and_then(Value::as_array) {
         for child in children {
-            node.children.push(node_from(child, archive, width, height, max_id)?);
+            node.children
+                .push(node_from(child, archive, width, height, max_id)?);
         }
     }
-    node.animation = row.get("animation").and_then(Value::as_bool).unwrap_or(false);
+    node.animation = row
+        .get("animation")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     node.timeline = row
         .get("timeline")
         .and_then(Value::as_array)
@@ -443,7 +620,13 @@ fn node_from(row: &Value, archive: &mut ZipArchive<File>, width: u32, height: u3
     node.frames = row
         .get("frames")
         .and_then(Value::as_array)
-        .map(|frames| frames.iter().filter_map(Value::as_f64).map(|frame| frame.max(0.0) as u32).collect())
+        .map(|frames| {
+            frames
+                .iter()
+                .filter_map(Value::as_f64)
+                .map(|frame| frame.max(0.0) as u32)
+                .collect()
+        })
         .unwrap_or_default();
     node.exposure = load_sheet(row.get("exposure"));
     node.effects = clean_effects(row.get("effects").unwrap_or(&Value::Null));
@@ -466,13 +649,23 @@ fn read_vectors(value: Option<&Value>) -> Vec<Vec<[f32; 2]>> {
     let Some(polys) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
-    polys.iter().filter_map(|poly| {
-        let points = poly.as_array()?.iter().filter_map(|point| {
-            let pair = point.as_array()?;
-            Some([pair.first()?.as_f64()? as f32, pair.get(1)?.as_f64()? as f32])
-        }).collect::<Vec<_>>();
-        (points.len() >= 3).then_some(points)
-    }).collect()
+    polys
+        .iter()
+        .filter_map(|poly| {
+            let points = poly
+                .as_array()?
+                .iter()
+                .filter_map(|point| {
+                    let pair = point.as_array()?;
+                    Some([
+                        pair.first()?.as_f64()? as f32,
+                        pair.get(1)?.as_f64()? as f32,
+                    ])
+                })
+                .collect::<Vec<_>>();
+            (points.len() >= 3).then_some(points)
+        })
+        .collect()
 }
 
 pub fn strokes_from_value(value: &Value) -> Vec<VectorStroke> {
@@ -483,7 +676,10 @@ fn read_strokes(value: Option<&Value>) -> Vec<VectorStroke> {
     let Some(rows) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
-    rows.iter().enumerate().filter_map(|(index, row)| stroke_from(row, index as u64 + 1)).collect()
+    rows.iter()
+        .enumerate()
+        .filter_map(|(index, row)| stroke_from(row, index as u64 + 1))
+        .collect()
 }
 
 fn stroke_from(row: &Value, fallback_id: u64) -> Option<VectorStroke> {
@@ -496,7 +692,10 @@ fn stroke_from(row: &Value, fallback_id: u64) -> Option<VectorStroke> {
         let x = pair.first()?.as_f64()? as f32;
         let y = pair.get(1)?.as_f64()? as f32;
         let pressure = pair.get(2).and_then(Value::as_f64).unwrap_or(1.0) as f32;
-        let width = widths.and_then(|rows| rows.get(index)).and_then(Value::as_f64).unwrap_or(4.0) as f32;
+        let width = widths
+            .and_then(|rows| rows.get(index))
+            .and_then(Value::as_f64)
+            .unwrap_or(4.0) as f32;
         let handle = handles.and_then(|rows| rows.get(index));
         vertices.push(Vertex {
             x,
@@ -510,7 +709,12 @@ fn stroke_from(row: &Value, fallback_id: u64) -> Option<VectorStroke> {
     if vertices.is_empty() {
         return None;
     }
-    let color = crate::color::parse_hex(row.get("color").and_then(Value::as_str).unwrap_or("#FFFFFF")).unwrap_or([255, 255, 255]);
+    let color = crate::color::parse_hex(
+        row.get("color")
+            .and_then(Value::as_str)
+            .unwrap_or("#FFFFFF"),
+    )
+    .unwrap_or([255, 255, 255]);
     Some(VectorStroke {
         id: row.get("id").and_then(Value::as_u64).unwrap_or(fallback_id),
         vertices,
@@ -531,6 +735,11 @@ fn stroke_from(row: &Value, fallback_id: u64) -> Option<VectorStroke> {
         },
         chunk: row.get("chunk").and_then(Value::as_u64).unwrap_or(1).max(1) as u32,
         tones: row.get("tones").and_then(Value::as_bool).unwrap_or(false),
+        pattern: pattern_of(row.get("dither_pattern")),
+        bias: row
+            .get("dither_bias")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         grain: match row.get("grain").and_then(Value::as_str).unwrap_or("none") {
             "stipple" => GrainKind::Stipple,
             "hatch" => GrainKind::Hatch,
@@ -547,7 +756,10 @@ fn stroke_from(row: &Value, fallback_id: u64) -> Option<VectorStroke> {
 
 fn pair_of(value: &Value) -> Option<[f32; 2]> {
     let pair = value.as_array()?;
-    Some([pair.first()?.as_f64()? as f32, pair.get(1)?.as_f64()? as f32])
+    Some([
+        pair.first()?.as_f64()? as f32,
+        pair.get(1)?.as_f64()? as f32,
+    ])
 }
 
 fn fringe_of(value: Option<&Value>) -> f32 {
@@ -579,10 +791,14 @@ fn read_raster(archive: &mut ZipArchive<File>, value: &Value) -> Result<Option<R
     let Some(file_name) = row.get("file").and_then(Value::as_str) else {
         return Ok(None);
     };
-    if !(file_name.starts_with("rasters/") || file_name.starts_with("inks/")) || file_name.contains("..") {
+    if !(file_name.starts_with("rasters/") || file_name.starts_with("inks/"))
+        || file_name.contains("..")
+    {
         return Err("A layer picture is missing.".into());
     }
-    let mut file = archive.by_name(file_name).map_err(|_| "A layer picture is missing.".to_string())?;
+    let mut file = archive
+        .by_name(file_name)
+        .map_err(|_| "A layer picture is missing.".to_string())?;
     let mut data = Vec::new();
     file.read_to_end(&mut data).map_err(|err| err.to_string())?;
     let w = row.get("w").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -611,11 +827,20 @@ mod tests {
         art.file_name = "ink".into();
         let id = art.add_layer(None, "Ink");
         let settings = ToolSettings::default_for(Tool::Vector);
-        let stroke = VectorStroke::from_gesture(art.alloc_stroke(), Tool::Vector, &[(2.0, 2.0, 1.0), (12.0, 8.0, 1.0)], &settings).unwrap();
+        let stroke = VectorStroke::from_gesture(
+            art.alloc_stroke(),
+            Tool::Vector,
+            &[(2.0, 2.0, 1.0), (12.0, 8.0, 1.0)],
+            &settings,
+        )
+        .unwrap();
         art.layers.last_mut().unwrap().strokes.push(stroke);
         art.layers.last_mut().unwrap().pixels[0] = 10;
         art.layers.last_mut().unwrap().pixels[3] = 255;
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("vmi-vmib-{stamp}.vmib"));
         save(&mut art, &path).unwrap();
         let loaded = load(&path).unwrap();
@@ -629,7 +854,10 @@ mod tests {
     }
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         std::env::temp_dir().join(format!("vmi-vmib-{tag}-{stamp}.vmib"))
     }
 
@@ -647,14 +875,39 @@ mod tests {
         wave.animation = true;
         wave.cel_marks.insert(
             cel.clone(),
-            CelMark { kind: "P".into(), reference: "".into(), origin: cel.clone(), gain: Some(1.5), block: None },
+            CelMark {
+                kind: "P".into(),
+                reference: "".into(),
+                origin: cel.clone(),
+                gain: Some(1.5),
+                block: None,
+            },
         );
-        wave.cel_marks.insert("ghost".into(), CelMark { kind: "I".into(), reference: "".into(), origin: "".into(), gain: None, block: None });
+        wave.cel_marks.insert(
+            "ghost".into(),
+            CelMark {
+                kind: "I".into(),
+                reference: "".into(),
+                origin: "".into(),
+                gain: None,
+                block: None,
+            },
+        );
         art.playlist = "battle".into();
         art.arrange_locked = false;
-        art.tasks = vec![Task { id: "t1".into(), text: "ink the door".into(), done: true }];
-        art.task_colors = TaskColors { background: "#101010".into(), text: "#FFEEDD".into() };
-        art.kosv.presets.push(Preset { name: "mine".into(), stack: make_stack("glow") });
+        art.tasks = vec![Task {
+            id: "t1".into(),
+            text: "ink the door".into(),
+            done: true,
+        }];
+        art.task_colors = TaskColors {
+            background: "#101010".into(),
+            text: "#FFEEDD".into(),
+        };
+        art.kosv.presets.push(Preset {
+            name: "mine".into(),
+            stack: make_stack("glow"),
+        });
         let mut object = DeskObject::new("o1", "door", vec![door.clone(), "gone".into()]);
         object.kind = "button".into();
         object.assign.insert(door.clone(), (1, 0));
@@ -679,14 +932,21 @@ mod tests {
         assert_eq!(document["objects"][0]["assign"][&door], json!([1, 0]));
         let loaded = load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert_eq!(loaded.file_name, path.file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            loaded.file_name,
+            path.file_name().unwrap().to_string_lossy()
+        );
         assert_eq!(loaded.kind, "vmib");
         let door_node = crate::find(&loaded.layers, &door).unwrap();
         assert_eq!(door_node.effects.len(), 2);
         assert_eq!(door_node.effects[0].id, "vhs");
         assert_eq!(door_node.effects[0].preset, "tape");
         let wave = crate::find(&loaded.layers, &folder).unwrap();
-        assert_eq!(wave.cel_marks.len(), 1, "a mark on a cel the folder lacks is dropped");
+        assert_eq!(
+            wave.cel_marks.len(),
+            1,
+            "a mark on a cel the folder lacks is dropped"
+        );
         assert_eq!(wave.cel_marks[&cel].gain, Some(1.5));
         assert_eq!(loaded.playlist, "battle");
         assert!(!loaded.arrange_locked);
@@ -696,7 +956,11 @@ mod tests {
         assert_eq!(loaded.kosv.presets[0].stack[0].id, "color-glow");
         assert_eq!(loaded.objects.len(), 1);
         let object = &loaded.objects[0];
-        assert_eq!(object.layer_ids, vec![door.clone()], "a layer the drawing lacks is dropped");
+        assert_eq!(
+            object.layer_ids,
+            vec![door.clone()],
+            "a layer the drawing lacks is dropped"
+        );
         assert_eq!(object.assign.len(), 1);
         assert_eq!(object.assign[&door], (1, 0));
         assert_eq!(object.labels["001000"], "lit");
@@ -707,12 +971,82 @@ mod tests {
         assert_eq!(object.sound, "sfx:tik");
         assert_eq!(object.origin, "slots:n1");
         assert!(object.explicit);
+        assert!(object.folder.is_empty());
+        assert!(object.samples.is_empty());
+    }
+
+    #[test]
+    fn a_library_keeps_its_folder_and_a_state_sample_and_an_old_row_still_loads() {
+        let mut art = Art::blank(4, 4);
+        art.file_name = "board.vmib".into();
+        let layer = art.add_layer(None, "mouth");
+        let mut folder = DeskObject::new("f", "Faces", Vec::new());
+        folder.kind = "folder".into();
+        let mut mouth = DeskObject::new("m", "Mouth", vec![layer.clone()]);
+        mouth.kind = "mouth".into();
+        mouth.folder = "f".into();
+        mouth.stack = 2;
+        mouth.sound = "samples/rest.wav".into();
+        mouth.set_sample(1, 0, "samples/ah.wav");
+        mouth.labels.insert("001000".into(), "AH".into());
+        mouth.assign.insert(layer.clone(), (1, 0));
+        art.objects.push(folder);
+        art.objects.push(mouth);
+        let path = temp_path("library");
+        save(&mut art, &path).unwrap();
+        let document = blueprint(&path);
+        let loaded = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(document["objects"][1]["folder"], "f");
+        assert_eq!(
+            document["objects"][1]["samples"]["001000"],
+            "samples/ah.wav"
+        );
+        assert_eq!(document["objects"][1]["kind"], "mouth");
+        assert_eq!(
+            loaded.objects.len(),
+            2,
+            "opening the file does not invent a third object"
+        );
+        let loaded_mouth = loaded
+            .objects
+            .iter()
+            .find(|object| object.id == "m")
+            .unwrap();
+        assert_eq!(loaded_mouth.kind, "mouth");
+        assert_eq!(loaded_mouth.folder, "f");
+        assert_eq!(loaded_mouth.stack, 2);
+        assert_eq!(loaded_mouth.sound, "samples/rest.wav");
+        assert_eq!(loaded_mouth.sample_of(1, 0), "samples/ah.wav");
+        assert_eq!(loaded_mouth.sample_of(0, 0), "samples/rest.wav");
+        assert_eq!(loaded_mouth.label_of(1, 0), "AH");
+        assert_eq!(loaded.fps, DEFAULT_FPS);
+
+        let old = json!([{
+            "id": "o1",
+            "name": "door",
+            "kind": "button",
+            "sound": "sfx:tik"
+        }]);
+        let known = std::collections::HashSet::new();
+        let objects = objects_from(Some(&old), &known);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].kind, "button");
+        assert_eq!(objects[0].sound, "sfx:tik");
+        assert!(objects[0].folder.is_empty());
+        assert!(objects[0].samples.is_empty());
+        assert_eq!(objects[0].sample_of(2, 0), "sfx:tik");
+        assert_eq!(objects[0].states(), vec![0, 1, 2, 3]);
     }
 
     fn blueprint(path: &Path) -> Value {
         let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
         let mut raw = String::new();
-        archive.by_name("blueprint.json").unwrap().read_to_string(&mut raw).unwrap();
+        archive
+            .by_name("blueprint.json")
+            .unwrap()
+            .read_to_string(&mut raw)
+            .unwrap();
         serde_json::from_str(&raw).unwrap()
     }
 
@@ -747,7 +1081,11 @@ mod tests {
         folder.exposure = Some(held_sheet());
         art.fps = 30;
         art.playhead = 4;
-        art.clip_time = Some(ClipTime { name: "Timeline 1".into(), start: 0, end: 48 });
+        art.clip_time = Some(ClipTime {
+            name: "Timeline 1".into(),
+            start: 0,
+            end: 48,
+        });
         art.onion = true;
 
         let path = temp_path("anim");
@@ -772,22 +1110,38 @@ mod tests {
         }
         assert_eq!(loaded.fps, 30);
         assert_eq!(loaded.playhead, 4);
-        assert_eq!(loaded.clip_time, Some(ClipTime { name: "Timeline 1".into(), start: 0, end: 48 }));
+        assert_eq!(
+            loaded.clip_time,
+            Some(ClipTime {
+                name: "Timeline 1".into(),
+                start: 0,
+                end: 48
+            })
+        );
         assert!(!loaded.onion, "onion skin is a view, not part of the file");
         assert_eq!(crate::anim::cel_at(folder, 4).unwrap().id, ids[1]);
 
         let rows = document["layers"].as_array().unwrap();
-        let row = rows.iter().find(|row| row["id"] == folder_id.as_str()).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["id"] == folder_id.as_str())
+            .unwrap();
         assert_eq!(row["animation"], json!(true));
         assert_eq!(row["timeline"], json!(ids));
         assert_eq!(row["frames"], json!([0, 2, 5]));
         assert_eq!(row["exposure"], held_sheet().to_row());
-        assert_eq!(row["exposure"]["slots"], json!(["000", "000", "000", "002"]));
+        assert_eq!(
+            row["exposure"]["slots"],
+            json!(["000", "000", "000", "002"])
+        );
         for cel in row["children"].as_array().unwrap() {
             assert_eq!(cel["animation"], json!(false));
             assert_eq!(cel["timeline"], json!([]));
             assert_eq!(cel["frames"], json!([]));
-            assert!(cel.get("exposure").is_none(), "a layer without a sheet omits the key");
+            assert!(
+                cel.get("exposure").is_none(),
+                "a layer without a sheet omits the key"
+            );
         }
         let paper = rows.iter().find(|row| row["name"] == "Paper").unwrap();
         assert!(paper.get("exposure").is_none());
@@ -806,7 +1160,10 @@ mod tests {
         let loaded = load(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(document.get("clip_time").is_none());
-        assert_eq!((loaded.fps, loaded.playhead, loaded.clip_time), (DEFAULT_FPS, 0, None));
+        assert_eq!(
+            (loaded.fps, loaded.playhead, loaded.clip_time),
+            (DEFAULT_FPS, 0, None)
+        );
         assert_eq!(document["layers"][0]["animation"], json!(false));
         assert_eq!(document["layers"][0]["timeline"], json!([]));
         assert_eq!(document["layers"][0]["frames"], json!([]));
@@ -831,7 +1188,14 @@ mod tests {
             "an animated drawing keeps its rate and playhead; end reaches the last key"
         );
         assert_eq!(loaded.playhead, 3);
-        assert_eq!(loaded.clip_time, Some(ClipTime { name: "Timeline".into(), start: 0, end: 7 }));
+        assert_eq!(
+            loaded.clip_time,
+            Some(ClipTime {
+                name: "Timeline".into(),
+                start: 0,
+                end: 7
+            })
+        );
 
         let mut slow = Art::new(4, 4);
         slow.fps = 12;
@@ -869,13 +1233,27 @@ mod tests {
         assert_eq!(loaded.layers[0].exposure, None);
         let folder = &loaded.layers[1];
         assert!(folder.animation);
-        assert_eq!(folder.timeline, vec!["n4".to_string(), "n3".to_string()], "unknown ids drop out");
+        assert_eq!(
+            folder.timeline,
+            vec!["n4".to_string(), "n3".to_string()],
+            "unknown ids drop out"
+        );
         assert_eq!(folder.frames, vec![2, 0, 5], "frames clamp at zero");
-        assert_eq!(folder.children[0].exposure, None, "an empty row is no sheet");
+        assert_eq!(
+            folder.children[0].exposure, None,
+            "an empty row is no sheet"
+        );
         assert_eq!(folder.children[1].exposure, None);
         assert_eq!(loaded.fps, DEFAULT_FPS, "a zero rate falls back");
         assert_eq!(loaded.playhead, 6);
-        assert_eq!(loaded.clip_time, Some(ClipTime { name: "Timeline".into(), start: 0, end: 9 }));
+        assert_eq!(
+            loaded.clip_time,
+            Some(ClipTime {
+                name: "Timeline".into(),
+                start: 0,
+                end: 9
+            })
+        );
         assert_eq!(loaded.next_id, 5);
 
         assert_eq!(load_sheet(None), None);

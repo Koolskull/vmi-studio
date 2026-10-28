@@ -28,6 +28,8 @@ pub enum Tool {
     Grain,
     WarpTarget,
     WarpMask,
+    /// Click a painted pixel. The outliner selects that layer.
+    Select,
     CutRect,
     CutLasso,
     CutPolygon,
@@ -138,6 +140,10 @@ pub enum Field {
     BoneReach,
     FillTolerance,
     PickRadius,
+    /// PhotoCraft-style tip scatter. 0 keeps every dab on the stroke.
+    Scatter,
+    /// Pulled-string correction, in pixels. 0 follows the pen.
+    Stabilize,
 }
 
 impl Field {
@@ -167,6 +173,8 @@ impl Field {
             Self::BoneReach => "Bone reach",
             Self::FillTolerance => "Fill tolerance",
             Self::PickRadius => "Pick radius",
+            Self::Scatter => "Scatter",
+            Self::Stabilize => "Stabilize",
         }
     }
 }
@@ -185,6 +193,8 @@ const SHAPE: &[Field] = &[
     Field::PressureSize,
     Field::PressureOpacity,
     Field::Opacity,
+    Field::Scatter,
+    Field::Stabilize,
     Field::SizeCurve,
     Field::OpacityCurve,
 ];
@@ -202,6 +212,8 @@ const NO_COLOR: &[Field] = &[
     Field::PressureSize,
     Field::PressureOpacity,
     Field::Opacity,
+    Field::Scatter,
+    Field::Stabilize,
     Field::SizeCurve,
     Field::OpacityCurve,
 ];
@@ -222,6 +234,8 @@ const DITHER: &[Field] = &[
     Field::PressureSize,
     Field::PressureOpacity,
     Field::Opacity,
+    Field::Scatter,
+    Field::Stabilize,
     Field::SizeCurve,
     Field::OpacityCurve,
 ];
@@ -240,6 +254,7 @@ const VECTOR: &[Field] = &[
     Field::PressureSize,
     Field::PressureOpacity,
     Field::Opacity,
+    Field::Stabilize,
     Field::CurveKind,
     Field::Grain,
     Field::Seed,
@@ -275,6 +290,7 @@ impl Tool {
         Self::Grain,
         Self::WarpTarget,
         Self::WarpMask,
+        Self::Select,
         Self::CutRect,
         Self::CutLasso,
         Self::CutPolygon,
@@ -300,6 +316,7 @@ impl Tool {
             Self::Grain => "Grain",
             Self::WarpTarget => "Warp target",
             Self::WarpMask => "Warp mask",
+            Self::Select => "Select",
             Self::CutRect => "Rect",
             Self::CutLasso => "Lasso",
             Self::CutPolygon => "Polygon",
@@ -326,6 +343,7 @@ impl Tool {
             Self::Grain => "",
             Self::WarpTarget => "T",
             Self::WarpMask => "M",
+            Self::Select => "",
             Self::CutRect => "",
             Self::CutLasso => "",
             Self::CutPolygon => "",
@@ -345,13 +363,14 @@ impl Tool {
             Self::Fill => "Fills a flat area on click.",
             Self::Dither => "KOOLDRAW chunks. Ink or a tone, never a gray edge.",
             Self::Line => "One straight stroke. Release writes pixels and keeps no points.",
-            Self::Vector => "Freehand points. Release keeps the stroke editable.",
-            Self::Curve => "Points and handles. Release keeps the curve.",
-            Self::Point => "Moves a point or a handle on a vector stroke.",
+            Self::Vector => "A smooth pen. Pressure sets the width. Stabilize pulls the string. Points stay hidden until the Point tool.",
+            Self::Curve => "A curve with handles. Stabilize pulls the string. Points stay hidden until the Point tool.",
+            Self::Point => "Shows the points and handles, and moves the one under the pen.",
             Self::Bone => "Bends a vector stroke around one bone.",
             Self::Grain => "A vector stroke with a generated texture.",
             Self::WarpTarget => "Click corners. Enter keeps the polygon.",
             Self::WarpMask => "Paints a mask. Release writes pixels.",
+            Self::Select => "Click painted ink. A drag stays put. The outliner selects that layer and opens the folders around it.",
             Self::CutRect => "A rectangle marquee for cut.",
             Self::CutLasso => "A freehand marquee for cut.",
             Self::CutPolygon => "Click corners for a cut.",
@@ -361,9 +380,13 @@ impl Tool {
     pub fn release_note(self) -> &'static str {
         match self.release() {
             Release::Pixels => "Release writes pixels and drops the path.",
-            Release::Stroke => "Release keeps the points, width, curve, and grain. The picture is a cache.",
+            Release::Stroke => {
+                "Release keeps a smooth curve. The Point tool edits the points and handles."
+            }
             Release::Polygon => "Enter keeps the corners and refills the raster from them.",
-            Release::Edit => "Release changes the thing under the pen. It does not start a new stroke.",
+            Release::Edit => {
+                "Release changes the thing under the pen. It does not start a new stroke."
+            }
         }
     }
 
@@ -371,7 +394,12 @@ impl Tool {
         match self {
             Self::Vector | Self::Curve | Self::Grain => Release::Stroke,
             Self::WarpTarget => Release::Polygon,
-            Self::Point | Self::Bone | Self::CutRect | Self::CutLasso | Self::CutPolygon => Release::Edit,
+            Self::Point
+            | Self::Bone
+            | Self::Select
+            | Self::CutRect
+            | Self::CutLasso
+            | Self::CutPolygon => Release::Edit,
             _ => Release::Pixels,
         }
     }
@@ -379,7 +407,7 @@ impl Tool {
     pub fn section(self) -> Section {
         match self {
             Self::Vector | Self::Curve | Self::Point | Self::Bone | Self::Grain => Section::Vector,
-            Self::WarpTarget | Self::WarpMask => Section::Picture,
+            Self::WarpTarget | Self::WarpMask | Self::Select => Section::Picture,
             Self::CutRect | Self::CutLasso | Self::CutPolygon => Section::Cut,
             _ => Section::Raster,
         }
@@ -393,19 +421,22 @@ impl Tool {
             Self::Point => POINT,
             Self::Bone => BONE,
             Self::WarpTarget => TARGET,
-            Self::CutRect | Self::CutLasso | Self::CutPolygon => CUT,
+            Self::Select | Self::CutRect | Self::CutLasso | Self::CutPolygon => CUT,
             Self::Eraser | Self::Smudge => NO_COLOR,
             _ => SHAPE,
         }
     }
 
     pub fn by_shortcut(key: &str) -> Option<Self> {
-        Self::PALETTE.iter().copied().find(|tool| !tool.shortcut().is_empty() && tool.shortcut().eq_ignore_ascii_case(key))
+        Self::PALETTE
+            .iter()
+            .copied()
+            .find(|tool| !tool.shortcut().is_empty() && tool.shortcut().eq_ignore_ascii_case(key))
     }
 }
 
 /// Bumped when a saved preset needs new traits filled in from the defaults.
-pub const SETTINGS_REV: u32 = 2;
+pub const SETTINGS_REV: u32 = 4;
 
 /// Settings for one palette tool. A right-click edits this record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -427,6 +458,12 @@ pub struct ToolSettings {
     pub edge: Edge,
     pub chunk: u32,
     pub tones: bool,
+    /// Ordered pattern used when the edge is dither.
+    #[serde(default)]
+    pub dither_pattern: crate::coverage::DitherPattern,
+    /// Slides the dither gate. Negative keeps more ink.
+    #[serde(default)]
+    pub dither_bias: f32,
     pub size_pressure: bool,
     pub opacity_pressure: bool,
     pub opacity: f32,
@@ -439,6 +476,12 @@ pub struct ToolSettings {
     pub bone_reach: f32,
     pub fill_tolerance: u8,
     pub pick_radius: f32,
+    /// How far a dab may leave the stroke, in fractions of the size. 0 is none.
+    #[serde(default)]
+    pub scatter: f32,
+    /// Pulled-string length in pixels. 0 follows the pen.
+    #[serde(default)]
+    pub stabilize: f32,
 }
 
 impl ToolSettings {
@@ -458,6 +501,8 @@ impl ToolSettings {
             edge: Edge::Smooth,
             chunk: 1,
             tones: false,
+            dither_pattern: crate::coverage::DitherPattern::Bayer,
+            dither_bias: 0.0,
             size_pressure: true,
             opacity_pressure: true,
             opacity: 1.0,
@@ -470,6 +515,8 @@ impl ToolSettings {
             bone_reach: 160.0,
             fill_tolerance: 0,
             pick_radius: 8.0,
+            scatter: 0.0,
+            stabilize: 0.0,
         };
         match tool {
             Tool::Pencil => {
@@ -515,13 +562,20 @@ impl ToolSettings {
                 settings.tones = true;
             }
             Tool::Line => settings.size = 4.0,
-            Tool::Vector => settings.size = 12.0,
+            Tool::Vector => {
+                settings.size = 12.0;
+                // Clip Studio's vector pen is a curve. Poly is still in the Curve menu.
+                settings.curve = CurveKind::Cubic;
+                settings.stabilize = 12.0;
+            }
             Tool::Curve => {
                 settings.size = 12.0;
                 settings.curve = CurveKind::Cubic;
+                settings.stabilize = 12.0;
             }
             Tool::Grain => {
                 settings.size = 18.0;
+                settings.stabilize = 12.0;
                 settings.grain = GrainKind::Liquid;
                 settings.edge = Edge::Dither;
                 settings.tones = true;
@@ -536,7 +590,11 @@ impl ToolSettings {
     }
 
     pub fn rack() -> Vec<Self> {
-        Tool::PALETTE.iter().copied().map(Self::default_for).collect()
+        Tool::PALETTE
+            .iter()
+            .copied()
+            .map(Self::default_for)
+            .collect()
     }
 
     pub fn merge(saved: Vec<Self>) -> Vec<Self> {
@@ -558,6 +616,16 @@ impl ToolSettings {
             self.texture = default.texture;
             self.size_pressure = true;
             self.opacity_pressure = true;
+        }
+        // The vector pen used to store a polyline. A saved Poly becomes the curve.
+        if self.rev < 3 && self.tool == Tool::Vector && self.curve == CurveKind::Poly {
+            self.curve = CurveKind::Cubic;
+        }
+        if self.rev < 4
+            && matches!(self.tool, Tool::Vector | Tool::Curve | Tool::Grain)
+            && self.stabilize <= 0.0
+        {
+            self.stabilize = default.stabilize;
         }
         self.rev = SETTINGS_REV;
     }
@@ -584,7 +652,11 @@ impl ToolSettings {
     /// Paint never draws fully hard when the knob is still near zero.
     pub fn softness_for(&self, tool: Tool) -> f32 {
         let value = self.softness.clamp(0.0, 1.0);
-        if tool == Tool::Paint && value < 0.35 { 0.55 } else { value }
+        if tool == Tool::Paint && value < 0.35 {
+            0.55
+        } else {
+            value
+        }
     }
 
     pub fn radius_for(&self, pressure: f32) -> f32 {
@@ -593,15 +665,19 @@ impl ToolSettings {
 }
 
 pub fn ink_spacing(diameter: f32, tool: Tool) -> f32 {
-    let width = diameter.max(1.0);
-    match tool {
-        Tool::Paint | Tool::Smudge => (width * 0.12).max(1.0),
-        Tool::Charcoal | Tool::Pencil => (width * 0.1).max(0.75),
-        Tool::Air => (width * 0.08).max(0.75),
-        Tool::Vector | Tool::Curve | Tool::Grain => (width * 0.22).max(1.0),
-        Tool::WarpMask => (width * 0.35).max(0.5),
-        _ => (width * 0.15).max(0.75),
-    }
+    let width = diameter.max(0.5);
+    let ratio = match tool {
+        Tool::Paint | Tool::Smudge => 0.12,
+        Tool::Charcoal | Tool::Pencil => 0.10,
+        Tool::Air => 0.08,
+        Tool::Vector | Tool::Curve | Tool::Grain => 0.22,
+        Tool::WarpMask => 0.35,
+        _ => 0.15,
+    };
+    // A wide brush keeps its ratio. A thin one spaces inside its own width,
+    // so the first dabs join instead of sitting as separate dots.
+    let spaced = width * ratio;
+    spaced.max((width.min(0.75)) * 0.45).min(width.max(0.35))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -612,7 +688,11 @@ pub enum PaletteAction {
 
 /// Left click selects. Right click opens the settings window and does not change the selection by itself.
 pub fn palette_action(tool: Tool, secondary: bool) -> PaletteAction {
-    if secondary { PaletteAction::Edit(tool) } else { PaletteAction::Select(tool) }
+    if secondary {
+        PaletteAction::Edit(tool)
+    } else {
+        PaletteAction::Select(tool)
+    }
 }
 
 pub fn palette_matching(query: &str) -> Vec<Tool> {
@@ -639,7 +719,11 @@ mod tests {
         for tool in Tool::PALETTE {
             assert!(!tool.name().is_empty(), "{tool:?}");
             assert!(!tool.usage().is_empty(), "{tool:?}");
-            assert!(tool.fields().contains(&Field::ReleaseNote), "{}", tool.name());
+            assert!(
+                tool.fields().contains(&Field::ReleaseNote),
+                "{}",
+                tool.name()
+            );
             names.push(tool.name());
         }
         names.sort_unstable();
@@ -650,8 +734,14 @@ mod tests {
 
     #[test]
     fn right_click_edits_and_vector_release_keeps_traits() {
-        assert_eq!(palette_action(Tool::Pen, false), PaletteAction::Select(Tool::Pen));
-        assert_eq!(palette_action(Tool::Smudge, true), PaletteAction::Edit(Tool::Smudge));
+        assert_eq!(
+            palette_action(Tool::Pen, false),
+            PaletteAction::Select(Tool::Pen)
+        );
+        assert_eq!(
+            palette_action(Tool::Smudge, true),
+            PaletteAction::Edit(Tool::Smudge)
+        );
         assert_eq!(Tool::Pen.release(), Release::Pixels);
         assert_eq!(Tool::Line.release(), Release::Pixels);
         assert_eq!(Tool::Vector.release(), Release::Stroke);
@@ -661,6 +751,8 @@ mod tests {
         assert_eq!(Tool::WarpTarget.release(), Release::Polygon);
         assert_eq!(Tool::Point.release(), Release::Edit);
         assert!(Tool::Vector.fields().contains(&Field::Grain));
+        assert!(Tool::Vector.fields().contains(&Field::Stabilize));
+        assert!(Tool::Pen.fields().contains(&Field::Stabilize));
         assert!(Tool::Dither.fields().contains(&Field::Chunk));
         assert!(Tool::Fill.fields().contains(&Field::FillTolerance));
     }
@@ -685,11 +777,17 @@ mod tests {
         assert!((pen.diameter_for(1.0) - pen.size).abs() < 1e-4);
         assert!(pen.diameter_for(0.0) < pen.diameter_for(1.0));
         let pencil = ToolSettings::default_for(Tool::Pencil);
-        assert!(pencil.size_pressure, "pressure is on by default for every tool");
+        assert!(
+            pencil.size_pressure,
+            "pressure is on by default for every tool"
+        );
         assert!(pencil.diameter_for(0.2) < pencil.size);
         for tool in Tool::PALETTE {
             let settings = ToolSettings::default_for(*tool);
-            assert!(settings.size_pressure && settings.opacity_pressure, "{tool:?}");
+            assert!(
+                settings.size_pressure && settings.opacity_pressure,
+                "{tool:?}"
+            );
         }
     }
 
@@ -702,7 +800,10 @@ mod tests {
         old.size_pressure = false;
         old.size = 99.0;
         let rack = ToolSettings::merge(vec![old]);
-        let paint = rack.iter().find(|preset| preset.tool == Tool::Paint).unwrap();
+        let paint = rack
+            .iter()
+            .find(|preset| preset.tool == Tool::Paint)
+            .unwrap();
         assert_eq!(paint.tip, Tip::Bristle);
         assert!(paint.texture > 0.0);
         assert!(paint.size_pressure);
@@ -712,7 +813,24 @@ mod tests {
         let mut kept = ToolSettings::default_for(Tool::Paint);
         kept.tip = Tip::Round;
         let rack = ToolSettings::merge(vec![kept]);
-        assert_eq!(rack.iter().find(|preset| preset.tool == Tool::Paint).unwrap().tip, Tip::Round);
+        assert_eq!(
+            rack.iter()
+                .find(|preset| preset.tool == Tool::Paint)
+                .unwrap()
+                .tip,
+            Tip::Round
+        );
+
+        let mut vector = ToolSettings::default_for(Tool::Vector);
+        vector.rev = 3;
+        vector.stabilize = 0.0;
+        let rack = ToolSettings::merge(vec![vector]);
+        let vector = rack
+            .iter()
+            .find(|preset| preset.tool == Tool::Vector)
+            .unwrap();
+        assert!((vector.stabilize - 12.0).abs() < 1e-4);
+        assert_eq!(vector.rev, SETTINGS_REV);
     }
 
     #[test]
@@ -727,5 +845,13 @@ mod tests {
         assert!(Tool::Smudge.fields().contains(&Field::Texture));
         assert_eq!(Tool::Charcoal.release(), Release::Pixels);
         assert_eq!(Tool::by_shortcut("c"), Some(Tool::Charcoal));
+    }
+
+    #[test]
+    fn a_thin_brush_spaces_inside_its_width() {
+        let thin = ink_spacing(1.0, Tool::Pen);
+        assert!(thin < 1.0 && thin > 0.2, "{thin}");
+        let wide = ink_spacing(24.0, Tool::Pen);
+        assert!((wide - 3.6).abs() < 1e-4, "{wide}");
     }
 }

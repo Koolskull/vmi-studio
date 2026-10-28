@@ -105,7 +105,10 @@ pub fn animation_folders(nodes: &[Node]) -> Vec<&Node> {
 }
 
 pub fn animation_folder_ids(nodes: &[Node]) -> Vec<String> {
-    animation_folders(nodes).into_iter().map(|folder| folder.id.clone()).collect()
+    animation_folders(nodes)
+        .into_iter()
+        .map(|folder| folder.id.clone())
+        .collect()
 }
 
 /// Direct children in timeline order. The top row is frame 0 until that
@@ -138,8 +141,16 @@ pub fn unspecified_cels(folder: &Node) -> Vec<&Node> {
     if folder.frames.is_empty() {
         return Vec::new();
     }
-    let shown: HashSet<&str> = timeline_cels(folder).iter().map(|cel| cel.id.as_str()).collect();
-    folder.children.iter().rev().filter(|child| !shown.contains(child.id.as_str())).collect()
+    let shown: HashSet<&str> = timeline_cels(folder)
+        .iter()
+        .map(|cel| cel.id.as_str())
+        .collect();
+    folder
+        .children
+        .iter()
+        .rev()
+        .filter(|child| !shown.contains(child.id.as_str()))
+        .collect()
 }
 
 /// (start frame, cel) pairs in frame order. A hand-marked folder uses 0, 1, 2…
@@ -173,7 +184,10 @@ pub fn cel_at(folder: &Node, frame: u32) -> Option<&Node> {
 
 /// The frame where this cel is keyed, or None when it is not on the timeline.
 pub fn key_of(folder: &Node, cel_id: &str) -> Option<u32> {
-    frame_map(folder).into_iter().find(|(_, cel)| cel.id == cel_id).map(|(frame, _)| frame)
+    frame_map(folder)
+        .into_iter()
+        .find(|(_, cel)| cel.id == cel_id)
+        .map(|(frame, _)| frame)
 }
 
 /// The cels of one folder with the frames each holds. `cut_end` is the frame
@@ -188,7 +202,13 @@ pub fn cels(folder: &Node, cut_end: u32) -> Vec<Cel<'_>> {
             Some((next, _)) => (*next).max(after),
             None => cut_end.max(after),
         };
-        out.push(Cel { id: &node.id, start: *start, end, node, index });
+        out.push(Cel {
+            id: &node.id,
+            start: *start,
+            end,
+            node,
+            index,
+        });
     }
     out
 }
@@ -226,7 +246,8 @@ fn holds(folder: &Node, id: &str) -> bool {
 pub fn owning_animation(nodes: &[Node], id: &str) -> Option<String> {
     fn visit(nodes: &[Node], id: &str) -> Option<String> {
         for node in nodes {
-            if node.kind == NodeKind::Group && node.animation && (node.id == id || holds(node, id)) {
+            if node.kind == NodeKind::Group && node.animation && (node.id == id || holds(node, id))
+            {
                 return Some(node.id.clone());
             }
             if let Some(found) = visit(&node.children, id) {
@@ -279,7 +300,12 @@ pub fn set_animation(nodes: &mut [Node], id: &str, on: bool) -> bool {
     node.animation = on;
     if on {
         clear_marks(&mut node.children);
-        node.timeline = node.children.iter().rev().map(|cel| cel.id.clone()).collect();
+        node.timeline = node
+            .children
+            .iter()
+            .rev()
+            .map(|cel| cel.id.clone())
+            .collect();
         node.frames.clear();
     } else {
         node.timeline.clear();
@@ -292,7 +318,10 @@ pub fn set_animation(nodes: &mut [Node], id: &str, on: bool) -> bool {
 /// swaps with it. A hand-marked folder has no frame numbers; there the move
 /// is along the timeline order. The layer stack stays where it is.
 pub fn move_frame(folder: &mut Node, cel_id: &str, start: u32) -> bool {
-    let ids: Vec<String> = timeline_cels(folder).iter().map(|cel| cel.id.clone()).collect();
+    let ids: Vec<String> = timeline_cels(folder)
+        .iter()
+        .map(|cel| cel.id.clone())
+        .collect();
     let Some(index) = ids.iter().position(|id| id == cel_id) else {
         return false;
     };
@@ -311,7 +340,11 @@ pub fn move_frame(folder: &mut Node, cel_id: &str, start: u32) -> bool {
     if start == frames[index] {
         return false;
     }
-    let other = frames.iter().enumerate().find(|(pos, value)| *pos != index && **value == start).map(|(pos, _)| pos);
+    let other = frames
+        .iter()
+        .enumerate()
+        .find(|(pos, value)| *pos != index && **value == start)
+        .map(|(pos, _)| pos);
     match other {
         None => frames[index] = start,
         Some(other) => frames.swap(index, other),
@@ -323,7 +356,10 @@ pub fn move_frame(folder: &mut Node, cel_id: &str, start: u32) -> bool {
 /// Move one cel `delta` places along the timeline (Python `move_cel`). The
 /// frame numbers travel with the places, so two cels swap frames.
 pub fn move_cel(folder: &mut Node, cel_id: &str, delta: i64) -> bool {
-    let mut order: Vec<String> = timeline_cels(folder).iter().map(|cel| cel.id.clone()).collect();
+    let mut order: Vec<String> = timeline_cels(folder)
+        .iter()
+        .map(|cel| cel.id.clone())
+        .collect();
     let Some(index) = order.iter().position(|id| id == cel_id) else {
         return false;
     };
@@ -344,9 +380,22 @@ pub fn move_cel(folder: &mut Node, cel_id: &str, delta: i64) -> bool {
 /// A playhead that already has a key steps forward. A later key moves only
 /// when it occupies that new slot. Returns the target and the shifted keys.
 pub fn next_frame_slot(frames: &[u32], playhead: u32) -> (u32, Vec<u32>) {
-    let target = if frames.contains(&playhead) { playhead.saturating_add(1) } else { playhead };
+    let target = if frames.contains(&playhead) {
+        playhead.saturating_add(1)
+    } else {
+        playhead
+    };
     let frames = if frames.contains(&target) {
-        frames.iter().map(|&frame| if frame >= target { frame.saturating_add(1) } else { frame }).collect()
+        frames
+            .iter()
+            .map(|&frame| {
+                if frame >= target {
+                    frame.saturating_add(1)
+                } else {
+                    frame
+                }
+            })
+            .collect()
     } else {
         frames.to_vec()
     };
@@ -408,7 +457,10 @@ pub fn add_cel(art: &mut Art, folder_id: &str, playhead: u32) -> Option<String> 
     let owner = ensure_animation(art, folder_id)?;
     let (frames, mut ids): (Vec<u32>, Vec<String>) = {
         let folder = find(&art.layers, &owner)?;
-        frame_map(folder).into_iter().map(|(frame, cel)| (frame, cel.id.clone())).unzip()
+        frame_map(folder)
+            .into_iter()
+            .map(|(frame, cel)| (frame, cel.id.clone()))
+            .unzip()
     };
     let (target, mut frames) = next_frame_slot(&frames, playhead);
     let id = art.alloc_id();
@@ -457,7 +509,12 @@ pub fn first_frame(art: &mut Art) {
 
 /// Past and future cels, nearest first, and the cel the playhead is showing,
 /// each side cut to its own limit. The current cel is in neither list.
-pub fn onion_neighbors(folder: &Node, frame: u32, past_limit: usize, future_limit: usize) -> (Vec<&Node>, Vec<&Node>, Option<&Node>) {
+pub fn onion_neighbors(
+    folder: &Node,
+    frame: u32,
+    past_limit: usize,
+    future_limit: usize,
+) -> (Vec<&Node>, Vec<&Node>, Option<&Node>) {
     let mut past = Vec::new();
     let mut future = Vec::new();
     let mut keyed = None;
@@ -483,7 +540,12 @@ pub fn onion_neighbors(folder: &Node, frame: u32, past_limit: usize, future_limi
 
 /// Python `onion.neighbors`: both sides cut to `ONION_LIMIT`.
 pub fn neighbors(folder: &Node, frame: u32) -> (Vec<&Node>, Vec<&Node>, Option<&Node>) {
-    onion_neighbors(folder, frame, usize::from(ONION_LIMIT), usize::from(ONION_LIMIT))
+    onion_neighbors(
+        folder,
+        frame,
+        usize::from(ONION_LIMIT),
+        usize::from(ONION_LIMIT),
+    )
 }
 
 /// Onion opacity for a cel this many keys away from the playhead.
@@ -545,7 +607,13 @@ impl Default for ExposureSheet {
 
 impl ExposureSheet {
     pub fn new(base_seed: u32) -> Self {
-        Self { slots: Vec::new(), pool: Vec::new(), issued: 0, base_seed, active: 0 }
+        Self {
+            slots: Vec::new(),
+            pool: Vec::new(),
+            issued: 0,
+            base_seed,
+            active: 0,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -558,7 +626,10 @@ impl ExposureSheet {
 
     /// The drawing id in this slot. None for a blank or a frame past the sheet.
     pub fn cell(&self, frame: usize) -> Option<&str> {
-        self.slots.get(frame).map(String::as_str).filter(|cell| !cell.is_empty())
+        self.slots
+            .get(frame)
+            .map(String::as_str)
+            .filter(|cell| !cell.is_empty())
     }
 
     /// The slot as stored: `Some("")` is a blank inside the sheet.
@@ -598,7 +669,10 @@ impl ExposureSheet {
             return None;
         }
         let known: HashSet<&str> = pool.iter().map(String::as_str).collect();
-        if slots.iter().any(|slot| !slot.is_empty() && !known.contains(slot.as_str())) {
+        if slots
+            .iter()
+            .any(|slot| !slot.is_empty() && !known.contains(slot.as_str()))
+        {
             return None;
         }
         let base_seed = row.get("base_seed")?.as_u64()?;
@@ -736,7 +810,10 @@ impl ExposureSheet {
     /// Previous and next pool ids around this slot. A blank neighbour is None.
     pub fn onion(&self, index: Option<usize>) -> Option<SheetOnion> {
         let index = self.slot_index(index)? as i64;
-        Some(SheetOnion { prev: self.shown(index - 1), next: self.shown(index + 1) })
+        Some(SheetOnion {
+            prev: self.shown(index - 1),
+            next: self.shown(index + 1),
+        })
     }
 
     /// "hold" continues the previous id. "reuse" points back at an earlier one.
@@ -766,7 +843,8 @@ impl ExposureSheet {
         if count < 1 || index > self.slots.len() {
             return false;
         }
-        self.slots.splice(index..index, std::iter::repeat_n(String::new(), count));
+        self.slots
+            .splice(index..index, std::iter::repeat_n(String::new(), count));
         self.active = index;
         true
     }
@@ -789,7 +867,11 @@ impl ExposureSheet {
             return false;
         };
         self.slots.drain(start..start + count);
-        self.active = if self.slots.is_empty() { 0 } else { start.min(self.slots.len() - 1) };
+        self.active = if self.slots.is_empty() {
+            0
+        } else {
+            start.min(self.slots.len() - 1)
+        };
         true
     }
 
@@ -813,7 +895,11 @@ impl ExposureSheet {
         if count < 2 {
             return true;
         }
-        let tail: Vec<String> = self.slots[start..start + count - 1].iter().rev().cloned().collect();
+        let tail: Vec<String> = self.slots[start..start + count - 1]
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
         self.slots.splice(start + count..start + count, tail);
         self.active = start;
         true
@@ -851,7 +937,11 @@ impl ExposureSheet {
         if count < n {
             return false;
         }
-        let kept: Vec<String> = self.slots[start..start + count].iter().step_by(n).cloned().collect();
+        let kept: Vec<String> = self.slots[start..start + count]
+            .iter()
+            .step_by(n)
+            .cloned()
+            .collect();
         self.slots.splice(start..start + count, kept);
         self.active = start;
         true
@@ -943,7 +1033,13 @@ impl ExposureSheet {
     /// `reframe` with OpenToonz's blank option: below 0 keeps a blank run, zero
     /// and above drop blanks, and a positive value inserts that many blank
     /// steps after each drawing.
-    pub fn reframe_with_blank(&mut self, start: usize, count: usize, step: i64, with_blank: i64) -> bool {
+    pub fn reframe_with_blank(
+        &mut self,
+        start: usize,
+        count: usize,
+        step: i64,
+        with_blank: i64,
+    ) -> bool {
         if step < 1 {
             return false;
         }
@@ -969,7 +1065,11 @@ impl ExposureSheet {
         if unique.is_empty() {
             return false;
         }
-        let gap = if with_blank > 0 { with_blank as usize * step } else { 0 };
+        let gap = if with_blank > 0 {
+            with_blank as usize * step
+        } else {
+            0
+        };
         let mut out: Vec<String> = Vec::new();
         for cell in unique {
             out.extend(std::iter::repeat_n(cell, step));
@@ -1044,7 +1144,8 @@ impl ExposureSheet {
                 let extra = frame2 - frame1 - run;
                 let cell = self.slots[index as usize].clone();
                 let at = (index + 1) as usize;
-                self.slots.splice(at..at, std::iter::repeat_n(cell, extra as usize));
+                self.slots
+                    .splice(at..at, std::iter::repeat_n(cell, extra as usize));
                 index += extra;
                 r1 += extra;
                 index += 1;
@@ -1057,7 +1158,11 @@ impl ExposureSheet {
                 index += 1;
             }
         }
-        self.active = if self.slots.is_empty() { 0 } else { start as usize };
+        self.active = if self.slots.is_empty() {
+            0
+        } else {
+            start as usize
+        };
         true
     }
 
@@ -1079,7 +1184,9 @@ impl ExposureSheet {
 
 /// Hold, reuse, or nothing for one filmstrip cel. No sheet is nothing.
 pub fn cel_mark(sheet: Option<&ExposureSheet>, index: usize) -> &'static str {
-    sheet.map(|sheet| sheet.slot_state(index)).unwrap_or_default()
+    sheet
+        .map(|sheet| sheet.slot_state(index))
+        .unwrap_or_default()
 }
 
 /// Timeline keys as an X-sheet column. Nothing is saved. Rows before the
@@ -1135,7 +1242,13 @@ pub fn sheet_from_slots(slots: &[String], base_seed: u32) -> Option<ExposureShee
 /// One cell command by its X-sheet menu name (`xsheet.run_command`). False
 /// means the sheet was left as it was. `arg` is the step, each, reframe, or
 /// repeat count; the other commands ignore it.
-pub fn run_command(sheet: &mut ExposureSheet, name: &str, start: usize, count: usize, arg: i64) -> bool {
+pub fn run_command(
+    sheet: &mut ExposureSheet,
+    name: &str,
+    start: usize,
+    count: usize,
+    arg: i64,
+) -> bool {
     match name {
         "reverse" => sheet.reverse(start, count),
         "swing" => sheet.swing(start, count),
@@ -1154,29 +1267,48 @@ pub fn run_command(sheet: &mut ExposureSheet, name: &str, start: usize, count: u
     }
 }
 
+/// One animation folder as an X-sheet column, `length` frames tall.
+pub fn column_of(folder: &Node, length: u32) -> XColumn {
+    let pairs = frame_map(folder);
+    let starts: HashSet<u32> = pairs.iter().map(|(frame, _)| *frame).collect();
+    let cells = (0..length)
+        .map(|frame| cel_at(folder, frame).map(|cel| cel.id.clone()))
+        .collect();
+    let keys = (0..length).map(|frame| starts.contains(&frame)).collect();
+    let (labels, stored) = match &folder.exposure {
+        Some(sheet) => (sheet.slots.clone(), true),
+        None => (project_slots(&pairs), false),
+    };
+    XColumn {
+        folder_id: folder.id.clone(),
+        name: folder.name.clone(),
+        cells,
+        keys,
+        labels,
+        stored,
+    }
+}
+
 /// The X-sheet: one column per animation folder, back to front, `cut_end`
 /// rows of cels and keys, plus the labels Python prints.
 pub fn xsheet_columns(nodes: &[Node], cut_end: u32) -> Vec<XColumn> {
     animation_folders(nodes)
         .into_iter()
-        .map(|folder| {
-            let pairs = frame_map(folder);
-            let starts: HashSet<u32> = pairs.iter().map(|(frame, _)| *frame).collect();
-            let cells = (0..cut_end).map(|frame| cel_at(folder, frame).map(|cel| cel.id.clone())).collect();
-            let keys = (0..cut_end).map(|frame| starts.contains(&frame)).collect();
-            let (labels, stored) = match &folder.exposure {
-                Some(sheet) => (sheet.slots.clone(), true),
-                None => (project_slots(&pairs), false),
-            };
-            XColumn { folder_id: folder.id.clone(), name: folder.name.clone(), cells, keys, labels, stored }
-        })
+        .map(|folder| column_of(folder, cut_end))
         .collect()
 }
 
 /// Run one cell command on the `column`th animation folder (Python
 /// `_xsheet_command`). A folder without a sheet gets one made from its keys
 /// first, and keeps it even when the command refuses.
-pub fn xsheet_command(nodes: &mut [Node], column: usize, name: &str, start: usize, count: usize, arg: i64) -> bool {
+pub fn xsheet_command(
+    nodes: &mut [Node],
+    column: usize,
+    name: &str,
+    start: usize,
+    count: usize,
+    arg: i64,
+) -> bool {
     let folders = animation_folder_ids(nodes);
     let Some(folder_id) = folders.get(column) else {
         return false;
@@ -1186,11 +1318,25 @@ pub fn xsheet_command(nodes: &mut [Node], column: usize, name: &str, start: usiz
 
 /// `xsheet_command` for the animation folder with `folder_id`. The desk
 /// addresses a column by the folder it stands for.
-pub fn folder_command(art: &mut Art, folder_id: &str, name: &str, start: usize, count: usize, arg: i64) -> bool {
+pub fn folder_command(
+    art: &mut Art,
+    folder_id: &str,
+    name: &str,
+    start: usize,
+    count: usize,
+    arg: i64,
+) -> bool {
     sheet_command(&mut art.layers, folder_id, name, start, count, arg)
 }
 
-fn sheet_command(nodes: &mut [Node], folder_id: &str, name: &str, start: usize, count: usize, arg: i64) -> bool {
+fn sheet_command(
+    nodes: &mut [Node],
+    folder_id: &str,
+    name: &str,
+    start: usize,
+    count: usize,
+    arg: i64,
+) -> bool {
     let projected = match find(nodes, folder_id) {
         Some(folder) if folder.animation && folder.exposure.is_none() => {
             sheet_from_slots(&project_slots(&frame_map(folder)), 0)
@@ -1240,7 +1386,16 @@ mod tests {
     }
 
     fn ids(numbers: &[i64]) -> Vec<String> {
-        numbers.iter().map(|number| if *number < 0 { String::new() } else { format!("{number:03X}") }).collect()
+        numbers
+            .iter()
+            .map(|number| {
+                if *number < 0 {
+                    String::new()
+                } else {
+                    format!("{number:03X}")
+                }
+            })
+            .collect()
     }
 
     fn sheet(numbers: &[i64]) -> ExposureSheet {
@@ -1250,7 +1405,10 @@ mod tests {
     #[test]
     fn frame_map_and_cel_at_hold_each_key_until_the_next_and_the_last_to_the_cut() {
         let folder = keyed_folder();
-        let map: Vec<(u32, &str)> = frame_map(&folder).into_iter().map(|(frame, cel)| (frame, cel.id.as_str())).collect();
+        let map: Vec<(u32, &str)> = frame_map(&folder)
+            .into_iter()
+            .map(|(frame, cel)| (frame, cel.id.as_str()))
+            .collect();
         assert_eq!(map, vec![(0, "a"), (2, "b"), (5, "c")]);
         assert_eq!(cel_at(&folder, 0).unwrap().id, "a");
         assert_eq!(cel_at(&folder, 1).unwrap().id, "a");
@@ -1262,7 +1420,10 @@ mod tests {
         assert_eq!(key_of(&folder, "zz"), None);
         let nodes = vec![folder];
         assert_eq!(cut_end(&nodes), 6);
-        let blocks: Vec<(u32, u32, usize)> = cels(&nodes[0], 10).iter().map(|cel| (cel.start, cel.end, cel.index)).collect();
+        let blocks: Vec<(u32, u32, usize)> = cels(&nodes[0], 10)
+            .iter()
+            .map(|cel| (cel.start, cel.end, cel.index))
+            .collect();
         assert_eq!(blocks, vec![(0, 2, 0), (2, 5, 1), (5, 10, 2)]);
         let short: Vec<u32> = cels(&nodes[0], 3).iter().map(|cel| cel.end).collect();
         assert_eq!(short, vec![2, 5, 6]);
@@ -1274,16 +1435,23 @@ mod tests {
         let mut folder = Node::group("f2", "Folder 2");
         folder.animation = true;
         for name in 1..=9 {
-            folder.children.push(layer(&format!("c{name}"), &name.to_string()));
+            folder
+                .children
+                .push(layer(&format!("c{name}"), &name.to_string()));
         }
         folder.timeline = (1..=8).map(|name| format!("c{name}")).collect();
         folder.frames = (1..=8).collect();
-        assert_eq!(names(&timeline_cels(&folder)), ["1", "2", "3", "4", "5", "6", "7", "8"]);
+        assert_eq!(
+            names(&timeline_cels(&folder)),
+            ["1", "2", "3", "4", "5", "6", "7", "8"]
+        );
         assert_eq!(names(&unspecified_cels(&folder)), ["9"]);
         assert_eq!(cel_at(&folder, 5).unwrap().name, "5");
         assert_eq!(cel_at(&folder, 100).unwrap().name, "8");
         assert!(cel_at(&folder, 0).is_none());
-        let shown: Vec<Option<String>> = (0..3).map(|frame| cel_at(&folder, frame).map(|cel| cel.name.clone())).collect();
+        let shown: Vec<Option<String>> = (0..3)
+            .map(|frame| cel_at(&folder, frame).map(|cel| cel.name.clone()))
+            .collect();
         assert_eq!(shown, vec![None, Some("1".into()), Some("2".into())]);
     }
 
@@ -1294,7 +1462,10 @@ mod tests {
         folder.children = vec![layer("line", "line"), layer("color", "color")];
         assert_eq!(names(&timeline_cels(&folder)), ["color", "line"]);
         assert!(unspecified_cels(&folder).is_empty());
-        let map: Vec<(u32, &str)> = frame_map(&folder).into_iter().map(|(frame, cel)| (frame, cel.name.as_str())).collect();
+        let map: Vec<(u32, &str)> = frame_map(&folder)
+            .into_iter()
+            .map(|(frame, cel)| (frame, cel.name.as_str()))
+            .collect();
         assert_eq!(map, vec![(0, "color"), (1, "line")]);
         assert_eq!(cel_at(&folder, 0).unwrap().name, "color");
         assert_eq!(cel_at(&folder, 7).unwrap().name, "line");
@@ -1303,8 +1474,15 @@ mod tests {
         folder.timeline = vec!["line".into(), "ghost".into()];
         folder.frames = vec![3, 4];
         assert_eq!(names(&timeline_cels(&folder)), ["line"]);
-        let map: Vec<u32> = frame_map(&folder).into_iter().map(|(frame, _)| frame).collect();
-        assert_eq!(map, vec![0], "a frame list that does not fit falls back to 0, 1, 2…");
+        let map: Vec<u32> = frame_map(&folder)
+            .into_iter()
+            .map(|(frame, _)| frame)
+            .collect();
+        assert_eq!(
+            map,
+            vec![0],
+            "a frame list that does not fit falls back to 0, 1, 2…"
+        );
     }
 
     #[test]
@@ -1320,18 +1498,33 @@ mod tests {
         assert!(set_animation(&mut nodes, "beetle", true));
         let beetle = find(&nodes, "beetle").unwrap();
         assert!(beetle.animation);
-        assert_eq!(beetle.timeline, vec!["color".to_string(), "line".to_string()]);
+        assert_eq!(
+            beetle.timeline,
+            vec!["color".to_string(), "line".to_string()]
+        );
         assert!(beetle.frames.is_empty());
-        assert!(!find(&nodes, "line").unwrap().animation, "marking the outer folder unmarks the frame inside");
+        assert!(
+            !find(&nodes, "line").unwrap().animation,
+            "marking the outer folder unmarks the frame inside"
+        );
         assert!(!set_animation(&mut nodes, "line", true));
         assert!(!find(&nodes, "line").unwrap().animation);
         assert_eq!(owning_animation(&nodes, "line").as_deref(), Some("beetle"));
         assert_eq!(owning_animation(&nodes, "fill").as_deref(), Some("beetle"));
-        assert_eq!(owning_animation(&nodes, "beetle").as_deref(), Some("beetle"));
+        assert_eq!(
+            owning_animation(&nodes, "beetle").as_deref(),
+            Some("beetle")
+        );
         assert_eq!(owning_animation(&nodes, "sky"), None);
-        assert!(!set_animation(&mut nodes, "sky", true), "a layer is not a timeline");
+        assert!(
+            !set_animation(&mut nodes, "sky", true),
+            "a layer is not a timeline"
+        );
         assert_eq!(animation_folder_ids(&nodes), vec!["beetle".to_string()]);
-        assert_eq!(cel_of(find(&nodes, "beetle").unwrap(), "fill").unwrap().id, "color");
+        assert_eq!(
+            cel_of(find(&nodes, "beetle").unwrap(), "fill").unwrap().id,
+            "color"
+        );
         assert!(set_animation(&mut nodes, "beetle", false));
         let beetle = find(&nodes, "beetle").unwrap();
         assert!(!beetle.animation && beetle.timeline.is_empty());
@@ -1377,7 +1570,10 @@ mod tests {
         hand.timeline = vec!["color".into(), "line".into()];
         assert!(move_cel(&mut hand, "color", 1));
         assert_eq!(names(&timeline_cels(&hand)), ["line", "color"]);
-        assert_eq!(names(&hand.children.iter().collect::<Vec<_>>()), ["line", "color"]);
+        assert_eq!(
+            names(&hand.children.iter().collect::<Vec<_>>()),
+            ["line", "color"]
+        );
     }
 
     #[test]
@@ -1408,13 +1604,18 @@ mod tests {
         let mut long = Node::group("long", "Long");
         long.animation = true;
         for index in 0..9 {
-            long.children.push(layer(&format!("c{index}"), &index.to_string()));
+            long.children
+                .push(layer(&format!("c{index}"), &index.to_string()));
         }
         long.timeline = (0..9).map(|index| format!("c{index}")).collect();
         long.frames = (0..9).collect();
         let (past, future, current) = neighbors(&long, 4);
         assert_eq!(current.unwrap().name, "4");
-        assert_eq!(names(&past), ["3", "2", "1"], "nearest first, three at most");
+        assert_eq!(
+            names(&past),
+            ["3", "2", "1"],
+            "nearest first, three at most"
+        );
         assert_eq!(names(&future), ["5", "6", "7"]);
         let (past, future, _) = onion_neighbors(&long, 4, 1, 0);
         assert_eq!(names(&past), ["3"]);
@@ -1447,9 +1648,20 @@ mod tests {
         art.playhead = 0;
         let between = add_cel(&mut art, &first, 0).unwrap();
         let folder = &art.layers[0];
-        assert_eq!(find(&art.layers, &between).unwrap().name, "1 2", "Python's fresh_name of \"1\"");
-        assert_eq!(folder.timeline, vec![ink.clone(), between.clone(), first.clone()]);
-        assert_eq!(folder.frames, vec![0, 1, 2], "the later key moved out of the new slot");
+        assert_eq!(
+            find(&art.layers, &between).unwrap().name,
+            "1 2",
+            "Python's fresh_name of \"1\""
+        );
+        assert_eq!(
+            folder.timeline,
+            vec![ink.clone(), between.clone(), first.clone()]
+        );
+        assert_eq!(
+            folder.frames,
+            vec![0, 1, 2],
+            "the later key moved out of the new slot"
+        );
         assert_eq!(art.playhead, 1);
 
         let plain = art.add_group(None, "Props");
@@ -1486,7 +1698,11 @@ mod tests {
         assert_eq!(art.playhead, 3);
         first_frame(&mut art);
         assert_eq!(art.playhead, 0);
-        art.clip_time = Some(ClipTime { name: "Timeline 1".into(), start: 0, end: 48 });
+        art.clip_time = Some(ClipTime {
+            name: "Timeline 1".into(),
+            start: 0,
+            end: 48,
+        });
         assert_eq!(cut_frames(&art), 49);
         set_playhead(&mut art, 100);
         assert_eq!(art.playhead, 48);
@@ -1506,7 +1722,13 @@ mod tests {
         assert_eq!(cel_mark(Some(&sheet), 2), "");
         assert_eq!(cel_mark(Some(&sheet), 1), "hold");
         assert_eq!(cel_mark(None, 1), "");
-        assert_eq!(sheet.onion(Some(2)), Some(SheetOnion { prev: Some("000".into()), next: Some("000".into()) }));
+        assert_eq!(
+            sheet.onion(Some(2)),
+            Some(SheetOnion {
+                prev: Some("000".into()),
+                next: Some("000".into())
+            })
+        );
         assert_eq!(sheet.onion(Some(0)).unwrap().prev, None);
         assert_eq!(sheet.boil_seed(2), None);
         assert_eq!(sheet.hold(Some(2), 1), None);
@@ -1515,7 +1737,12 @@ mod tests {
         assert_eq!(sheet.slots[2], "000");
         assert_eq!(sheet.cell(2), Some("000"));
         assert_eq!(sheet.cell(9), None);
-        let loaded = ExposureSheet::from_row(&super::sheet_from_slots(&ids(&[1, -1, 2]), 0).unwrap().to_row()).unwrap();
+        let loaded = ExposureSheet::from_row(
+            &super::sheet_from_slots(&ids(&[1, -1, 2]), 0)
+                .unwrap()
+                .to_row(),
+        )
+        .unwrap();
         assert_eq!(loaded.slots, ["001", "", "002"]);
         assert_eq!(loaded.pool, ["001", "002"]);
         assert_eq!(loaded.cell(1), None);
@@ -1529,7 +1756,9 @@ mod tests {
         assert_eq!(sheet.hold(None, 2).as_deref(), Some("000"));
         assert_eq!(sheet.slots, ["000", "000", "000"]);
         assert_eq!(sheet.pool, ["000"]);
-        let seeds: HashSet<u32> = (0..3).map(|index| sheet.boil_seed(index).unwrap()).collect();
+        let seeds: HashSet<u32> = (0..3)
+            .map(|index| sheet.boil_seed(index).unwrap())
+            .collect();
         assert_eq!(seeds.len(), 1);
 
         let mut sheet = ExposureSheet::new(0);
@@ -1548,14 +1777,21 @@ mod tests {
         assert_eq!(sheet.slot_state(1), "hold");
         assert_eq!(sheet.reuse("12", Some(0)), None);
         assert_eq!(sheet.reuse("FFF", Some(0)), None);
-        assert_eq!(sheet.reuse("00a", Some(0)), None, "001 is in the pool, 00A is not");
+        assert_eq!(
+            sheet.reuse("00a", Some(0)),
+            None,
+            "001 is in the pool, 00A is not"
+        );
 
         let mut held = ExposureSheet::new(0);
         held.append_blank();
         held.hold(None, 2);
         let other = held.append_blank().unwrap();
         assert_eq!(held.delete(Some(1)).as_deref(), Some("000"));
-        assert_eq!(held.slots, vec!["000".to_string(), "000".to_string(), other.clone()]);
+        assert_eq!(
+            held.slots,
+            vec!["000".to_string(), "000".to_string(), other.clone()]
+        );
         assert_eq!(held.delete(Some(2)), Some(other.clone()));
         assert!(!held.slots.contains(&other));
         assert!(held.pool.contains(&other));
@@ -1575,7 +1811,10 @@ mod tests {
         let pool = moved.pool.clone();
         let seed = moved.boil_seed(0);
         assert_eq!(moved.move_slot(0, 2), Some(all[0].clone()));
-        assert_eq!(moved.slots, vec![all[1].clone(), all[2].clone(), all[0].clone()]);
+        assert_eq!(
+            moved.slots,
+            vec![all[1].clone(), all[2].clone(), all[0].clone()]
+        );
         assert_eq!(moved.pool, pool);
         assert_eq!(moved.boil_seed(2), seed);
         assert_eq!(moved.move_slot(2, 0), Some(all[0].clone()));
@@ -1591,9 +1830,17 @@ mod tests {
         let first = seeded.slots[0].clone();
         seeded.reuse(&first, Some(4));
         assert_eq!(seeded.slots, ["000", "000", "000", "001", "000"]);
-        let seeds: Vec<u32> = (0..seeded.len()).map(|index| seeded.boil_seed(index).unwrap()).collect();
+        let seeds: Vec<u32> = (0..seeded.len())
+            .map(|index| seeded.boil_seed(index).unwrap())
+            .collect();
         assert_eq!(seeds, [4, 4, 4, 5, 4]);
-        assert_eq!(seeded.onion(Some(3)), Some(SheetOnion { prev: Some("000".into()), next: Some("000".into()) }));
+        assert_eq!(
+            seeded.onion(Some(3)),
+            Some(SheetOnion {
+                prev: Some("000".into()),
+                next: Some("000".into())
+            })
+        );
         assert_eq!(seeded.onion(Some(4)).unwrap().next, None);
         seeded.active = 4;
         assert_eq!(seeded.onion(None), seeded.onion(Some(4)));
@@ -1609,7 +1856,10 @@ mod tests {
         sheet.slots = ids(&[1, 2, 3, 4]);
         sheet.slots.push(tail.clone());
         assert!(sheet.swing(0, 4));
-        assert_eq!(sheet.slots, ["001", "002", "003", "004", "003", "002", "001", "00A"]);
+        assert_eq!(
+            sheet.slots,
+            ["001", "002", "003", "004", "003", "002", "001", "00A"]
+        );
         sheet.slots = vec!["001".into(), "".into(), "002".into(), tail.clone()];
         assert!(sheet.step(0, 3, 2));
         assert_eq!(sheet.slots, ["001", "001", "", "", "002", "002", "00A"]);
@@ -1636,7 +1886,10 @@ mod tests {
         assert_eq!(sheet.pool, pool);
         let mut sheet = self::sheet(&[1, 1, 2, -1, 3]);
         assert!(sheet.increase_step(0, sheet.len()));
-        assert_eq!(sheet.slots, ["001", "001", "001", "002", "002", "", "003", "003"]);
+        assert_eq!(
+            sheet.slots,
+            ["001", "001", "001", "002", "002", "", "003", "003"]
+        );
         let mut sheet = self::sheet(&[1, 1, 1, 2, -1, 3, 3]);
         assert!(sheet.decrease_step(0, sheet.len()));
         assert_eq!(sheet.slots, ["001", "001", "002", "", "003"]);
@@ -1667,7 +1920,10 @@ mod tests {
         assert_eq!(gap.slots, ["002", "002", "002", "005"]);
         let mut ladder = sheet(&[1, 3, 5, 7]);
         assert!(ladder.autoexpose(0, 4));
-        assert_eq!(ladder.slots, ["001", "001", "003", "003", "005", "005", "007"]);
+        assert_eq!(
+            ladder.slots,
+            ["001", "001", "003", "003", "005", "005", "007"]
+        );
         let mut packed = sheet(&[1, 2, 3]);
         assert!(packed.autoexpose(0, 3));
         assert_eq!(packed.slots, ["001", "002", "003"]);
@@ -1703,7 +1959,10 @@ mod tests {
         assert_eq!(sheet.slots, ["", "002", "001", "002", "003"]);
         assert_eq!(sheet.active, 1);
         assert!(!sheet.insert_empty(9, 1));
-        assert!(sheet.insert_empty(sheet.len(), 1), "insert at the end is allowed");
+        assert!(
+            sheet.insert_empty(sheet.len(), 1),
+            "insert at the end is allowed"
+        );
         assert!(!sheet.clear_cells(0, 0));
         assert!(sheet.remove_cells(0, sheet.len()));
         assert!(sheet.is_empty());
@@ -1729,13 +1988,19 @@ mod tests {
         assert_eq!(sheet.slots, ["002", "001"]);
         assert!(run_command(&mut sheet, "repeat", 0, 2, 1));
         assert!(run_command(&mut sheet, "reframe", 0, 4, 2));
-        assert_eq!(sheet.slots, ["002", "002", "001", "001", "002", "002", "001", "001"]);
+        assert_eq!(
+            sheet.slots,
+            ["002", "002", "001", "001", "002", "002", "001", "001"]
+        );
         assert!(run_command(&mut sheet, "insert", 0, 1, 0));
         assert_eq!(sheet.slots[0], "");
         assert!(run_command(&mut sheet, "clear", 1, 1, 0));
         assert_eq!(sheet.slots[1], "");
         assert!(run_command(&mut sheet, "cut", 0, 2, 0));
-        assert_eq!(sheet.slots, ["002", "001", "001", "002", "002", "001", "001"]);
+        assert_eq!(
+            sheet.slots,
+            ["002", "001", "001", "002", "002", "001", "001"]
+        );
         assert!(!run_command(&mut sheet, "autoexpose", 0, 2, 0));
         assert!(!run_command(&mut sheet, "random", 0, 2, 3));
         assert!(!run_command(&mut sheet, "", 0, 2, 0));
@@ -1752,9 +2017,20 @@ mod tests {
         held.delete(Some(1));
         held.active = 2;
         let row = held.to_row();
-        let keys: HashSet<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, HashSet::from(["slots", "pool", "issued", "base_seed", "active"]));
-        assert_eq!(row["slots"], serde_json::json!(["000", "000", "000", "002"]));
+        let keys: HashSet<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            HashSet::from(["slots", "pool", "issued", "base_seed", "active"])
+        );
+        assert_eq!(
+            row["slots"],
+            serde_json::json!(["000", "000", "000", "002"])
+        );
         assert_eq!(row["pool"], serde_json::json!(["000", "001", "002"]));
         assert_eq!(row["issued"], 3);
         assert_eq!(row["base_seed"], 11);
@@ -1762,7 +2038,9 @@ mod tests {
         let back = ExposureSheet::from_row(&row).unwrap();
         assert_eq!(back, held);
         assert_eq!(back.to_row(), row);
-        let seeds: Vec<u32> = (0..back.len()).map(|index| back.boil_seed(index).unwrap()).collect();
+        let seeds: Vec<u32> = (0..back.len())
+            .map(|index| back.boil_seed(index).unwrap())
+            .collect();
         assert_eq!(seeds, [11, 11, 11, 13]);
 
         let mut good = ExposureSheet::new(0);
@@ -1795,11 +2073,18 @@ mod tests {
         lower["pool"] = serde_json::json!(["000", "001", "00a"]);
         lower["issued"] = serde_json::json!(3);
         let loaded = ExposureSheet::from_row(&lower).unwrap();
-        assert_eq!(loaded.slots, ["00A", ""], "ids are upper case, null is a blank");
+        assert_eq!(
+            loaded.slots,
+            ["00A", ""],
+            "ids are upper case, null is a blank"
+        );
         assert_eq!(loaded.pool, ["000", "001", "00A"]);
         let mut unknown = row.clone();
         unknown["slots"] = serde_json::json!(["00a"]);
-        assert!(ExposureSheet::from_row(&unknown).is_none(), "a slot outside the pool is refused");
+        assert!(
+            ExposureSheet::from_row(&unknown).is_none(),
+            "a slot outside the pool is refused"
+        );
 
         let gapped = serde_json::json!({
             "slots": ["000", "002", "000"],
@@ -1811,13 +2096,19 @@ mod tests {
         let loaded = ExposureSheet::from_row(&gapped).unwrap();
         assert_eq!(loaded.to_row(), gapped);
         assert!(!loaded.pool.contains(&"001".to_string()));
-        let seeds: Vec<u32> = (0..3).map(|index| loaded.boil_seed(index).unwrap()).collect();
+        let seeds: Vec<u32> = (0..3)
+            .map(|index| loaded.boil_seed(index).unwrap())
+            .collect();
         assert_eq!(seeds, [4, 6, 4]);
-        let empty = serde_json::json!({"slots": [], "pool": [], "issued": 0, "base_seed": 0, "active": 0});
+        let empty =
+            serde_json::json!({"slots": [], "pool": [], "issued": 0, "base_seed": 0, "active": 0});
         let blank = ExposureSheet::from_row(&empty).unwrap();
         assert!(blank.slots.is_empty() && blank.pool.is_empty());
         assert_eq!(blank.to_row(), empty);
-        assert!(ExposureSheet::from_row(&serde_json::json!({"issued": 0, "base_seed": 0, "active": 0})).is_none());
+        assert!(ExposureSheet::from_row(
+            &serde_json::json!({"issued": 0, "base_seed": 0, "active": 0})
+        )
+        .is_none());
         assert!(ExposureSheet::from_row(&serde_json::json!({"note": "no sheet"})).is_none());
         assert!(ExposureSheet::from_row(&serde_json::json!(null)).is_none());
         assert_eq!(ExposureSheet::default().to_row(), empty);
@@ -1836,7 +2127,11 @@ mod tests {
         assert_eq!(sheet.issued, 2);
         assert_eq!(sheet.active, 0);
         assert!(sheet_from_slots(&["0G0".to_string()], 0).is_none());
-        let mixed = sheet_from_slots(&["00A".to_string(), "001".to_string(), "00a".to_string()], 0).unwrap();
+        let mixed = sheet_from_slots(
+            &["00A".to_string(), "001".to_string(), "00a".to_string()],
+            0,
+        )
+        .unwrap();
         assert_eq!(mixed.pool, ["00A", "001"]);
     }
 
@@ -1870,41 +2165,73 @@ mod tests {
         assert_eq!(columns[0].keys, [true, false, false, true]);
         assert_eq!(columns[0].labels, ["000", "000", "000", "001"]);
         assert!(!columns[0].stored);
-        let front_cells: Vec<Option<&str>> = columns[1].cells.iter().map(Option::as_deref).collect();
+        let front_cells: Vec<Option<&str>> =
+            columns[1].cells.iter().map(Option::as_deref).collect();
         assert_eq!(front_cells, [None, None, Some("f1"), Some("f1")]);
         assert_eq!(columns[1].keys, [false, false, true, false]);
-        assert_eq!(columns[1].labels.len(), 7, "a stored sheet keeps its own length");
+        assert_eq!(
+            columns[1].labels.len(),
+            7,
+            "a stored sheet keeps its own length"
+        );
         assert!(columns[1].stored);
 
         // The first command stores a sheet made from the keys, then edits it.
         assert!(find(&nodes, "b").unwrap().exposure.is_none());
         assert!(xsheet_command(&mut nodes, 0, "step", 0, 4, 2));
         let stored = find(&nodes, "b").unwrap().exposure.as_ref().unwrap();
-        assert_eq!(stored.slots, ["000", "000", "000", "000", "000", "000", "001", "001"]);
+        assert_eq!(
+            stored.slots,
+            ["000", "000", "000", "000", "000", "000", "001", "001"]
+        );
         let folder = find(&nodes, "b").unwrap();
-        assert_eq!(folder.frames, vec![0, 3], "the sheet does not touch the keys");
+        assert_eq!(
+            folder.frames,
+            vec![0, 3],
+            "the sheet does not touch the keys"
+        );
         assert_eq!(cel_at(folder, 3).unwrap().id, "b2");
-        assert!(!xsheet_command(&mut nodes, 5, "step", 0, 1, 2), "a column off the sheet is refused");
+        assert!(
+            !xsheet_command(&mut nodes, 5, "step", 0, 1, 2),
+            "a column off the sheet is refused"
+        );
         let columns = xsheet_columns(&nodes, cut_end(&nodes));
         assert!(columns[0].stored);
         assert_eq!(columns[0].labels.len(), 8);
-        assert_eq!(cel_mark(find(&nodes, "b").unwrap().exposure.as_ref(), 1), "hold");
+        assert_eq!(
+            cel_mark(find(&nodes, "b").unwrap().exposure.as_ref(), 1),
+            "hold"
+        );
 
         let mut desk_back = Node::group("db", "back");
         desk_back.animation = true;
         desk_back.exposure = Some(sheet(&[1, 3]));
         let mut nodes = vec![desk_back];
         assert!(xsheet_command(&mut nodes, 0, "autoexpose", 0, 2, 0));
-        assert_eq!(nodes[0].exposure.as_ref().unwrap().slots, ["001", "001", "003"]);
+        assert_eq!(
+            nodes[0].exposure.as_ref().unwrap().slots,
+            ["001", "001", "003"]
+        );
 
         // The desk names the column by its folder.
         let mut art = Art::blank(1, 1);
         art.layers = vec![Node::group("folder", "Folder"), keyed_folder()];
-        assert!(!folder_command(&mut art, "folder", "step", 0, 1, 2), "a plain folder has no column");
+        assert!(
+            !folder_command(&mut art, "folder", "step", 0, 1, 2),
+            "a plain folder has no column"
+        );
         assert!(!folder_command(&mut art, "missing", "step", 0, 1, 2));
         assert!(folder_command(&mut art, "shot", "step", 0, 6, 2));
-        let stored = find(&art.layers, "shot").unwrap().exposure.as_ref().unwrap();
-        assert_eq!(stored.len(), 12, "the keys [0, 2, 5] project six cells, stepped twice");
+        let stored = find(&art.layers, "shot")
+            .unwrap()
+            .exposure
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            12,
+            "the keys [0, 2, 5] project six cells, stepped twice"
+        );
         assert_eq!(&stored.slots[..4], ["000", "000", "000", "000"]);
         assert!(find(&art.layers, "folder").unwrap().exposure.is_none());
     }

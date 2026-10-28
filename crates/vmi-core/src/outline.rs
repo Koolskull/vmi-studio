@@ -144,37 +144,6 @@ pub fn underlay(buf: &mut [u8], w: u32, h: u32, px: f32, rgb: [u8; 3], step: u32
     }
 }
 
-/// The outline of `src` onto `dst`. Both buffers are the same sample grid.
-/// The paint in `src` is not copied. The caller paints it afterwards.
-pub fn disc_onto(dst: &mut [u8], src: &[u8], w: u32, h: u32, px: f32, rgb: [u8; 3], step: u32) {
-    let Some(px) = active(true, px) else {
-        return;
-    };
-    let Some(cover) = cover_of(src, w, h, 0, 0, w as i32, h as i32, px, f64::from(step.max(1))) else {
-        return;
-    };
-    for y in 0..cover.h {
-        for x in 0..cover.w {
-            let alpha = cover.alpha[y * cover.w + x];
-            if alpha == 0 {
-                continue;
-            }
-            let dx = cover.x0 + x as i32;
-            let dy = cover.y0 + y as i32;
-            if dx < 0 || dy < 0 || dx >= w as i32 || dy >= h as i32 {
-                continue;
-            }
-            let di = ((dy as u32 * w + dx as u32) * 4) as usize;
-            if di + 3 >= dst.len() {
-                continue;
-            }
-            let base = Rgba::new(dst[di], dst[di + 1], dst[di + 2], dst[di + 3]);
-            let over = source_over(base, Rgba::new(rgb[0], rgb[1], rgb[2], alpha), 1.0);
-            dst[di..di + 4].copy_from_slice(&over.channels());
-        }
-    }
-}
-
 struct Cover {
     x0: i32,
     y0: i32,
@@ -211,19 +180,170 @@ fn cover_of(
     }
     let gw = (gx1 - gx0) as usize;
     let gh = (gy1 - gy0) as usize;
+    let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
+    // Sample distance that still has coverage. A 1–3px edge only needs the
+    // pixels next to the paint, not a distance grid the size of the canvas.
+    let limit = (f64::from(px) + 1.0) / step;
+    let radius = (limit - 1e-9).floor().max(0.0) as i32;
+    let alpha = if radius <= 8 {
+        cover_near(src, sw, gx0, gy0, gw, gh, px, step, limit, radius)
+    } else {
+        cover_far(src, sw, bx0, by0, bx1, by1, gx0, gy0, gw, gh, px, step)
+    };
+    Some(Cover {
+        x0: gx0,
+        y0: gy0,
+        w: gw,
+        h: gh,
+        alpha,
+    })
+}
+
+/// Exact coverage for a small radius. Each empty pixel looks a few rows
+/// up and down. Opaque pixels are already distance 0.
+fn cover_near(
+    src: &[u8],
+    sw: u32,
+    gx0: i32,
+    gy0: i32,
+    gw: usize,
+    gh: usize,
+    px: f32,
+    step: f64,
+    limit: f64,
+    radius: i32,
+) -> Vec<u8> {
+    let span = radius as usize * 2 + 1;
+    let mut ring = vec![-1i32; gw.saturating_mul(span)];
+    let mut alpha = vec![0u8; gw.saturating_mul(gh)];
+    let mut ready = 0usize;
+    let limit_sq = limit * limit;
+    for y in 0..gh {
+        let need = (y + radius as usize).min(gh - 1);
+        while ready <= need {
+            fill_near_row(src, sw, gx0, gy0, gw, radius, &mut ring, span, ready);
+            ready += 1;
+        }
+        let src_y = gy0 + y as i32;
+        let row_off = (src_y as usize) * (sw as usize) * 4;
+        for x in 0..gw {
+            let src_x = gx0 + x as i32;
+            if src[row_off + (src_x as usize) * 4 + 3] > 0 {
+                alpha[y * gw + x] = 255;
+                continue;
+            }
+            let mut best = i32::MAX;
+            let y_i = y as i32;
+            for dy in -radius..=radius {
+                let sy = y_i + dy;
+                if sy < 0 || sy >= gh as i32 {
+                    continue;
+                }
+                let sx = ring[x * span + (sy as usize % span)];
+                if sx < 0 {
+                    continue;
+                }
+                let dx = x as i32 - sx;
+                let distance_sq = dx * dx + dy * dy;
+                if distance_sq < best {
+                    best = distance_sq;
+                    if best == 0 {
+                        break;
+                    }
+                }
+            }
+            if best == i32::MAX || (best as f64) >= limit_sq {
+                continue;
+            }
+            let distance = (best as f64).sqrt() * step;
+            let cover = (f64::from(px) + 1.0 - distance).clamp(0.0, 1.0);
+            if cover <= 0.0 {
+                continue;
+            }
+            alpha[y * gw + x] = (cover * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    alpha
+}
+
+fn fill_near_row(
+    src: &[u8],
+    sw: u32,
+    gx0: i32,
+    gy0: i32,
+    gw: usize,
+    radius: i32,
+    ring: &mut [i32],
+    span: usize,
+    sy: usize,
+) {
+    let slot = sy % span;
+    let row_off = ((gy0 + sy as i32) as usize) * (sw as usize) * 4;
+    let mut prev = -1i32;
+    for x in 0..gw {
+        let src_x = gx0 + x as i32;
+        if src[row_off + (src_x as usize) * 4 + 3] > 0 {
+            prev = x as i32;
+        }
+        let near = if prev >= 0 && x as i32 - prev <= radius {
+            prev
+        } else {
+            -1
+        };
+        ring[x * span + slot] = near;
+    }
+    let mut next = -1i32;
+    for x in (0..gw).rev() {
+        let src_x = gx0 + x as i32;
+        if src[row_off + (src_x as usize) * 4 + 3] > 0 {
+            next = x as i32;
+        }
+        if next < 0 {
+            continue;
+        }
+        let dx = next - x as i32;
+        if dx > radius {
+            continue;
+        }
+        let cur = ring[x * span + slot];
+        if cur < 0 || dx < x as i32 - cur {
+            ring[x * span + slot] = next;
+        }
+    }
+}
+
+fn cover_far(
+    src: &[u8],
+    sw: u32,
+    bx0: i32,
+    by0: i32,
+    bx1: i32,
+    by1: i32,
+    gx0: i32,
+    gy0: i32,
+    gw: usize,
+    gh: usize,
+    px: f32,
+    step: f64,
+) -> Vec<u8> {
     let mut sites = vec![FAR; gw * gh];
     for y in by0..by1 {
         let row = (y as usize) * (sw as usize) * 4;
         let gy = (y - gy0) as usize;
+        if gy >= gh {
+            continue;
+        }
         for x in bx0..bx1 {
             if src[row + (x as usize) * 4 + 3] > 0 {
-                sites[gy * gw + (x - gx0) as usize] = 0.0;
+                let gx = (x - gx0) as usize;
+                if gx < gw {
+                    sites[gy * gw + gx] = 0.0;
+                }
             }
         }
     }
     let dist = edt_sq(&sites, gw, gh);
     let mut alpha = vec![0u8; gw * gh];
-    let step = if step.is_finite() && step > 0.0 { step } else { 1.0 };
     for (slot, sq) in alpha.iter_mut().zip(dist) {
         let distance = sq.max(0.0).sqrt() * step;
         let cover = (f64::from(px) + 1.0 - distance).clamp(0.0, 1.0);
@@ -232,13 +352,7 @@ fn cover_of(
         }
         *slot = (cover * 255.0).round().clamp(0.0, 255.0) as u8;
     }
-    Some(Cover {
-        x0: gx0,
-        y0: gy0,
-        w: gw,
-        h: gh,
-        alpha,
-    })
+    alpha
 }
 
 /// Inclusive-exclusive bounds of pixels with alpha, inside the window.
@@ -383,6 +497,77 @@ mod tests {
         assert!(active(false, 4.0).is_none());
         assert_eq!(clamp_px(f64::NAN), 0.0);
         assert_eq!(clamp_px(400.0), 250.0);
+    }
+
+    #[test]
+    fn a_wide_gap_stays_clear() {
+        let w = 3000u32;
+        let h = 3u32;
+        let mut src = vec![0u8; (w * h * 4) as usize];
+        let origin = (1 * w + 20) * 4;
+        src[origin as usize] = 255;
+        src[origin as usize + 3] = 255;
+        let mut dst = vec![0u8; src.len()];
+        under_layer(&mut dst, w, h, 0, 0, &src, w, h, 1.0, [9, 8, 7], 1);
+        let at = |x: u32| {
+            let i = ((1 * w + x) * 4) as usize;
+            [dst[i], dst[i + 1], dst[i + 2], dst[i + 3]]
+        };
+        assert_eq!(at(21), [9, 8, 7, 255]);
+        assert_eq!(at(22), [0, 0, 0, 0]);
+        assert_eq!(at(1500), [0, 0, 0, 0]);
+        assert_eq!(at(2999), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_poster_sized_plate_outlines_without_filling() {
+        let w = 3840u32;
+        let h = 1920u32;
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        for y in 100..180 {
+            for x in 100..180 {
+                let i = ((y * w + x) * 4) as usize;
+                buf[i] = 255;
+                buf[i + 3] = 255;
+            }
+        }
+        let start = std::time::Instant::now();
+        underlay(&mut buf, w, h, 3.0, [0, 0, 0], 1);
+        let at = |buf: &[u8], x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            buf[i + 3]
+        };
+        assert_eq!(at(&buf, 100, 97), 255);
+        assert_eq!(at(&buf, 100, 96), 0);
+        assert_eq!(at(&buf, 2000, 1000), 0);
+
+        // Ink at opposite corners forces the whole plate through the edge pass.
+        let mut wide = vec![0u8; buf.len()];
+        wide[3] = 255;
+        let last = ((h - 1) * w + (w - 1)) * 4 + 3;
+        wide[last as usize] = 255;
+        underlay(&mut wide, w, h, 3.0, [0, 0, 0], 1);
+        assert_eq!(at(&wide, 3, 0), 255);
+        assert_eq!(at(&wide, 4, 0), 0);
+        assert_eq!(at(&wide, 2000, 1000), 0);
+        assert!(start.elapsed().as_millis() < 500);
+    }
+
+    #[test]
+    fn two_pixels_of_width_reach_two_samples_and_stop() {
+        let mut buf = vec![0u8; 9 * 4];
+        buf[4 * 4] = 255;
+        buf[4 * 4 + 3] = 255;
+        underlay(&mut buf, 9, 1, 2.0, [0, 0, 1], 1);
+        let at = |x: usize| {
+            let i = x * 4;
+            [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+        };
+        assert_eq!(at(4), [255, 0, 0, 255]);
+        assert_eq!(at(2), [0, 0, 1, 255]);
+        assert_eq!(at(6), [0, 0, 1, 255]);
+        assert_eq!(at(1), [0, 0, 0, 0]);
+        assert_eq!(at(7), [0, 0, 0, 0]);
     }
 
     #[test]

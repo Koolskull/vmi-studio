@@ -5,8 +5,8 @@
 //! branches, a clipping mask stays inside the row it clips onto, a pass
 //! through folder paints its children on the picture below, and an animation
 //! folder shows one cel, the one `anim::cel_at` holds at the playhead. A Clip
-//! Studio border edge sits under that paint, and under a folder once its
-//! children have merged. Onion skin (`vmi_studio/onion.py`) is a view:
+//! Studio border edge sits under the paint of the layer that has one. A folder
+//! does not pass that edge on to the layers inside it. Onion skin (`vmi_studio/onion.py`) is a view:
 //! `present` tints the neighbour cels
 //! when `Art::onion` is on, `present_plain` never does.
 
@@ -1605,31 +1605,8 @@ fn paint_stack(
     // layer's. The stack then covers everything that was inside.
     let styled = has_job(&nodes[index], item, ctx);
     if kind == NodeKind::Group && is_pass(&blend) && clips.is_empty() && opacity == 255 && !styled {
-        // The edge goes down first, then the children paint onto the picture,
-        // the way a pass-through folder keeps each child's blend.
-        let outlined = {
-            let node = actual(&nodes[index], item);
-            crate::outline::active(node.outline, node.outline_px)
-                .map(|px| (px, node.outline_rgb))
-        };
-        if let Some((px, rgb)) = outlined {
-            let mut plate = vec![0u8; dst.len()];
-            {
-                let node = actual_mut(&mut nodes[index], item);
-                paint_list(
-                    &mut node.children,
-                    Target {
-                        buf: &mut plate,
-                        w,
-                        h,
-                        ox,
-                        oy,
-                    },
-                    &inner,
-                );
-            }
-            crate::outline::disc_onto(dst, &plate, w, h, px, rgb, ctx.step);
-        }
+        // Each child keeps its own blend. The folder's border is not painted
+        // around them.
         let node = actual_mut(&mut nodes[index], item);
         paint_list(
             &mut node.children,
@@ -1710,9 +1687,6 @@ fn appearance(node: &mut Node, target: Target<'_>, inner: &Ctx<'_>) {
             },
             inner,
         );
-        if let Some(px) = crate::outline::active(node.outline, node.outline_px) {
-            crate::outline::underlay(buf, w, h, px, node.outline_rgb, inner.step);
-        }
     } else {
         blit_layer(
             node,
@@ -3373,7 +3347,7 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_outline_wraps_the_merged_paint() {
+    fn a_folder_border_does_not_spread_and_a_layer_keeps_its_own() {
         let mut art = Art::blank(30, 30);
         let folder = art.add_group(None, "group");
         let ink = art.add_layer(Some(&folder), "ink");
@@ -3386,10 +3360,20 @@ mod tests {
         }
         let plate = present(&mut art);
         assert_eq!(&px(&plate, 30, 10, 10)[..3], &[255, 0, 0]);
-        let edge = px(&plate, 30, 10, 8);
+        assert_eq!(px(&plate, 30, 10, 8), [0, 0, 0, 0]);
+
+        {
+            let node = find_mut(&mut art.layers, &ink).unwrap();
+            node.outline = true;
+            node.outline_px = 2.0;
+            node.outline_rgb = [0, 0, 255];
+        }
+        let owned = present(&mut art);
+        assert_eq!(&px(&owned, 30, 10, 10)[..3], &[255, 0, 0]);
+        let edge = px(&owned, 30, 10, 8);
         assert_eq!(&edge[..3], &[0, 0, 255]);
         assert!(edge[3] > 200);
-        assert_eq!(px(&plate, 30, 10, 7)[3], 0);
+        assert_eq!(px(&owned, 30, 10, 7)[3], 0);
 
         find_mut(&mut art.layers, &folder).unwrap().blend = "pass through".into();
         let passed = present(&mut art);

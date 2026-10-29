@@ -210,6 +210,15 @@ The program is `dist/VMI STUDIO.app`. Open that bundle. Check the build from a t
 
 It prints `VMI STUDIO 0.03`. A drawing dropped on the icon, or chosen with Open With, opens in the studio. The first time a downloaded copy is opened, macOS shows “VMI STUDIO” Not Opened, with Move to Trash and Done. Click Done. Then open System Settings, go to Privacy & Security, and click Open Anyway next to the VMI STUDIO note. Open the app again and confirm Open.
 
+The window titled KOOL SKULL STUDIO is the Rust desk. From this checkout on a Mac:
+
+```bash
+bash tools/build-mac.sh
+open "dist/KOOL SKULL STUDIO.app"
+```
+
+The script needs Python 3.12 or newer, Rust, and the Xcode command line tools. It makes `.venv`, the Krita decoder, the Clip Studio vector reader, and `dist/KOOL SKULL STUDIO.app`. Leave that app inside this checkout. A blueprint opens on its own. Any other drawing is read by the virtualenv. The same steps run on a Mac from `.github/workflows/macos.yml`.
+
 An optional font catalog can live in `~/Documents/work/Github/bgcardbuilder`, or in the directory named by `BGCARDBUILDER`. Without it, the header font list is the system monospace. That is the default face either way.
 
 ## The Rust desk

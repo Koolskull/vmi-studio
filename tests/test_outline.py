@@ -88,7 +88,7 @@ class OutlineTests(unittest.TestCase):
         self.assertEqual(plain.getpixel((10, 10)), (255, 0, 0, 255))
         self.assertEqual(plain.getpixel((10, 8))[3], 0)
 
-    def test_a_folder_outline_wraps_the_merged_paint(self):
+    def test_a_folder_border_does_not_spread_and_a_layer_keeps_its_own(self):
         reset_plate_cache()
         ink = Node("n1", "ink", "layer", raster=_dot(10, 10))
         folder = Node("n0", "group", "group", blend="normal")
@@ -98,8 +98,15 @@ class OutlineTests(unittest.TestCase):
         folder.outline_rgb = (0, 0, 255)
         image = composite_image(30, 30, refresh([folder]))
         self.assertEqual(image.getpixel((10, 10))[:3], (255, 0, 0))
-        self.assertEqual(image.getpixel((10, 8))[:3], (0, 0, 255))
-        self.assertGreater(image.getpixel((10, 8))[3], 200)
+        self.assertEqual(image.getpixel((10, 8))[3], 0)
+        ink.outline = True
+        ink.outline_px = 2
+        ink.outline_rgb = (0, 0, 255)
+        reset_plate_cache()
+        owned = composite_image(30, 30, refresh([folder]))
+        self.assertEqual(owned.getpixel((10, 10))[:3], (255, 0, 0))
+        self.assertEqual(owned.getpixel((10, 8))[:3], (0, 0, 255))
+        self.assertGreater(owned.getpixel((10, 8))[3], 200)
 
     def test_a_blueprint_keeps_the_outline(self):
         ids = Ids()

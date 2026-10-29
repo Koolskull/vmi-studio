@@ -46,8 +46,14 @@ def clamp_rgb(value):
 
 
 def active_outline(node):
-    """(pixels, rgb) when this layer's outline should draw. Otherwise None."""
-    if node is None or not getattr(node, "outline", False):
+    """(pixels, rgb) when this layer's outline should draw. Otherwise None.
+
+    A folder keeps the edge in the file. Painting it would ring every
+    separated child, including layers that have no edge of their own.
+    """
+    if node is None or getattr(node, "kind", "") == "group":
+        return None
+    if not getattr(node, "outline", False):
         return None
     px = clamp_px(getattr(node, "outline_px", 0))
     if px <= 0:

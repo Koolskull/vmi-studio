@@ -1,0 +1,12 @@
+[package]
+name = "vmi-audit"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Parity notes for the studio desk. A row is Have only when a test proves it."
+
+[dependencies]
+vmi-app = { path = "../vmi-app", default-features = false }
+vmi-core = { path = "../vmi-core" }
+vmi-paint = { path = "../vmi-paint" }

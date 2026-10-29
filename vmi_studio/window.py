@@ -3184,7 +3184,9 @@ class MainWindow(QMainWindow):
         outline_row.setSpacing(6)
         self.outline_box = QCheckBox("Outline")
         self.outline_box.setObjectName("outlineToggle")
-        self.outline_box.setToolTip("Clip Studio's border edge, around the non-transparent pixels.")
+        self.outline_box.setToolTip(
+            "Clip Studio's border edge, around the non-transparent pixels of this layer. A folder does not outline the layers inside it."
+        )
         self.outline_px = QSpinBox()
         self.outline_px.setObjectName("outlinePx")
         self.outline_px.setRange(1, 250)

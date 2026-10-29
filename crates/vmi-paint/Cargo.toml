@@ -1,0 +1,10 @@
+[package]
+name = "vmi-paint"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Raster dabs, smudge carry, and flood fill"
+
+[dependencies]
+vmi-core = { path = "../vmi-core" }

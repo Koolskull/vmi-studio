@@ -1,0 +1,31 @@
+name: Mac build
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the desk
+        run: bash tools/build-mac.sh
+
+      - name: Test the library
+        run: cargo test --workspace --locked --lib -- --test-threads=8
+
+      - name: Confirm the app is a Mac binary
+        run: file "dist/KOOL SKULL STUDIO.app/Contents/MacOS/vmi-studio"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kool-skull-studio-macos
+          path: dist/KOOL SKULL STUDIO.app

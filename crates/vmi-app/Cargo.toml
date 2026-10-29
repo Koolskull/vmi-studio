@@ -1,0 +1,36 @@
+[package]
+name = "vmi-app"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "KOOL SKULL STUDIO desk"
+
+[features]
+default = ["window"]
+window = ["dep:eframe", "dep:raw-window-handle", "dep:x11rb", "dep:wayland-client", "dep:wayland-protocols"]
+
+[[bin]]
+name = "vmi-studio"
+path = "src/main.rs"
+required-features = ["window"]
+
+[dependencies]
+eframe = { version = "0.29", optional = true }
+# Names the display server behind the eframe window, so the pen listener matches it.
+raw-window-handle = { version = "0.6", optional = true }
+vmi-core = { path = "../vmi-core" }
+vmi-paint = { path = "../vmi-paint" }
+
+# Tablet pressure on macOS comes straight from AppKit. Same versions winit uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.2", features = ["NSEvent", "block2"] }
+block2 = "0.5"
+
+# Tablet pressure on Linux: XInput2 raw events on X11 (and XWayland), tablet-v2
+# on a native Wayland session. Same crates, versions and features winit uses,
+# so nothing new is compiled.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11rb = { version = "0.13", features = ["xinput"], optional = true }
+wayland-client = { version = "0.31", features = ["system"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
